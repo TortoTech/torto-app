@@ -60,18 +60,13 @@ class LibraryStore {
   /// into the library directory. Returns the imported file, or null when the
   /// user cancelled. Name collisions get a `-1`, `-2`, … suffix.
   Future<File?> import() async {
-    final result = await FilePicker.pickFiles(
+    final files = await FilePicker.pickFiles(
       type: FileType.custom,
       allowedExtensions: const ['epub'],
-      withData: true,
     );
-    if (result == null || result.files.isEmpty) return null;
-    final picked = result.files.first;
-    var bytes = picked.bytes;
-    if (bytes == null && picked.path != null) {
-      bytes = await File(picked.path!).readAsBytes();
-    }
-    if (bytes == null) return null;
+    if (files.isEmpty) return null;
+    final picked = files.first;
+    final bytes = await picked.readAsBytes();
 
     final dir = await _booksDir();
     await dir.create(recursive: true);
