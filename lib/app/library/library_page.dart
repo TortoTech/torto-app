@@ -38,7 +38,9 @@ class _LibraryPageState extends State<LibraryPage> {
       await _refresh();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Imported "${LibraryStore.titleOf(file.path)}"')),
+        SnackBar(
+          content: Text('Imported "${LibraryStore.titleOf(file.path)}"'),
+        ),
       );
     } catch (_) {
       if (!mounted) return;
@@ -96,31 +98,95 @@ class _LibraryPageState extends State<LibraryPage> {
       body: switch (books) {
         null => const Center(child: CircularProgressIndicator()),
         [] => const Center(
-            child: Text('No books yet.\nTap + to import an EPUB.',
-                textAlign: TextAlign.center),
+          child: Text(
+            'No books yet.\nTap + to import an EPUB.',
+            textAlign: TextAlign.center,
           ),
-        _ => ListView.builder(
-            itemCount: books.length,
-            itemBuilder: (context, index) {
-              final book = books[index];
-              return ListTile(
-                leading: const Icon(Icons.book_outlined),
-                title: Text(book.title),
-                subtitle: Text(_formatSize(book.sizeBytes)),
-                onTap: () => _open(book),
-                onLongPress: () => _confirmDelete(book),
-              );
-            },
-          ),
+        ),
+        _ => ListView.separated(
+          itemCount: books.length,
+          separatorBuilder: (context, index) =>
+              const Divider(height: 1, indent: 88),
+          itemBuilder: (context, index) {
+            final book = books[index];
+            return InkWell(
+              onTap: () => _open(book),
+              onLongPress: () => _confirmDelete(book),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 10,
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _BookCover(book: book),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 2),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              book.title,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context).textTheme.titleMedium,
+                            ),
+                            if (book.authors.isNotEmpty) ...[
+                              const SizedBox(height: 4),
+                              Text(
+                                book.authors.join(' / '),
+                                maxLines: 2,
+                                overflow: TextOverflow.ellipsis,
+                                style: Theme.of(context).textTheme.bodyMedium,
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
       },
     );
   }
+}
 
-  static String _formatSize(int bytes) {
-    if (bytes >= 1024 * 1024) {
-      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-    }
-    if (bytes >= 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    return '$bytes B';
+class _BookCover extends StatelessWidget {
+  final LibraryBook book;
+
+  const _BookCover({required this.book});
+
+  @override
+  Widget build(BuildContext context) {
+    final bytes = book.coverBytes;
+    return Container(
+      width: 56,
+      height: 80,
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: bytes == null
+          ? _fallback(context)
+          : Image.memory(
+              bytes,
+              fit: BoxFit.contain,
+              gaplessPlayback: true,
+              errorBuilder: (context, error, stackTrace) => _fallback(context),
+            ),
+    );
   }
+
+  Widget _fallback(BuildContext context) => Icon(
+    Icons.book_outlined,
+    color: Theme.of(context).colorScheme.onSurfaceVariant,
+  );
 }

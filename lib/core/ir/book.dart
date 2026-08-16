@@ -7,13 +7,16 @@ typedef PublicationId = String;
 class BookMetadata {
   final String title;
   final List<String> authors;
-  final String language;
+  final List<String> languages;
 
   const BookMetadata({
     this.title = '',
     this.authors = const [],
-    this.language = '',
+    this.languages = const [],
   });
+
+  /// First declared language, kept as a convenience for typography callers.
+  String get language => languages.isEmpty ? '' : languages.first;
 }
 
 class TocEntry {

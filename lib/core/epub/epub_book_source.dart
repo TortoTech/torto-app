@@ -77,13 +77,13 @@ class EpubBookSource implements BookSource {
 
     final containerText = source._readXmlText('META-INF/container.xml');
     if (containerText == null) {
-      throw const FormatException(
-          'EPUB is missing META-INF/container.xml');
+      throw const FormatException('EPUB is missing META-INF/container.xml');
     }
     final opfPath = _parseContainer(containerText);
     if (opfPath == null) {
       throw const FormatException(
-          'EPUB container.xml has no rootfile full-path');
+        'EPUB container.xml has no rootfile full-path',
+      );
     }
 
     final opfDir = packageDirname(opfPath);
@@ -175,16 +175,18 @@ class EpubBookSource implements BookSource {
       if (text != null) {
         final document = tryParseXmlTolerant(text);
         if (document != null) {
-          final toc =
-              _parseNavDocument(document, packageDirname(navItem.href), spine);
+          final toc = _parseNavDocument(
+            document,
+            packageDirname(navItem.href),
+            spine,
+          );
           if (toc.isNotEmpty) return toc;
         }
       }
     }
 
-    final ncxItem = (model.ncxId == null
-            ? null
-            : model.manifest[model.ncxId!]) ??
+    final ncxItem =
+        (model.ncxId == null ? null : model.manifest[model.ncxId!]) ??
         model.items
             .where((item) => item.mediaType == 'application/x-dtbncx+xml')
             .firstOrNull;
@@ -205,7 +207,10 @@ class EpubBookSource implements BookSource {
   }
 
   List<TocEntry> _parseNavDocument(
-      XmlDocument document, String navDir, List<SpineItem> spine) {
+    XmlDocument document,
+    String navDir,
+    List<SpineItem> spine,
+  ) {
     XmlElement? nav;
     for (final element in document.descendants.whereType<XmlElement>()) {
       if (_localName(element) != 'nav') continue;
@@ -224,20 +229,24 @@ class EpubBookSource implements BookSource {
   }
 
   List<TocEntry> _parseNavList(
-      XmlElement list, String navDir, List<SpineItem> spine) {
+    XmlElement list,
+    String navDir,
+    List<SpineItem> spine,
+  ) {
     final entries = <TocEntry>[];
     for (final item in list.childElements) {
       if (_localName(item) != 'li') continue;
       final labelNode = item.childElements
-          .where((element) =>
-              _localName(element) == 'a' || _localName(element) == 'span')
+          .where(
+            (element) =>
+                _localName(element) == 'a' || _localName(element) == 'span',
+          )
           .firstOrNull;
       final label = labelNode == null
           ? 'Untitled section'
           : _normalizedText(labelNode);
       var href = '';
-      final rawHref =
-          labelNode == null ? null : _localAttr(labelNode, 'href');
+      final rawHref = labelNode == null ? null : _localAttr(labelNode, 'href');
       if (rawHref != null &&
           rawHref.trim().isNotEmpty &&
           !isExternalHref(rawHref.trim())) {
@@ -249,18 +258,23 @@ class EpubBookSource implements BookSource {
           children.addAll(_parseNavList(child, navDir, spine));
         }
       }
-      entries.add(TocEntry(
-        label: label.isEmpty ? 'Untitled section' : label,
-        href: href,
-        spineIndex: href.isEmpty ? null : _spineIndexFor(spine, href),
-        children: children,
-      ));
+      entries.add(
+        TocEntry(
+          label: label.isEmpty ? 'Untitled section' : label,
+          href: href,
+          spineIndex: href.isEmpty ? null : _spineIndexFor(spine, href),
+          children: children,
+        ),
+      );
     }
     return entries;
   }
 
   List<TocEntry> _parseNcx(
-      XmlDocument document, String ncxDir, List<SpineItem> spine) {
+    XmlDocument document,
+    String ncxDir,
+    List<SpineItem> spine,
+  ) {
     final navMap = document.descendants
         .whereType<XmlElement>()
         .where((element) => _localName(element) == 'navmap')
@@ -270,7 +284,10 @@ class EpubBookSource implements BookSource {
   }
 
   List<TocEntry> _parseNavPoints(
-      XmlElement parent, String ncxDir, List<SpineItem> spine) {
+    XmlElement parent,
+    String ncxDir,
+    List<SpineItem> spine,
+  ) {
     final entries = <TocEntry>[];
     for (final point in parent.childElements) {
       if (_localName(point) != 'navpoint') continue;
@@ -286,17 +303,17 @@ class EpubBookSource implements BookSource {
           .where((element) => _localName(element) == 'content')
           .firstOrNull;
       final src = content == null ? null : _localAttr(content, 'src');
-      if (src != null &&
-          src.trim().isNotEmpty &&
-          !isExternalHref(src.trim())) {
+      if (src != null && src.trim().isNotEmpty && !isExternalHref(src.trim())) {
         href = resolvePackageHref(ncxDir, src);
       }
-      entries.add(TocEntry(
-        label: label.isEmpty ? 'Untitled section' : label,
-        href: href,
-        spineIndex: href.isEmpty ? null : _spineIndexFor(spine, href),
-        children: _parseNavPoints(point, ncxDir, spine),
-      ));
+      entries.add(
+        TocEntry(
+          label: label.isEmpty ? 'Untitled section' : label,
+          href: href,
+          spineIndex: href.isEmpty ? null : _spineIndexFor(spine, href),
+          children: _parseNavPoints(point, ncxDir, spine),
+        ),
+      );
     }
     return entries;
   }
@@ -372,7 +389,7 @@ class _PackageModel {
     // ---- metadata
     var title = '';
     final authors = <String>[];
-    var language = '';
+    final languages = <String>[];
     String? coverMetaId;
     for (final child in package.childElements) {
       if (_localName(child) != 'metadata') continue;
@@ -384,7 +401,8 @@ class _PackageModel {
             final name = _normalizedText(field);
             if (name.isNotEmpty) authors.add(name);
           case 'language':
-            if (language.isEmpty) language = _normalizedText(field);
+            final language = _normalizedText(field);
+            if (language.isNotEmpty) languages.add(language);
           case 'meta':
             if (_localAttr(field, 'name') == 'cover') {
               coverMetaId = _localAttr(field, 'content');
@@ -451,7 +469,11 @@ class _PackageModel {
     }
 
     return _PackageModel(
-      metadata: BookMetadata(title: title, authors: authors, language: language),
+      metadata: BookMetadata(
+        title: title,
+        authors: authors,
+        languages: languages,
+      ),
       manifest: manifest,
       items: items,
       spineIdrefs: spineIdrefs,
