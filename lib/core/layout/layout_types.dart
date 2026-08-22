@@ -184,8 +184,9 @@ class PageLayout {
     final seen = <ui.Paragraph>{};
     for (final item in items) {
       if (item is! TextPlacement) continue;
-      final firstSeen =
-          pool != null ? pool.markDisposed(item.paragraph) : seen.add(item.paragraph);
+      final firstSeen = pool != null
+          ? pool.markDisposed(item.paragraph)
+          : seen.add(item.paragraph);
       if (firstSeen) item.paragraph.dispose();
     }
   }

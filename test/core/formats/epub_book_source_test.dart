@@ -4,7 +4,7 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:torto/core/epub/epub_book_source.dart';
+import 'package:torto/core/formats/epub_book_source.dart';
 import 'package:torto/core/ir/ir.dart';
 
 const _container = '''<?xml version="1.0"?>

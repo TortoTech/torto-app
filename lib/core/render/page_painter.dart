@@ -32,9 +32,12 @@ class PagePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     canvas.drawRect(ui.Offset.zero & size, Paint()..color = background);
-    final separatorColor = (foreground ??
-            (background.computeLuminance() > 0.5 ? Colors.black : Colors.white))
-        .withAlpha(102);
+    final separatorColor =
+        (foreground ??
+                (background.computeLuminance() > 0.5
+                    ? Colors.black
+                    : Colors.white))
+            .withAlpha(102);
 
     for (final item in page.items) {
       switch (item) {
@@ -43,9 +46,12 @@ class PagePainter extends CustomPainter {
           // paragraph offset so the slice lands at (x, y).
           canvas.save();
           canvas.clipRect(
-              ui.Rect.fromLTWH(0, item.y, size.width, item.sliceHeight));
+            ui.Rect.fromLTWH(0, item.y, size.width, item.sliceHeight),
+          );
           canvas.drawParagraph(
-              item.paragraph, ui.Offset(item.x, item.y - item.sliceTop));
+            item.paragraph,
+            ui.Offset(item.x, item.y - item.sliceTop),
+          );
           canvas.restore();
         case ImagePlacement():
           final image = imageResolver(item.href);
@@ -53,7 +59,11 @@ class PagePainter extends CustomPainter {
             canvas.drawImageRect(
               image,
               ui.Rect.fromLTWH(
-                  0, 0, image.width.toDouble(), image.height.toDouble()),
+                0,
+                0,
+                image.width.toDouble(),
+                image.height.toDouble(),
+              ),
               item.rect,
               Paint(),
             );

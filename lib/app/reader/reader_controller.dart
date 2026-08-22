@@ -5,20 +5,23 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 
-import '../../core/epub/epub_book_source.dart';
+import '../../core/formats/formats.dart';
 import '../../core/ir/ir.dart';
 import '../../core/layout/layout_engine.dart';
 import '../../core/layout/layout_types.dart';
 import '../progress_store.dart';
+import '../sync/derived_data_store.dart';
 
 /// Owns the reading session for one book: the parsed source, paginated
 /// sections (prev/current/next cached), page navigation, image decoding,
 /// and progress persistence.
 class ReaderController extends ChangeNotifier {
   final ProgressStore progressStore;
+  final String? titleHint;
+  final String? publicationIdHint;
   final LayoutEngine _engine = const LayoutEngine();
 
-  EpubBookSource? _source;
+  BookSource? _source;
   LayoutViewport _viewport = const LayoutViewport(width: 0, height: 0);
   ReaderStyle _style = const ReaderStyle();
 
@@ -42,11 +45,16 @@ class ReaderController extends ChangeNotifier {
   bool opened = false;
 
   String title = '';
+  List<TocEntry> _derivedToc = const [];
 
   Timer? _saveTimer;
+  bool _progressDirty = false;
 
-  ReaderController({ProgressStore? progressStore})
-    : progressStore = progressStore ?? ProgressStore();
+  ReaderController({
+    ProgressStore? progressStore,
+    this.titleHint,
+    this.publicationIdHint,
+  }) : progressStore = progressStore ?? ProgressStore();
 
   Book get _book => _source!.book;
 
@@ -62,7 +70,8 @@ class ReaderController extends ChangeNotifier {
   bool _peekPreparing = false;
 
   /// Table of contents from the book's navigation document (may be empty).
-  List<TocEntry> get toc => _source?.book.toc ?? const [];
+  List<TocEntry> get toc =>
+      _derivedToc.isNotEmpty ? _derivedToc : (_source?.book.toc ?? const []);
 
   double get totalProgression {
     final count = sectionCount;
@@ -77,7 +86,7 @@ class ReaderController extends ChangeNotifier {
   ui.Image? resolveImage(String href) => _images[href];
 
   /// Opens [file], restores the saved position (if any), and paginates the
-  /// starting section. Throws when the file is not a readable EPUB.
+  /// starting section. Throws when the file is not a readable e-book.
   Future<void> open(
     File file,
     LayoutViewport viewport,
@@ -86,8 +95,17 @@ class ReaderController extends ChangeNotifier {
     _viewport = viewport;
     _style = style;
     final bytes = await file.readAsBytes();
-    final source = await EpubBookSource.fromBytes(bytes);
+    final source = await openBook(
+      bytes,
+      _baseName(file.path),
+      filePath: file.path,
+      titleHint: titleHint,
+      publicationIdHint: publicationIdHint,
+    );
     _source = source;
+    _derivedToc = await DerivedDataStore.fromBooksDirectory(
+      file.parent,
+    ).generatedToc(source.book.id, source.book);
     title = _book.metadata.title.isEmpty
         ? _fileTitle(file.path)
         : _book.metadata.title;
@@ -438,8 +456,17 @@ class ReaderController extends ChangeNotifier {
   }
 
   void _scheduleSave() {
+    _progressDirty = true;
     _saveTimer?.cancel();
     _saveTimer = Timer(const Duration(milliseconds: 500), _saveProgress);
+  }
+
+  /// Persists the final visible page before the reader is backgrounded or
+  /// popped. This avoids losing the last turn while the debounce is pending.
+  Future<void> flushProgress() async {
+    _saveTimer?.cancel();
+    _saveTimer = null;
+    if (_progressDirty) await _saveProgress();
   }
 
   Future<void> _saveProgress() async {
@@ -461,6 +488,12 @@ class ReaderController extends ChangeNotifier {
         source: anchor == null ? null : SourceRange(start: anchor, end: anchor),
       ),
     );
+    _progressDirty = false;
+  }
+
+  static String _baseName(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    return normalized.substring(normalized.lastIndexOf('/') + 1);
   }
 
   static String _fileTitle(String path) {
@@ -474,6 +507,7 @@ class ReaderController extends ChangeNotifier {
   @override
   void dispose() {
     _saveTimer?.cancel();
+    if (_progressDirty) unawaited(_saveProgress());
     for (final pages in _sections.values) {
       for (final page in pages) {
         page.dispose();

@@ -25,7 +25,7 @@ void main() {
       source: SourceRange(start: anchor, end: anchor),
     );
 
-    await store.save(locator);
+    await store.save(locator, activityTimeMs: 100);
     final loaded = await store.load('pub-1');
 
     expect(loaded, isNotNull);
@@ -39,18 +39,30 @@ void main() {
     expect(loaded.source!.end, anchor);
 
     expect(await store.load('no-such-book'), isNull);
+    expect(await store.activityTimes(), {'pub-1': 100});
+    await store.markActivity('pub-1', activityTimeMs: 50);
+    expect(await store.activityTimes(), {'pub-1': 100});
+    await store.markActivity('pub-1', activityTimeMs: 200);
+    expect(await store.activityTimes(), {'pub-1': 200});
   });
 
   testWidgets('LibraryPage renders the empty state', (tester) async {
     // A directory that never exists → empty library, no temp dirs needed.
-    final store =
-        LibraryStore(booksDir: Directory('test/__no_such_books_dir__'));
-    await tester.pumpWidget(MaterialApp(home: LibraryPage(store: store)));
+    final store = LibraryStore(
+      booksDir: Directory('test/__no_such_books_dir__'),
+    );
+    SharedPreferences.setMockInitialValues({});
+    final progressStore = ProgressStore(await SharedPreferences.getInstance());
+    await tester.pumpWidget(
+      MaterialApp(
+        home: LibraryPage(store: store, progressStore: progressStore),
+      ),
+    );
     // Let the real async directory check complete, then rebuild.
     await tester.runAsync(() => Future<void>.delayed(Duration.zero));
     await tester.pump();
 
     expect(find.textContaining('No books yet'), findsOneWidget);
-    expect(find.byTooltip('Import EPUB'), findsOneWidget);
+    expect(find.byTooltip('Import book'), findsOneWidget);
   });
 }

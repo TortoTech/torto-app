@@ -51,10 +51,14 @@ class LayoutEngine {
 
     final contentLeft = style.marginLeft;
     final contentTop = style.marginTop;
-    final contentWidth =
-        math.max(1.0, viewport.width - style.marginLeft - style.marginRight);
-    final contentBottom =
-        math.max(contentTop + 1.0, viewport.height - style.marginBottom);
+    final contentWidth = math.max(
+      1.0,
+      viewport.width - style.marginLeft - style.marginRight,
+    );
+    final contentBottom = math.max(
+      contentTop + 1.0,
+      viewport.height - style.marginBottom,
+    );
     final contentHeight = contentBottom - contentTop;
 
     // Cumulative UTF-16 text offsets, for progression computation.
@@ -88,8 +92,14 @@ class LayoutEngine {
           if (prepared == null) continue;
           paginator.pushText(prepared);
         case ImageBlock():
-          _pushImage(paginator, block, style, imageSizeResolver, contentWidth,
-              contentHeight);
+          _pushImage(
+            paginator,
+            block,
+            style,
+            imageSizeResolver,
+            contentWidth,
+            contentHeight,
+          );
         case SeparatorBlock():
           paginator.pushSeparator(vMargin: style.baseFontSize * 0.75);
         case PageBreakBlock():
@@ -118,7 +128,8 @@ class LayoutEngine {
         anchor = SourceAnchor(
           spine: section.spineIndex,
           node: firstText.nodeId,
-          textOffset: (firstText.source?.start.textOffset ?? 0) +
+          textOffset:
+              (firstText.source?.start.textOffset ?? 0) +
               firstText.textOffsetAtStart,
         );
         if (totalText > 0) {
@@ -130,13 +141,15 @@ class LayoutEngine {
         carriedProgression = progression;
       }
       if (i == rawPages.length - 1) progression = 1.0;
-      pages.add(PageLayout(
-        viewport: viewport,
-        items: items,
-        firstAnchor: anchor,
-        progression: progression,
-        disposalPool: disposalPool,
-      ));
+      pages.add(
+        PageLayout(
+          viewport: viewport,
+          items: items,
+          firstAnchor: anchor,
+          progression: progression,
+          disposalPool: disposalPool,
+        ),
+      );
     }
     return pages;
   }
@@ -163,8 +176,9 @@ class LayoutEngine {
     // at scale 1.0), bold, extra margins.
     var headingScale = 1.0;
     if (isHeading) {
-      final allPlain = block.inlines
-          .every((i) => i is! TextRun || i.style.sizeScale == 1.0);
+      final allPlain = block.inlines.every(
+        (i) => i is! TextRun || i.style.sizeScale == 1.0,
+      );
       if (allPlain) {
         headingScale = _headingScales[block.headingLevel.clamp(1, 6)] ?? 1.0;
       }
@@ -183,8 +197,9 @@ class LayoutEngine {
       marginStart += baseSize * 1.5;
     }
 
-    final hasText = block.inlines
-        .any((i) => i is TextRun && i.text.isNotEmpty || i is BreakInline);
+    final hasText = block.inlines.any(
+      (i) => i is TextRun && i.text.isNotEmpty || i is BreakInline,
+    );
     if (!hasText) return null;
 
     final foreground = ui.Color(style.foreground);
@@ -196,21 +211,25 @@ class LayoutEngine {
       BlockAlign.justify => ui.TextAlign.justify,
     };
 
-    final builder = ui.ParagraphBuilder(ui.ParagraphStyle(
-      textAlign: align,
-      textDirection: ui.TextDirection.ltr,
-      fontSize: baseSize * headingScale,
-      height: style.lineHeight * block.style.lineHeight,
-      fontFamily: fontFamily,
-    ));
+    final builder = ui.ParagraphBuilder(
+      ui.ParagraphStyle(
+        textAlign: align,
+        textDirection: ui.TextDirection.ltr,
+        fontSize: baseSize * headingScale,
+        height: style.lineHeight * block.style.lineHeight,
+        fontFamily: fontFamily,
+      ),
+    );
 
     if (marker.isNotEmpty) {
-      builder.pushStyle(ui.TextStyle(
-        color: foreground,
-        fontSize: baseSize * headingScale,
-        fontWeight: isHeading ? ui.FontWeight.bold : null,
-        fontFamily: fontFamily,
-      ));
+      builder.pushStyle(
+        ui.TextStyle(
+          color: foreground,
+          fontSize: baseSize * headingScale,
+          fontWeight: isHeading ? ui.FontWeight.bold : null,
+          fontFamily: fontFamily,
+        ),
+      );
       builder.addText(marker);
       builder.pop();
     }
@@ -222,16 +241,20 @@ class LayoutEngine {
           var scale = runStyle.sizeScale * headingScale;
           // Super/subscript: size reduced, baseline shift not approximated.
           if (runStyle.baseline != TextBaselineShift.none) scale *= 0.7;
-          builder.pushStyle(ui.TextStyle(
-            color:
-                runStyle.color != null ? ui.Color(runStyle.color!) : foreground,
-            fontWeight:
-                (runStyle.bold || isHeading) ? ui.FontWeight.bold : null,
-            fontStyle: runStyle.italic ? ui.FontStyle.italic : null,
-            decoration: _decorationFor(runStyle),
-            fontSize: baseSize * scale,
-            fontFamily: fontFamily,
-          ));
+          builder.pushStyle(
+            ui.TextStyle(
+              color: runStyle.color != null
+                  ? ui.Color(runStyle.color!)
+                  : foreground,
+              fontWeight: (runStyle.bold || isHeading)
+                  ? ui.FontWeight.bold
+                  : null,
+              fontStyle: runStyle.italic ? ui.FontStyle.italic : null,
+              decoration: _decorationFor(runStyle),
+              fontSize: baseSize * scale,
+              fontFamily: fontFamily,
+            ),
+          );
           builder.addText(text);
           builder.pop();
         case BreakInline():
@@ -291,22 +314,30 @@ class LayoutEngine {
       final aspect = intrinsic.width / intrinsic.height;
       var requestedHeight = imageStyle.height?.resolve(contentHeight);
       final requestedWidth = math.max(
-          1.0,
-          imageStyle.width?.resolve(contentWidth) ??
-              (requestedHeight != null
-                  ? requestedHeight * aspect
-                  : intrinsic.width));
-      requestedHeight =
-          math.max(1.0, requestedHeight ?? requestedWidth / aspect);
-      final maxWidth = (imageStyle.maxWidth?.resolve(contentWidth) ??
-              contentWidth)
-          .clamp(1.0, contentWidth);
-      final maxHeight = (imageStyle.maxHeight?.resolve(contentHeight) ??
-              contentHeight)
-          .clamp(1.0, contentHeight);
+        1.0,
+        imageStyle.width?.resolve(contentWidth) ??
+            (requestedHeight != null
+                ? requestedHeight * aspect
+                : intrinsic.width),
+      );
+      requestedHeight = math.max(
+        1.0,
+        requestedHeight ?? requestedWidth / aspect,
+      );
+      final maxWidth =
+          (imageStyle.maxWidth?.resolve(contentWidth) ?? contentWidth).clamp(
+            1.0,
+            contentWidth,
+          );
+      final maxHeight =
+          (imageStyle.maxHeight?.resolve(contentHeight) ?? contentHeight).clamp(
+            1.0,
+            contentHeight,
+          );
       final scale = math.min(
-          math.min(maxWidth / requestedWidth, maxHeight / requestedHeight),
-          1.0);
+        math.min(maxWidth / requestedWidth, maxHeight / requestedHeight),
+        1.0,
+      );
       width = requestedWidth * scale;
       height = requestedHeight * scale;
     }
@@ -417,24 +448,26 @@ class _Paginator {
       if (lineEnd == lineStart) continue; // page was advanced; retry
 
       final sliceTop = tops[lineStart];
-      items.add(TextPlacement(
-        paragraph: prepared.paragraph,
-        startLine: lineStart,
-        endLine: lineEnd,
-        x: prepared.x,
-        y: cursorY,
-        width: prepared.width,
-        source: prepared.source,
-        nodeId: prepared.nodeId,
-        spineIndex: prepared.spineIndex,
-        textOffsetAtStart: lineStart == 0
-            ? 0
-            : _lineStartOffset(prepared, lineStart),
-        lineMetrics: metrics,
-        sliceTop: sliceTop,
-        sliceHeight: sliceBottom - sliceTop,
-        sectionTextOffset: prepared.sectionTextOffset,
-      ));
+      items.add(
+        TextPlacement(
+          paragraph: prepared.paragraph,
+          startLine: lineStart,
+          endLine: lineEnd,
+          x: prepared.x,
+          y: cursorY,
+          width: prepared.width,
+          source: prepared.source,
+          nodeId: prepared.nodeId,
+          spineIndex: prepared.spineIndex,
+          textOffsetAtStart: lineStart == 0
+              ? 0
+              : _lineStartOffset(prepared, lineStart),
+          lineMetrics: metrics,
+          sliceTop: sliceTop,
+          sliceHeight: sliceBottom - sliceTop,
+          sectionTextOffset: prepared.sectionTextOffset,
+        ),
+      );
       hasContent = true;
       cursorY += sliceBottom - sliceTop;
       lineStart = lineEnd;
@@ -443,15 +476,21 @@ class _Paginator {
     _setMarginAfter(prepared.marginAfter);
   }
 
-  void pushImage(String href, double width, double height,
-      {required double gap}) {
+  void pushImage(
+    String href,
+    double width,
+    double height, {
+    required double gap,
+  }) {
     _collapseMargin(gap);
     if (height > remaining + _eps && hasContent) advance();
     final x = left + (this.width - width) / 2;
-    items.add(ImagePlacement(
-      href: href,
-      rect: ui.Rect.fromLTWH(x, cursorY, width, height),
-    ));
+    items.add(
+      ImagePlacement(
+        href: href,
+        rect: ui.Rect.fromLTWH(x, cursorY, width, height),
+      ),
+    );
     hasContent = true;
     cursorY += height;
     _setMarginAfter(gap);
@@ -460,9 +499,9 @@ class _Paginator {
   void pushSeparator({required double vMargin}) {
     _addSpacing(vMargin);
     if (1.0 > remaining + _eps && hasContent) advance();
-    items.add(SeparatorPlacement(
-      rect: ui.Rect.fromLTWH(left, cursorY, width, 1),
-    ));
+    items.add(
+      SeparatorPlacement(rect: ui.Rect.fromLTWH(left, cursorY, width, 1)),
+    );
     hasContent = true;
     cursorY += 1;
     _addSpacing(vMargin);
@@ -513,11 +552,12 @@ class _Paginator {
   /// paragraph line [line], excluding the synthetic marker prefix.
   int _lineStartOffset(_PreparedText prepared, int line) {
     final metric = prepared.metrics[line];
-    final position = prepared.paragraph.getPositionForOffset(ui.Offset(
-      metric.left + 0.1,
-      prepared.lineTops[line] + metric.height / 2,
-    ));
-    return (position.offset - prepared.markerLength)
-        .clamp(0, prepared.textLength);
+    final position = prepared.paragraph.getPositionForOffset(
+      ui.Offset(metric.left + 0.1, prepared.lineTops[line] + metric.height / 2),
+    );
+    return (position.offset - prepared.markerLength).clamp(
+      0,
+      prepared.textLength,
+    );
   }
 }

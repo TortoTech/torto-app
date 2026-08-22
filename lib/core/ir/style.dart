@@ -64,7 +64,14 @@ class TextStyle {
 
   @override
   int get hashCode => Object.hash(
-      bold, italic, underline, strikethrough, sizeScale, color, baseline);
+    bold,
+    italic,
+    underline,
+    strikethrough,
+    sizeScale,
+    color,
+    baseline,
+  );
 }
 
 enum BlockAlign { start, center, end, justify }

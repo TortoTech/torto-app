@@ -82,7 +82,8 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
         // the real reader now that a controller exists.
         if (mounted) setState(() {});
         _schedulePeekPreparation();
-      } catch (_) {
+      } catch (error, stackTrace) {
+        debugPrint('Could not open ${widget.file.path}: $error\n$stackTrace');
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Could not open this book.')),

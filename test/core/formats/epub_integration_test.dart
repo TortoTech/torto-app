@@ -1,7 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:torto/core/epub/epub_book_source.dart';
+import 'package:torto/core/formats/epub_book_source.dart';
 import 'package:torto/core/ir/ir.dart';
 
 /// Integration smoke tests against real books from the torto repo's

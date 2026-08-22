@@ -2,13 +2,18 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
 
-import '../../core/epub/epub_book_source.dart';
+import '../../core/formats/formats.dart';
+import '../../core/formats/pdf/pdf_cover.dart';
+import '../sync/derived_data_store.dart';
 
 /// One imported book on disk.
 class LibraryBook {
+  /// Lowercase SHA-256 of the exact imported bytes (the cross-device ID).
+  final String id;
   final File file;
 
   /// Display title from package metadata, with the file name as fallback.
@@ -18,22 +23,26 @@ class LibraryBook {
   final List<String> languages;
   final Uint8List? coverBytes;
   final int sizeBytes;
+  final int addedAt;
 
   const LibraryBook({
+    this.id = '',
     required this.file,
     required this.title,
     this.authors = const [],
     this.languages = const [],
     this.coverBytes,
     required this.sizeBytes,
+    this.addedAt = 0,
   });
 }
 
-/// On-disk library: EPUB files under `<app documents>/books/`.
+/// On-disk library: book files (EPUB, FB2/FBZ, CBZ) under
+/// `<app documents>/books/`.
 ///
 /// Pass [booksDir] in tests to avoid touching path_provider.
 class LibraryStore {
-  static const _metadataVersion = 1;
+  static const _metadataVersion = 2;
 
   final Directory? _overrideDir;
   Directory? _dir;
@@ -49,6 +58,8 @@ class LibraryStore {
     return _dir = Directory('${docs.path}${Platform.pathSeparator}books');
   }
 
+  Future<Directory> booksDirectory() => _booksDir();
+
   /// Lists imported books, sorted by title. A missing directory (fresh
   /// install) yields an empty library.
   Future<List<LibraryBook>> list() async {
@@ -57,7 +68,7 @@ class LibraryStore {
     final books = <LibraryBook>[];
     await for (final entity in dir.list()) {
       if (entity is! File) continue;
-      if (!entity.path.toLowerCase().endsWith('.epub')) continue;
+      if (!hasSupportedBookExtension(entity.path)) continue;
       books.add(await _readBook(entity));
     }
     books.sort(
@@ -66,26 +77,31 @@ class LibraryStore {
     return books;
   }
 
-  /// Opens the platform file picker (EPUB only) and copies the chosen file
-  /// into the library directory. Returns the imported file, or null when the
-  /// user cancelled. Name collisions get a `-1`, `-2`, … suffix.
+  /// Opens the platform file picker and copies the chosen file into the
+  /// library directory. Returns the imported file, or null when the user
+  /// cancelled. Name collisions get a `-1`, `-2`, … suffix.
   Future<File?> import() async {
     final files = await FilePicker.pickFiles(
       type: FileType.custom,
-      allowedExtensions: const ['epub'],
+      // `zip` admits `.fb2.zip`; other zips are rejected by name below.
+      allowedExtensions: [...supportedBookExtensions, 'zip'],
     );
     if (files.isEmpty) return null;
     final picked = files.first;
     final bytes = await picked.readAsBytes();
 
+    final name = picked.name.isEmpty ? 'book' : picked.name;
+    if (!hasSupportedBookExtension(name)) {
+      // A plain .zip is not a book (FBZ must be named *.fb2.zip).
+      throw FormatException('不支持的电子书格式: $name');
+    }
+
     final dir = await _booksDir();
     await dir.create(recursive: true);
 
-    var name = picked.name.isEmpty ? 'book.epub' : picked.name;
-    if (!name.toLowerCase().endsWith('.epub')) name = '$name.epub';
     final dot = name.lastIndexOf('.');
     final base = dot > 0 ? name.substring(0, dot) : name;
-    final ext = dot > 0 ? name.substring(dot) : '.epub';
+    final ext = dot > 0 ? name.substring(dot) : '';
 
     var candidate = File('${dir.path}${Platform.pathSeparator}$name');
     var suffix = 1;
@@ -107,10 +123,97 @@ class LibraryStore {
     if (await cover.exists()) await cover.delete();
   }
 
+  /// Atomically installs a fully downloaded and verified remote book.
+  Future<File> installDownloaded(
+    File downloaded,
+    String contentId,
+    String remoteFileName, {
+    String remoteTitle = '',
+    List<String> remoteAuthors = const [],
+    Uint8List? remoteCoverBytes,
+    int? remoteAddedAt,
+  }) async {
+    final dir = await _booksDir();
+    await dir.create(recursive: true);
+    final safeName = _baseName(remoteFileName).trim();
+    final format = BookFormat.fromFileName(safeName);
+    if (safeName.isEmpty ||
+        format == null ||
+        !RegExp(r'^[0-9a-f]{64}$').hasMatch(contentId)) {
+      throw const FormatException('Remote book has an unsupported file name.');
+    }
+    final target = File(
+      '${dir.path}${Platform.pathSeparator}$contentId.${format.name}',
+    );
+    if (await target.exists()) {
+      final existingDigest = await sha256.bind(target.openRead()).first;
+      if (existingDigest.toString() == contentId) {
+        if (await downloaded.exists()) await downloaded.delete();
+        await _readBook(
+          target,
+          forceRefresh: true,
+          sourceFileName: safeName,
+          preferredTitle: remoteTitle,
+          preferredAuthors: remoteAuthors,
+          preferredCoverBytes: remoteCoverBytes,
+          preferredAddedAt: remoteAddedAt,
+        );
+        return target;
+      }
+      await delete(target);
+    }
+    await downloaded.rename(target.path);
+    await _readBook(
+      target,
+      forceRefresh: true,
+      sourceFileName: safeName,
+      preferredTitle: remoteTitle,
+      preferredAuthors: remoteAuthors,
+      preferredCoverBytes: remoteCoverBytes,
+      preferredAddedAt: remoteAddedAt,
+    );
+    return target;
+  }
+
+  /// Applies authoritative manifest metadata without reopening large books.
+  Future<void> applyRemoteMetadata(
+    LibraryBook book, {
+    String remoteTitle = '',
+    List<String> remoteAuthors = const [],
+    Uint8List? remoteCoverBytes,
+    int? remoteAddedAt,
+  }) async {
+    final stat = await book.file.stat();
+    final title = remoteTitle.trim().isEmpty ? book.title : remoteTitle.trim();
+    final normalizedAuthors = _normalizedValues(remoteAuthors);
+    final authors = normalizedAuthors.isEmpty
+        ? book.authors
+        : normalizedAuthors;
+    final coverBytes = remoteCoverBytes != null && remoteCoverBytes.isNotEmpty
+        ? remoteCoverBytes
+        : book.coverBytes;
+    await _writeBookCache(
+      file: book.file,
+      sizeBytes: stat.size,
+      modifiedMillis: stat.modified.millisecondsSinceEpoch,
+      id: book.id,
+      title: title,
+      authors: authors,
+      languages: book.languages,
+      coverBytes: coverBytes,
+      addedAt: remoteAddedAt ?? book.addedAt,
+    );
+  }
+
   Future<LibraryBook> _readBook(
     File file, {
     Uint8List? bytes,
     bool forceRefresh = false,
+    String? sourceFileName,
+    String preferredTitle = '',
+    List<String> preferredAuthors = const [],
+    Uint8List? preferredCoverBytes,
+    int? preferredAddedAt,
   }) async {
     final stat = await file.stat();
     final sizeBytes = stat.size;
@@ -121,18 +224,44 @@ class LibraryStore {
         sizeBytes: sizeBytes,
         modifiedMillis: modifiedMillis,
       );
-      if (cached != null) return cached;
+      if (cached != null) {
+        if (cached.coverBytes == null &&
+            BookFormat.fromFileName(file.path) == BookFormat.pdf) {
+          final generatedCover = await renderPdfCover(file.path);
+          if (generatedCover != null && generatedCover.isNotEmpty) {
+            await applyRemoteMetadata(cached, remoteCoverBytes: generatedCover);
+            return LibraryBook(
+              id: cached.id,
+              file: cached.file,
+              title: cached.title,
+              authors: cached.authors,
+              languages: cached.languages,
+              coverBytes: generatedCover,
+              sizeBytes: cached.sizeBytes,
+              addedAt: cached.addedAt,
+            );
+          }
+        }
+        return cached;
+      }
     }
 
-    var title = titleOf(file.path);
+    final content = bytes ?? await file.readAsBytes();
+    var id = sha256.convert(content).toString();
+    var title = titleOf(sourceFileName ?? file.path);
     var authors = const <String>[];
     var languages = const <String>[];
     Uint8List? coverBytes;
     try {
-      final source = await EpubBookSource.fromBytes(
-        bytes ?? await file.readAsBytes(),
+      final source = await openBook(
+        content,
+        sourceFileName ?? _baseName(file.path),
+        filePath: file.path,
+        titleHint: preferredTitle,
+        publicationIdHint: id,
       );
       final metadata = source.book.metadata;
+      id = source.book.id;
       final packageTitle = metadata.title.trim();
       if (packageTitle.isNotEmpty) title = packageTitle;
       authors = _normalizedValues(metadata.authors);
@@ -143,33 +272,78 @@ class LibraryStore {
       // A damaged book remains visible and openable by file name. Cache the
       // fallback until its size or modification time changes.
     }
+    if (preferredTitle.trim().isNotEmpty) title = preferredTitle.trim();
+    final normalizedPreferredAuthors = _normalizedValues(preferredAuthors);
+    if (normalizedPreferredAuthors.isNotEmpty) {
+      authors = normalizedPreferredAuthors;
+    }
+    if (preferredCoverBytes != null && preferredCoverBytes.isNotEmpty) {
+      coverBytes = preferredCoverBytes;
+    }
+    if ((coverBytes == null || coverBytes.isEmpty) &&
+        BookFormat.fromFileName(sourceFileName ?? file.path) ==
+            BookFormat.pdf) {
+      coverBytes = await renderPdfCover(file.path);
+    }
+    final addedAt = preferredAddedAt ?? stat.changed.millisecondsSinceEpoch;
+    await _writeBookCache(
+      file: file,
+      sizeBytes: sizeBytes,
+      modifiedMillis: modifiedMillis,
+      id: id,
+      title: title,
+      authors: authors,
+      languages: languages,
+      coverBytes: coverBytes,
+      addedAt: addedAt,
+    );
+    return _withDerivedMetadata(
+      LibraryBook(
+        id: id,
+        file: file,
+        title: title,
+        authors: authors,
+        languages: languages,
+        coverBytes: coverBytes,
+        sizeBytes: sizeBytes,
+        addedAt: addedAt,
+      ),
+    );
+  }
 
+  Future<void> _writeBookCache({
+    required File file,
+    required int sizeBytes,
+    required int modifiedMillis,
+    required String id,
+    required String title,
+    required List<String> authors,
+    required List<String> languages,
+    required Uint8List? coverBytes,
+    required int addedAt,
+  }) async {
     final coverFile = _coverFile(file);
-    if (coverBytes != null && coverBytes.isNotEmpty) {
-      await coverFile.writeAsBytes(coverBytes, flush: true);
-    } else {
-      coverBytes = null;
-      if (await coverFile.exists()) await coverFile.delete();
+    final storedCover = coverBytes != null && coverBytes.isNotEmpty
+        ? coverBytes
+        : null;
+    if (storedCover != null) {
+      await coverFile.writeAsBytes(storedCover, flush: true);
+    } else if (await coverFile.exists()) {
+      await coverFile.delete();
     }
     await _metadataFile(file).writeAsString(
       jsonEncode({
         'version': _metadataVersion,
         'sizeBytes': sizeBytes,
         'modifiedMillis': modifiedMillis,
+        'id': id,
+        'addedAt': addedAt,
         'title': title,
         'authors': authors,
         'languages': languages,
-        'hasCover': coverBytes != null,
+        'hasCover': storedCover != null,
       }),
       flush: true,
-    );
-    return LibraryBook(
-      file: file,
-      title: title,
-      authors: authors,
-      languages: languages,
-      coverBytes: coverBytes,
-      sizeBytes: sizeBytes,
     );
   }
 
@@ -196,17 +370,40 @@ class LibraryStore {
         if (!await coverFile.exists()) return null;
         coverBytes = await coverFile.readAsBytes();
       }
-      return LibraryBook(
-        file: file,
-        title: title,
-        authors: authors,
-        languages: languages,
-        coverBytes: coverBytes,
-        sizeBytes: sizeBytes,
+      return await _withDerivedMetadata(
+        LibraryBook(
+          id: decoded['id'] as String,
+          file: file,
+          title: title,
+          authors: authors,
+          languages: languages,
+          coverBytes: coverBytes,
+          sizeBytes: sizeBytes,
+          addedAt: decoded['addedAt'] as int? ?? modifiedMillis,
+        ),
       );
     } catch (_) {
       return null;
     }
+  }
+
+  Future<LibraryBook> _withDerivedMetadata(LibraryBook book) async {
+    final derived = await DerivedDataStore.fromBooksDirectory(
+      await _booksDir(),
+    ).metadata(book.id);
+    if (derived == null || (derived.title.isEmpty && derived.authors.isEmpty)) {
+      return book;
+    }
+    return LibraryBook(
+      id: book.id,
+      file: book.file,
+      title: derived.title.isEmpty ? book.title : derived.title,
+      authors: derived.authors.isEmpty ? book.authors : derived.authors,
+      languages: book.languages,
+      coverBytes: book.coverBytes,
+      sizeBytes: book.sizeBytes,
+      addedAt: book.addedAt,
+    );
   }
 
   static List<String> _stringList(Object? value) => value is List
@@ -230,8 +427,16 @@ class LibraryStore {
   static String titleOf(String path) {
     final normalized = path.replaceAll('\\', '/');
     var name = normalized.substring(normalized.lastIndexOf('/') + 1);
+    if (name.toLowerCase().endsWith('.fb2.zip')) {
+      return name.substring(0, name.length - '.fb2.zip'.length);
+    }
     final dot = name.lastIndexOf('.');
     if (dot > 0) name = name.substring(0, dot);
     return name;
+  }
+
+  static String _baseName(String path) {
+    final normalized = path.replaceAll('\\', '/');
+    return normalized.substring(normalized.lastIndexOf('/') + 1);
   }
 }

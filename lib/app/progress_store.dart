@@ -11,6 +11,7 @@ import '../core/ir/ir.dart';
 /// the default instance.
 class ProgressStore {
   static const String _keyPrefix = 'progress:';
+  static const String _activityKeyPrefix = 'progress_activity:';
 
   final SharedPreferences? _injected;
   SharedPreferences? _resolved;
@@ -33,11 +34,53 @@ class ProgressStore {
     }
   }
 
-  Future<void> save(LocatorV1 locator) async {
+  Future<void> save(LocatorV1 locator, {int? activityTimeMs}) async {
     final prefs = await _prefs;
     await prefs.setString(
       '$_keyPrefix${locator.publicationId}',
       jsonEncode(locator.toJson()),
     );
+    await markActivity(locator.publicationId, activityTimeMs: activityTimeMs);
+  }
+
+  Future<void> markActivity(String publicationId, {int? activityTimeMs}) async {
+    if (publicationId.isEmpty) return;
+    final prefs = await _prefs;
+    final key = '$_activityKeyPrefix$publicationId';
+    final next = activityTimeMs ?? DateTime.now().millisecondsSinceEpoch;
+    final current = prefs.getInt(key) ?? 0;
+    if (next > current) await prefs.setInt(key, next);
+  }
+
+  Future<Map<String, int>> activityTimes() async {
+    final prefs = await _prefs;
+    final result = <String, int>{};
+    for (final key in prefs.getKeys()) {
+      if (!key.startsWith(_activityKeyPrefix)) continue;
+      final value = prefs.getInt(key);
+      if (value != null && value >= 0) {
+        result[key.substring(_activityKeyPrefix.length)] = value;
+      }
+    }
+    return result;
+  }
+
+  Future<Map<String, LocatorV1>> all() async {
+    final prefs = await _prefs;
+    final result = <String, LocatorV1>{};
+    for (final key in prefs.getKeys()) {
+      if (!key.startsWith(_keyPrefix)) continue;
+      final raw = prefs.getString(key);
+      if (raw == null) continue;
+      try {
+        final locator = LocatorV1.fromJson(
+          jsonDecode(raw) as Map<String, dynamic>,
+        );
+        result[locator.publicationId] = locator;
+      } catch (_) {
+        // Ignore a single damaged entry without losing the remaining books.
+      }
+    }
+    return result;
   }
 }

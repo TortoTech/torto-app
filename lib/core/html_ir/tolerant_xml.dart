@@ -34,9 +34,11 @@ String decodeXmlBytes(List<int> bytes) {
 String _decodeUtf16(List<int> bytes, {required bool littleEndian}) {
   final units = <int>[];
   for (var i = 0; i + 1 < bytes.length; i += 2) {
-    units.add(littleEndian
-        ? bytes[i] | (bytes[i + 1] << 8)
-        : (bytes[i] << 8) | bytes[i + 1]);
+    units.add(
+      littleEndian
+          ? bytes[i] | (bytes[i + 1] << 8)
+          : (bytes[i] << 8) | bytes[i + 1],
+    );
   }
   return String.fromCharCodes(units);
 }
@@ -93,10 +95,10 @@ String escapeStrayAmpersands(String xml) {
 
 bool _isWellFormedReference(String xml, int start) {
   if (start >= xml.length) return false;
-  if (xml.codeUnitAt(start) == 0x23 /* # */) {
+  if (xml.codeUnitAt(start) == 0x23 /* # */ ) {
     var i = start + 1;
     var isHex = false;
-    if (i < xml.length && xml.codeUnitAt(i) == 0x78 /* x */) {
+    if (i < xml.length && xml.codeUnitAt(i) == 0x78 /* x */ ) {
       isHex = true;
       i++;
     }
@@ -105,8 +107,8 @@ bool _isWellFormedReference(String xml, int start) {
       final c = xml.codeUnitAt(i);
       final ok = isHex
           ? (c >= 0x30 && c <= 0x39) ||
-              (c >= 0x41 && c <= 0x46) ||
-              (c >= 0x61 && c <= 0x66)
+                (c >= 0x41 && c <= 0x46) ||
+                (c >= 0x61 && c <= 0x66)
           : c >= 0x30 && c <= 0x39;
       if (!ok) break;
       i++;

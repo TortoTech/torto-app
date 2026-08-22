@@ -36,14 +36,16 @@ List<TocViewItem> flattenToc(List<TocEntry> entries) {
     for (var i = 0; i < level.length; i++) {
       final entry = level[i];
       final id = ancestors.isEmpty ? '$i' : '${ancestors.last}/$i';
-      items.add(TocViewItem(
-        id: id,
-        label: entry.label,
-        spineIndex: entry.spineIndex,
-        depth: depth,
-        ancestors: List.unmodifiable(ancestors),
-        hasChildren: entry.children.isNotEmpty,
-      ));
+      items.add(
+        TocViewItem(
+          id: id,
+          label: entry.label,
+          spineIndex: entry.spineIndex,
+          depth: depth,
+          ancestors: List.unmodifiable(ancestors),
+          hasChildren: entry.children.isNotEmpty,
+        ),
+      );
       append(entry.children, depth + 1, [...ancestors, id]);
     }
   }
@@ -56,10 +58,9 @@ List<TocViewItem> flattenToc(List<TocEntry> entries) {
 /// ancestor is expanded (roots are always visible). Mirrors torto's
 /// `visible_toc_row_indices`.
 List<TocViewItem> visibleTocItems(
-        List<TocViewItem> items, Set<String> expandedIds) =>
-    items
-        .where((item) => item.ancestors.every(expandedIds.contains))
-        .toList();
+  List<TocViewItem> items,
+  Set<String> expandedIds,
+) => items.where((item) => item.ancestors.every(expandedIds.contains)).toList();
 
 /// Id of the active row for [currentSection]: the LAST item in document
 /// order whose spine index is at or before the current section. Items

@@ -132,10 +132,15 @@ class _SectionParser {
   _SectionParser(this.spineIndex, this.href, this.baseDir, this.document) {
     for (final element in document.descendants.whereType<XmlElement>()) {
       if (_name(element) == 'style') {
-        styles.addCss(element.descendants
-            .where((node) => node is XmlText || node is XmlCDATA)
-            .map((node) => node is XmlText ? node.value : (node as XmlCDATA).value)
-            .join());
+        styles.addCss(
+          element.descendants
+              .where((node) => node is XmlText || node is XmlCDATA)
+              .map(
+                (node) =>
+                    node is XmlText ? node.value : (node as XmlCDATA).value,
+              )
+              .join(),
+        );
       }
     }
   }
@@ -148,17 +153,17 @@ class _SectionParser {
         break;
       }
     }
-    root ??= document.rootElement;    _parseChildren(root);
+    root ??= document.rootElement;
+    _parseChildren(root);
     return Section(spineIndex: spineIndex, href: href, blocks: blocks);
   }
 
   String _allocateNode() => 'n${_nextNode++}';
 
   SourceRange _sourceFor(String nodeId, int textLength) => SourceRange(
-        start: SourceAnchor(spine: spineIndex, node: nodeId, textOffset: 0),
-        end: SourceAnchor(
-            spine: spineIndex, node: nodeId, textOffset: textLength),
-      );
+    start: SourceAnchor(spine: spineIndex, node: nodeId, textOffset: 0),
+    end: SourceAnchor(spine: spineIndex, node: nodeId, textOffset: textLength),
+  );
 
   // ---------------------------------------------------------------- blocks
 
@@ -181,22 +186,35 @@ class _SectionParser {
       case 'h1' || 'h2' || 'h3' || 'h4' || 'h5' || 'h6':
         final level = int.tryParse(name.substring(1)) ?? 1;
         final style = _blockStyleFor(
-            element,
-            const BlockStyle(
-                marginBefore: 32, marginAfter: 8, lineHeight: 1.3));
-        _pushTextBlock(element, TextBlockKind.heading, style,
-            headingLevel: level);
+          element,
+          const BlockStyle(marginBefore: 32, marginAfter: 8, lineHeight: 1.3),
+        );
+        _pushTextBlock(
+          element,
+          TextBlockKind.heading,
+          style,
+          headingLevel: level,
+        );
       case 'p':
         _pushTextBlock(
-            element, TextBlockKind.paragraph, _blockStyleFor(element));
+          element,
+          TextBlockKind.paragraph,
+          _blockStyleFor(element),
+        );
       case 'blockquote':
         final style = _blockStyleFor(element);
-        _pushTextBlock(element, TextBlockKind.blockquote,
-            style.copyWith(indent: style.indent + 24));
+        _pushTextBlock(
+          element,
+          TextBlockKind.blockquote,
+          style.copyWith(indent: style.indent + 24),
+        );
       case 'pre':
-        _pushTextBlock(element, TextBlockKind.preformatted,
-            _blockStyleFor(element, const BlockStyle(lineHeight: 1.35)),
-            preserveWhitespace: true);
+        _pushTextBlock(
+          element,
+          TextBlockKind.preformatted,
+          _blockStyleFor(element, const BlockStyle(lineHeight: 1.35)),
+          preserveWhitespace: true,
+        );
       case 'ul':
         _parseList(element, ordered: false, depth: listDepth);
       case 'ol':
@@ -206,8 +224,7 @@ class _SectionParser {
         _parseContainer(element, listDepth);
       case 'li':
         // Bare <li> outside an enclosing list.
-        _emitListItem(element,
-            ordered: false, ordinal: 1, depth: listDepth);
+        _emitListItem(element, ordered: false, ordinal: 1, depth: listDepth);
       case 'img' || 'image':
         _pushImage(element);
       case 'hr':
@@ -216,7 +233,10 @@ class _SectionParser {
         _parseTable(element);
       case 'figcaption':
         _pushTextBlock(
-            element, TextBlockKind.paragraph, _blockStyleFor(element));
+          element,
+          TextBlockKind.paragraph,
+          _blockStyleFor(element),
+        );
       default:
         // Transparent container (div/section/article/…) or unknown element:
         // recurse, lifting mixed inline content into paragraphs.
@@ -261,7 +281,11 @@ class _SectionParser {
     flush();
   }
 
-  void _parseList(XmlElement list, {required bool ordered, required int depth}) {
+  void _parseList(
+    XmlElement list, {
+    required bool ordered,
+    required int depth,
+  }) {
     var ordinal = 1;
     for (final item in list.childElements) {
       if (_name(item) != 'li') continue;
@@ -270,11 +294,16 @@ class _SectionParser {
     }
   }
 
-  void _emitListItem(XmlElement item,
-      {required bool ordered, required int ordinal, required int depth}) {
+  void _emitListItem(
+    XmlElement item, {
+    required bool ordered,
+    required int ordinal,
+    required int depth,
+  }) {
     var style = _blockStyleFor(item);
     style = style.copyWith(
-        marginStart: math.max(style.marginStart, 24.0 * (depth + 1)));
+      marginStart: math.max(style.marginStart, 24.0 * (depth + 1)),
+    );
     final textStyle = _textStyleForBlock(item, TextBlockKind.listItem);
     final collector = _InlineCollector(preserveWhitespace: false);
     for (final child in item.children) {
@@ -285,8 +314,14 @@ class _SectionParser {
     }
     collector.finish();
     if (collector.content.isNotEmpty) {
-      _emitTextBlock(TextBlockKind.listItem, style, collector.content,
-          listOrdered: ordered, listOrdinal: ordinal, listDepth: depth);
+      _emitTextBlock(
+        TextBlockKind.listItem,
+        style,
+        collector.content,
+        listOrdered: ordered,
+        listOrdinal: ordinal,
+        listDepth: depth,
+      );
     }
     for (final image in _descendantImages(item, skipNestedLists: true)) {
       _pushImage(image);
@@ -317,7 +352,10 @@ class _SectionParser {
         collector.finish();
         if (collector.content.isNotEmpty) {
           _emitTextBlock(
-              TextBlockKind.paragraph, _blockStyleFor(cell), collector.content);
+            TextBlockKind.paragraph,
+            _blockStyleFor(cell),
+            collector.content,
+          );
         }
       }
     }
@@ -332,14 +370,17 @@ class _SectionParser {
     return null;
   }
 
-  static bool _hasDescendantImage(XmlElement element) => element.descendants
-      .whereType<XmlElement>()
-      .any((node) =>
-          !identical(node, element) &&
-          (_name(node) == 'img' || _name(node) == 'image'));
+  static bool _hasDescendantImage(XmlElement element) =>
+      element.descendants.whereType<XmlElement>().any(
+        (node) =>
+            !identical(node, element) &&
+            (_name(node) == 'img' || _name(node) == 'image'),
+      );
 
-  Iterable<XmlElement> _descendantImages(XmlElement element,
-      {bool skipNestedLists = false}) {
+  Iterable<XmlElement> _descendantImages(
+    XmlElement element, {
+    bool skipNestedLists = false,
+  }) {
     bool underNestedList(XmlElement node) {
       if (!skipNestedLists) return false;
       var current = node.parentElement;
@@ -350,34 +391,51 @@ class _SectionParser {
       return false;
     }
 
-    return element.descendants.whereType<XmlElement>().where((node) =>
-        !identical(node, element) &&
-        (_name(node) == 'img' || _name(node) == 'image') &&
-        !underNestedList(node));
+    return element.descendants.whereType<XmlElement>().where(
+      (node) =>
+          !identical(node, element) &&
+          (_name(node) == 'img' || _name(node) == 'image') &&
+          !underNestedList(node),
+    );
   }
 
-  void _pushTextBlock(XmlElement element, TextBlockKind kind, BlockStyle style,
-      {int headingLevel = 0, bool preserveWhitespace = false}) {
-    final textStyle = _textStyleForBlock(element, kind,
-        headingLevel: headingLevel);
-    final collector =
-        _InlineCollector(preserveWhitespace: preserveWhitespace);
+  void _pushTextBlock(
+    XmlElement element,
+    TextBlockKind kind,
+    BlockStyle style, {
+    int headingLevel = 0,
+    bool preserveWhitespace = false,
+  }) {
+    final textStyle = _textStyleForBlock(
+      element,
+      kind,
+      headingLevel: headingLevel,
+    );
+    final collector = _InlineCollector(preserveWhitespace: preserveWhitespace);
     _collectInline(element, textStyle, null, collector);
     collector.finish();
     if (collector.content.isNotEmpty) {
-      _emitTextBlock(kind, style, collector.content,
-          headingLevel: headingLevel);
+      _emitTextBlock(
+        kind,
+        style,
+        collector.content,
+        headingLevel: headingLevel,
+      );
     }
     for (final image in _descendantImages(element)) {
       _pushImage(image);
     }
   }
 
-  void _emitTextBlock(TextBlockKind kind, BlockStyle style, List<Inline> inlines,
-      {int headingLevel = 0,
-      bool listOrdered = false,
-      int listOrdinal = 0,
-      int listDepth = 0}) {
+  void _emitTextBlock(
+    TextBlockKind kind,
+    BlockStyle style,
+    List<Inline> inlines, {
+    int headingLevel = 0,
+    bool listOrdered = false,
+    int listOrdinal = 0,
+    int listDepth = 0,
+  }) {
     final nodeId = _allocateNode();
     // Source range spans the block's normalized plain text (UTF-16 units;
     // Dart String.length is already UTF-16 code units).
@@ -388,42 +446,54 @@ class _SectionParser {
         BreakInline() => 1,
       };
     }
-    blocks.add(TextBlock(
-      kind: kind,
-      headingLevel: kind == TextBlockKind.heading ? headingLevel : 0,
-      listOrdered: listOrdered,
-      listOrdinal: listOrdinal,
-      listDepth: listDepth,
-      inlines: inlines,
-      style: style,
-      source: _sourceFor(nodeId, textLength),
-      nodeId: nodeId,
-    ));
+    blocks.add(
+      TextBlock(
+        kind: kind,
+        headingLevel: kind == TextBlockKind.heading ? headingLevel : 0,
+        listOrdered: listOrdered,
+        listOrdinal: listOrdinal,
+        listDepth: listDepth,
+        inlines: inlines,
+        style: style,
+        source: _sourceFor(nodeId, textLength),
+        nodeId: nodeId,
+      ),
+    );
   }
 
   void _pushImage(XmlElement element) {
     final src = _attr(element, 'src') ?? _attr(element, 'href');
     if (src == null || src.trim().isEmpty) return;
     final nodeId = _allocateNode();
-    blocks.add(ImageBlock(
-      href: resolvePackageHref(baseDir, src),
-      alt: _attr(element, 'alt') ?? '',
-      style: _imageStyleFor(element),
-      source: _sourceFor(nodeId, 0),
-    ));
+    blocks.add(
+      ImageBlock(
+        href: resolvePackageHref(baseDir, src),
+        alt: _attr(element, 'alt') ?? '',
+        style: _imageStyleFor(element),
+        source: _sourceFor(nodeId, 0),
+      ),
+    );
   }
 
   // --------------------------------------------------------------- inlines
 
-  void _collectInline(XmlNode node, TextStyle inherited, String? link,
-      _InlineCollector collector) {
+  void _collectInline(
+    XmlNode node,
+    TextStyle inherited,
+    String? link,
+    _InlineCollector collector,
+  ) {
     for (final child in node.children) {
       _collectInlineNode(child, inherited, link, collector);
     }
   }
 
-  void _collectInlineNode(XmlNode node, TextStyle inherited, String? link,
-      _InlineCollector collector) {
+  void _collectInlineNode(
+    XmlNode node,
+    TextStyle inherited,
+    String? link,
+    _InlineCollector collector,
+  ) {
     if (node is XmlText) {
       collector.pushText(node.value, inherited, link);
       return;
@@ -456,13 +526,17 @@ class _SectionParser {
       case 's' || 'strike' || 'del':
         style = _copyTextStyle(style, strikethrough: true);
       case 'sup':
-        style = _copyTextStyle(style,
-            baseline: TextBaselineShift.superscript,
-            sizeScale: style.sizeScale * 0.75);
+        style = _copyTextStyle(
+          style,
+          baseline: TextBaselineShift.superscript,
+          sizeScale: style.sizeScale * 0.75,
+        );
       case 'sub':
-        style = _copyTextStyle(style,
-            baseline: TextBaselineShift.subscript,
-            sizeScale: style.sizeScale * 0.75);
+        style = _copyTextStyle(
+          style,
+          baseline: TextBaselineShift.subscript,
+          sizeScale: style.sizeScale * 0.75,
+        );
       case 'small':
         style = _copyTextStyle(style, sizeScale: style.sizeScale * 0.85);
       case 'big':
@@ -499,8 +573,10 @@ class _SectionParser {
     return chain.reversed.toList();
   }
 
-  BlockStyle _blockStyleFor(XmlElement element,
-      [BlockStyle base = BlockStyle.normal]) {
+  BlockStyle _blockStyleFor(
+    XmlElement element, [
+    BlockStyle base = BlockStyle.normal,
+  ]) {
     var align = base.align;
     var marginBefore = base.marginBefore;
     var marginAfter = base.marginAfter;
@@ -513,11 +589,15 @@ class _SectionParser {
       final props = styles.cascadedProperties(ancestor);
       // Reading IR flattens nested boxes: accumulate the start-side offset
       // contributed by every containing box.
-      marginStart += _cssLength(_firstOf(
-              props, const ['margin-inline-start', 'margin-left'])) ??
+      marginStart +=
+          _cssLength(
+            _firstOf(props, const ['margin-inline-start', 'margin-left']),
+          ) ??
           0;
-      marginStart += _cssLength(_firstOf(
-              props, const ['padding-inline-start', 'padding-left'])) ??
+      marginStart +=
+          _cssLength(
+            _firstOf(props, const ['padding-inline-start', 'padding-left']),
+          ) ??
           0;
       switch (props['text-align']) {
         case 'center':
@@ -551,21 +631,29 @@ class _SectionParser {
     );
   }
 
-  TextStyle _textStyleForBlock(XmlElement element, TextBlockKind kind,
-      {int headingLevel = 0}) {
+  TextStyle _textStyleForBlock(
+    XmlElement element,
+    TextBlockKind kind, {
+    int headingLevel = 0,
+  }) {
     var style = TextStyle.plain;
     for (final ancestor in _chain(element)) {
       if (identical(ancestor, element)) {
         style = _applySemanticBlockStyle(style, kind, headingLevel);
       }
-      style =
-          _applyCssTextProperties(style, styles.cascadedProperties(ancestor));
+      style = _applyCssTextProperties(
+        style,
+        styles.cascadedProperties(ancestor),
+      );
     }
     return style;
   }
 
   static TextStyle _applySemanticBlockStyle(
-      TextStyle style, TextBlockKind kind, int headingLevel) {
+    TextStyle style,
+    TextBlockKind kind,
+    int headingLevel,
+  ) {
     switch (kind) {
       case TextBlockKind.heading:
         final scale = switch (headingLevel) {
@@ -574,8 +662,11 @@ class _SectionParser {
           3 => 1.15,
           _ => 1.05,
         };
-        return _copyTextStyle(style,
-            bold: true, sizeScale: style.sizeScale * scale);
+        return _copyTextStyle(
+          style,
+          bold: true,
+          sizeScale: style.sizeScale * scale,
+        );
       case TextBlockKind.preformatted:
         return _copyTextStyle(style, sizeScale: style.sizeScale * 0.9);
       default:
@@ -594,7 +685,11 @@ class _SectionParser {
     maxWidth = _imageLength(props['max-width']);
     maxHeight = _imageLength(props['max-height']);
     return ImageStyle(
-        width: width, height: height, maxWidth: maxWidth, maxHeight: maxHeight);
+      width: width,
+      height: height,
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+    );
   }
 
   static String? _firstOf(Map<String, String> props, List<String> names) {
@@ -628,8 +723,7 @@ TextStyle _copyTextStyle(
 }
 
 /// Applies the supported inline CSS properties of one element onto [base].
-TextStyle _applyCssTextProperties(
-    TextStyle base, Map<String, String> props) {
+TextStyle _applyCssTextProperties(TextStyle base, Map<String, String> props) {
   var style = base;
   final fontSize = _cssScale(props['font-size']);
   if (fontSize != null) {
@@ -637,21 +731,28 @@ TextStyle _applyCssTextProperties(
   }
   final fontWeight = props['font-weight'];
   if (fontWeight != null) {
-    style = _copyTextStyle(style,
-        bold: fontWeight == 'bold' ||
-            fontWeight == 'bolder' ||
-            (int.tryParse(fontWeight) ?? 0) >= 600);
+    style = _copyTextStyle(
+      style,
+      bold:
+          fontWeight == 'bold' ||
+          fontWeight == 'bolder' ||
+          (int.tryParse(fontWeight) ?? 0) >= 600,
+    );
   }
   final fontStyle = props['font-style'];
   if (fontStyle != null) {
-    style =
-        _copyTextStyle(style, italic: fontStyle == 'italic' || fontStyle == 'oblique');
+    style = _copyTextStyle(
+      style,
+      italic: fontStyle == 'italic' || fontStyle == 'oblique',
+    );
   }
   final decoration = props['text-decoration-line'] ?? props['text-decoration'];
   if (decoration != null) {
-    style = _copyTextStyle(style,
-        underline: decoration.contains('underline'),
-        strikethrough: decoration.contains('line-through'));
+    style = _copyTextStyle(
+      style,
+      underline: decoration.contains('underline'),
+      strikethrough: decoration.contains('line-through'),
+    );
   }
   final color = _cssColor(props['color']);
   if (color != null) style = _copyTextStyle(style, color: color);
@@ -682,8 +783,11 @@ class _InlineCollector {
     if (normalized.isEmpty) return;
     final last = content.isEmpty ? null : content.last;
     if (last is TextRun && last.style == style && last.link == link) {
-      content[content.length - 1] =
-          TextRun(last.text + normalized, style: style, link: link);
+      content[content.length - 1] = TextRun(
+        last.text + normalized,
+        style: style,
+        link: link,
+      );
     } else {
       content.add(TextRun(normalized, style: style, link: link));
     }
@@ -715,8 +819,11 @@ class _InlineCollector {
     if (last is TextRun) {
       final trimmed = last.text.replaceAll(RegExp(' +\$'), '');
       if (trimmed.length != last.text.length) {
-        content[content.length - 1] =
-            TextRun(trimmed, style: last.style, link: last.link);
+        content[content.length - 1] = TextRun(
+          trimmed,
+          style: last.style,
+          link: last.link,
+        );
       }
     }
     content.removeWhere((inline) => inline is TextRun && inline.text.isEmpty);
@@ -750,12 +857,20 @@ class _StyleSheet {
       if (close == null) break;
       final prelude = cleaned.substring(cursor, open).trim();
       if (!prelude.startsWith('@')) {
-        final declarations = _parseDeclarations(cleaned.substring(open + 1, close));
+        final declarations = _parseDeclarations(
+          cleaned.substring(open + 1, close),
+        );
         for (final rawSelector in prelude.split(',')) {
           final selector = _SimpleSelector.parse(rawSelector);
           if (selector == null) continue;
-          rules.add(_StyleRule(
-              selector, selector.specificity, _nextOrder, declarations));
+          rules.add(
+            _StyleRule(
+              selector,
+              selector.specificity,
+              _nextOrder,
+              declarations,
+            ),
+          );
         }
         _nextOrder++;
       }
@@ -766,11 +881,14 @@ class _StyleSheet {
   /// All properties applying to [element]: matching rules sorted by
   /// (specificity, source order), then the inline `style` attribute.
   Map<String, String> cascadedProperties(XmlElement element) {
-    final matching = rules.where((rule) => rule.selector.matches(element)).toList()
-      ..sort((a, b) {
-        final bySpecificity = a.specificity.compareTo(b.specificity);
-        return bySpecificity != 0 ? bySpecificity : a.order.compareTo(b.order);
-      });
+    final matching =
+        rules.where((rule) => rule.selector.matches(element)).toList()
+          ..sort((a, b) {
+            final bySpecificity = a.specificity.compareTo(b.specificity);
+            return bySpecificity != 0
+                ? bySpecificity
+                : a.order.compareTo(b.order);
+          });
     final props = <String, String>{};
     for (final rule in matching) {
       _insertDeclarations(props, rule.declarations);
@@ -797,7 +915,8 @@ class _SimpleSelector {
     var rest = raw.trim();
     if (rest.isEmpty) return null;
     for (final rune in rest.runes) {
-      if (_isWhitespaceRune(rune) || '>+~[:*'.contains(String.fromCharCode(rune))) {
+      if (_isWhitespaceRune(rune) ||
+          '>+~[:*'.contains(String.fromCharCode(rune))) {
         return null;
       }
     }
@@ -831,7 +950,8 @@ class _SimpleSelector {
     var end = 0;
     while (end < input.length) {
       final code = input.codeUnitAt(end);
-      final ok = (code >= 0x30 && code <= 0x39) ||
+      final ok =
+          (code >= 0x30 && code <= 0x39) ||
           (code >= 0x41 && code <= 0x5A) ||
           (code >= 0x61 && code <= 0x7A) ||
           code == 0x2D ||
@@ -904,7 +1024,9 @@ List<MapEntry<String, String>> _parseDeclarations(String body) {
 }
 
 void _insertDeclarations(
-    Map<String, String> props, List<MapEntry<String, String>> declarations) {
+  Map<String, String> props,
+  List<MapEntry<String, String>> declarations,
+) {
   for (final entry in declarations) {
     if (entry.key == 'margin') {
       final sides = _boxSides(entry.value);
@@ -924,8 +1046,10 @@ void _insertDeclarations(
 
 /// CSS box shorthand → [top, right, bottom, left].
 List<String>? _boxSides(String value) {
-  final values =
-      value.split(RegExp(r'\s+')).where((v) => v.isNotEmpty).toList();
+  final values = value
+      .split(RegExp(r'\s+'))
+      .where((v) => v.isNotEmpty)
+      .toList();
   return switch (values.length) {
     1 => [values[0], values[0], values[0], values[0]],
     2 => [values[0], values[1], values[0], values[1]],
@@ -1019,22 +1143,26 @@ int? _cssColor(String? value) {
 
     try {
       return switch (hex.length) {
-        3 => 0xFF000000 |
-            (component(0, true)! << 16) |
-            (component(1, true)! << 8) |
-            component(2, true)!,
-        4 => (component(3, true)! << 24) |
-            (component(0, true)! << 16) |
-            (component(1, true)! << 8) |
-            component(2, true)!,
-        6 => 0xFF000000 |
-            (component(0)! << 16) |
-            (component(2)! << 8) |
-            component(4)!,
-        8 => (component(6)! << 24) |
-            (component(0)! << 16) |
-            (component(2)! << 8) |
-            component(4)!,
+        3 =>
+          0xFF000000 |
+              (component(0, true)! << 16) |
+              (component(1, true)! << 8) |
+              component(2, true)!,
+        4 =>
+          (component(3, true)! << 24) |
+              (component(0, true)! << 16) |
+              (component(1, true)! << 8) |
+              component(2, true)!,
+        6 =>
+          0xFF000000 |
+              (component(0)! << 16) |
+              (component(2)! << 8) |
+              component(4)!,
+        8 =>
+          (component(6)! << 24) |
+              (component(0)! << 16) |
+              (component(2)! << 8) |
+              component(4)!,
         _ => null,
       };
     } catch (_) {

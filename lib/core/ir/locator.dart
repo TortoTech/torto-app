@@ -33,14 +33,24 @@ class LocatorV1 {
   });
 
   Map<String, dynamic> toJson() => {
-        'version': currentVersion,
-        'publication_id': publicationId,
-        'href': href,
-        'position': position,
-        'progression': progression,
-        'total_progression': totalProgression,
-        if (source != null) 'source': source!.toJson(),
-      };
+    'version': currentVersion,
+    'publication_id': publicationId,
+    'href': _hrefToJson(href),
+    'position': position,
+    'progression': progression,
+    'total_progression': totalProgression,
+    if (source != null) 'source': source!.toJson(),
+  };
+
+  static Map<String, Object?> _hrefToJson(String href) {
+    final separator = href.indexOf('#');
+    if (separator < 0) return {'path': href};
+    final fragment = href.substring(separator + 1);
+    return {
+      'path': href.substring(0, separator),
+      if (fragment.isNotEmpty) 'fragment': fragment,
+    };
+  }
 
   factory LocatorV1.fromJson(Map<String, dynamic> json) {
     final version = json['version'] as int? ?? currentVersion;
@@ -49,7 +59,7 @@ class LocatorV1 {
     }
     return LocatorV1(
       publicationId: json['publication_id'] as String,
-      href: json['href'] as String? ?? '',
+      href: _hrefFromJson(json['href']),
       position: json['position'] as int? ?? 0,
       progression: (json['progression'] as num?)?.toDouble() ?? 0,
       totalProgression: (json['total_progression'] as num?)?.toDouble() ?? 0,
@@ -57,5 +67,18 @@ class LocatorV1 {
           ? null
           : SourceRange.fromJson(json['source'] as Map<String, dynamic>),
     );
+  }
+
+  static String _hrefFromJson(Object? value) {
+    if (value is Map) {
+      final path = value['path'];
+      final fragment = value['fragment'];
+      if (path is String && (fragment == null || fragment is String)) {
+        return fragment is String && fragment.isNotEmpty
+            ? '$path#$fragment'
+            : path;
+      }
+    }
+    throw const FormatException('Invalid locator href.');
   }
 }

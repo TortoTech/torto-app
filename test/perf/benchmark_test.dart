@@ -10,7 +10,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:torto/core/epub/epub_book_source.dart';
+import 'package:torto/core/formats/epub_book_source.dart';
 import 'package:torto/core/layout/layout_engine.dart';
 import 'package:torto/core/layout/layout_types.dart';
 

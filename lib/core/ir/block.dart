@@ -21,14 +21,17 @@ class SourceAnchor {
     required this.textOffset,
   });
 
-  Map<String, dynamic> toJson() =>
-      {'spine': spine, 'node': node, 'text_offset': textOffset};
+  Map<String, dynamic> toJson() => {
+    'spine': spine,
+    'node': node,
+    'text_offset': textOffset,
+  };
 
   factory SourceAnchor.fromJson(Map<String, dynamic> json) => SourceAnchor(
-        spine: json['spine'] as int,
-        node: json['node'] as String,
-        textOffset: json['text_offset'] as int,
-      );
+    spine: json['spine'] as int,
+    node: json['node'] as String,
+    textOffset: json['text_offset'] as int,
+  );
 
   @override
   bool operator ==(Object other) =>
@@ -50,13 +53,15 @@ class SourceRange {
 
   const SourceRange({required this.start, required this.end});
 
-  Map<String, dynamic> toJson() =>
-      {'start': start.toJson(), 'end': end.toJson()};
+  Map<String, dynamic> toJson() => {
+    'start': start.toJson(),
+    'end': end.toJson(),
+  };
 
   factory SourceRange.fromJson(Map<String, dynamic> json) => SourceRange(
-        start: SourceAnchor.fromJson(json['start'] as Map<String, dynamic>),
-        end: SourceAnchor.fromJson(json['end'] as Map<String, dynamic>),
-      );
+    start: SourceAnchor.fromJson(json['start'] as Map<String, dynamic>),
+    end: SourceAnchor.fromJson(json['end'] as Map<String, dynamic>),
+  );
 }
 
 /// Inline-level content of a [TextBlock].
