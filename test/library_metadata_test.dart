@@ -1,16 +1,15 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:torto/app/library/library_page.dart';
 import 'package:torto/app/library/library_store.dart';
 import 'package:torto/app/progress_store.dart';
-import 'package:torto/core/formats/pdf/pdf_cover.dart';
 
 const _container = '''<?xml version="1.0"?>
 <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
@@ -48,6 +47,37 @@ Uint8List _epubBytes() {
   );
   archive.addFile(ArchiveFile('OPS/cover.png', cover.length, cover));
   return ZipEncoder().encodeBytes(archive);
+}
+
+Uint8List _singlePagePdf() {
+  List<int> ascii(String value) => Uint8List.fromList(value.codeUnits);
+  final objects = <String>[
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] '
+        '/Contents 4 0 R >>',
+    '<< /Length 0 >>\nstream\n\nendstream',
+  ];
+  final output = BytesBuilder(copy: false)..add(ascii('%PDF-1.4\n'));
+  final offsets = <int>[];
+  for (var index = 0; index < objects.length; index++) {
+    offsets.add(output.length);
+    output.add(ascii('${index + 1} 0 obj\n${objects[index]}\nendobj\n'));
+  }
+  final xref = output.length;
+  output
+    ..add(ascii('xref\n0 ${objects.length + 1}\n'))
+    ..add(ascii('0000000000 65535 f \n'));
+  for (final offset in offsets) {
+    output.add(ascii('${offset.toString().padLeft(10, '0')} 00000 n \n'));
+  }
+  output.add(
+    ascii(
+      'trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\n'
+      'startxref\n$xref\n%%EOF\n',
+    ),
+  );
+  return output.takeBytes();
 }
 
 class _FakeLibraryStore extends LibraryStore {
@@ -172,7 +202,7 @@ void main() {
     final directory = await Directory.systemTemp.createTemp('torto-pdf-cover-');
     addTearDown(() => directory.delete(recursive: true));
     final file = File('${directory.path}${Platform.pathSeparator}book.pdf');
-    await file.writeAsBytes([1, 2, 3]);
+    await file.writeAsBytes(_singlePagePdf());
     final stat = await file.stat();
     await File('${file.path}.metadata.json').writeAsString(
       jsonEncode({
@@ -187,24 +217,11 @@ void main() {
         'hasCover': false,
       }),
     );
-    final generatedCover = Uint8List.fromList([9, 8, 7]);
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(pdfCoverChannel, (call) async {
-          expect(call.method, 'renderPage');
-          expect((call.arguments as Map)['path'], file.path);
-          expect((call.arguments as Map)['pageIndex'], 0);
-          expect((call.arguments as Map)['maxDimension'], 384);
-          return generatedCover;
-        });
-    addTearDown(
-      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(pdfCoverChannel, null),
-    );
-
     final book = (await LibraryStore(booksDir: directory).list()).single;
 
-    expect(book.coverBytes, generatedCover);
-    expect(await File('${file.path}.cover').readAsBytes(), generatedCover);
+    expect(book.coverBytes, isNotNull);
+    expect(book.coverBytes!.take(8), [137, 80, 78, 71, 13, 10, 26, 10]);
+    expect(await File('${file.path}.cover').readAsBytes(), book.coverBytes);
   });
 
   testWidgets('LibraryPage displays metadata and a fallback cover', (

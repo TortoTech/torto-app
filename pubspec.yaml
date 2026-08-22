@@ -44,6 +44,14 @@ dependencies:
   flutter_secure_storage: ^10.0.0
   sqflite: ^2.4.3
   uuid: ^4.6.0
+  # Pure-Dart PDF stack: COS/document semantics, text geometry, and the
+  # Flutter Canvas renderer. This replaces the Android PdfRenderer channel.
+  pdf_document: ^3.7.0
+  pdf_graphics: ^3.7.0
+  # 3.5+ pulls flutter_secure_storage 11 (compileSdk 37) through editing-only
+  # features. The public Canvas renderer used here is already present in 3.4;
+  # keep this exact until that renderer is split into a lighter package.
+  dart_pdf_editor: 3.4.0
   # CHM pages and .hhc contents are legacy non-XHTML HTML; needs a real
   # HTML5 parser (= torto's html5ever via scraper).
   html: ^0.15.6

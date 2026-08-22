@@ -1,27 +1,26 @@
-/// PDF → [DirectBookSource].
+/// Pure-Dart PDF adapter for Torto's format-neutral reading model.
 ///
-/// torto renders PDF pages with hayro and attaches a glyph text layer
-/// (`crates/formats/src/pdf.rs`); the app has no rasterizer, so pages are
-/// presented as extracted text through the reflowable pipeline. Structure
-/// matches torto: one section per page (`Page N`), /Info metadata, outline
-/// table of contents, SHA-256 identity.
+/// Parsing, metadata, outlines, text geometry, and graphics interpretation are
+/// delegated to the dart-pdf packages. Torto owns only the BookSource adapter,
+/// fixed-page resource naming, and reader-facing cache boundary.
 library;
 
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:crypto/crypto.dart';
+import 'package:pdf_document/pdf_document.dart' as pdf;
+import 'package:pdf_graphics/pdf_graphics.dart' as graphics;
 
 import '../../ir/ir.dart';
-import '../direct_book_source.dart';
-import 'pdf_cover.dart';
-import 'pdf_document.dart';
-import 'pdf_text.dart';
+import 'pdf_rasterizer.dart';
 
 const String _coverPath = 'Cover/thumbnail.png';
+const int _readerPageDimension = 2048;
+const int _coverDimension = 384;
 
-/// Opens a PDF from raw bytes. Throws [FormatException] when the file has
-/// no pages. Android uses fixed-layout page rasterization; callers without a
-/// file path retain the pure-Dart extracted-text fallback.
+/// Opens a PDF from raw bytes. [filePath] is retained for the common format
+/// dispatcher API, but PDF parsing and rendering no longer depend on it.
 Future<BookSource> openPdf(
   Uint8List bytes,
   String fileName, {
@@ -29,127 +28,103 @@ Future<BookSource> openPdf(
   String? titleHint,
   String? publicationIdHint,
 }) async {
-  final nativeInfo = filePath == null ? null : await inspectPdf(filePath);
-  PdfDocument? document;
-  var pages = const <PdfPage>[];
+  final pdf.PdfDocument document;
   try {
-    document = PdfDocument.open(bytes);
-    pages = document.pages;
-  } catch (_) {
-    if (nativeInfo == null) rethrow;
-  }
-  final pageCount = nativeInfo?.pageCount ?? pages.length;
-  if (pageCount == 0) {
-    throw const FormatException('PDF does not contain any pages');
+    document = pdf.PdfDocument.open(bytes);
+    if (document.pageCount == 0) {
+      throw const FormatException('PDF does not contain any pages');
+    }
+  } on FormatException {
+    rethrow;
+  } catch (error) {
+    throw FormatException('Invalid or unsupported PDF: $error');
   }
 
-  String? infoTitle;
-  String? infoAuthor;
-  List<SourceTocEntry> tableOfContents = const [];
-  if (document != null) {
-    try {
-      (infoTitle, infoAuthor) = document.infoMetadata();
-      tableOfContents = document.outline();
-    } catch (_) {
-      // Native fixed-page rendering remains usable without optional metadata.
-    }
-  }
-  final title = titleHint != null && titleHint.trim().isNotEmpty
-      ? titleHint.trim()
-      : infoTitle != null && infoTitle.trim().isNotEmpty
-      ? infoTitle.trim()
+  final info = document.info;
+  final hintedTitle = titleHint?.trim() ?? '';
+  final metadataTitle = info['Title']?.trim() ?? '';
+  final title = hintedTitle.isNotEmpty
+      ? hintedTitle
+      : metadataTitle.isNotEmpty
+      ? metadataTitle
       : _titleFromFileName(fileName);
-  final authors = [
-    if (infoAuthor != null && infoAuthor.trim().isNotEmpty) infoAuthor.trim(),
-  ];
+  final author = info['Author']?.trim() ?? '';
   final publicationId = publicationIdHint?.trim().isNotEmpty == true
       ? publicationIdHint!.trim()
       : sha256.convert(bytes).toString();
 
-  if (filePath != null && nativeInfo != null) {
-    final descriptor = DirectBookSource.open(
-      SourceBook(
-        id: publicationId,
-        metadata: BookMetadata(title: title, authors: authors),
-        sections: [
-          for (var index = 0; index < pageCount; index++)
-            SourceSection(
-              title: 'Page ${index + 1}',
-              content: ImageSectionContent(
-                resourcePath: _pagePath(index),
-                alt: 'PDF page ${index + 1}',
-              ),
-            ),
-        ],
-        tableOfContents: tableOfContents,
-        coverPath: _coverPath,
-      ),
-    );
-    return _PdfRasterBookSource(
-      book: descriptor.book,
-      filePath: filePath,
-      pageCount: pageCount,
-    );
-  }
+  final spine = [
+    for (var index = 0; index < document.pageCount; index++)
+      SpineItem(index: index, href: _sectionPath(index)),
+  ];
+  final toc = _promoteSingleTocRoot(
+    _outlineEntries(pdf.PdfOutline.of(document).items, spine),
+  );
 
-  final fallbackDocument = document!;
-  final sections = <SourceSection>[];
-  var textPages = 0;
-  for (var index = 0; index < pages.length; index++) {
-    var paragraphs = const <String>[];
-    try {
-      paragraphs = extractPageText(
-        pages[index].content,
-        pages[index].resources,
-        fallbackDocument.resolve,
-      );
-    } on FormatException {
-      // A page we cannot interpret renders empty; the reader skips it.
-    }
-    if (paragraphs.isNotEmpty) textPages++;
-    final html = paragraphs
-        .map((paragraph) => '<p>${_escapeText(paragraph)}</p>')
-        .join();
-    sections.add(
-      SourceSection(
-        title: 'Page ${index + 1}',
-        content: HtmlSectionContent(html),
-      ),
-    );
-  }
-  if (textPages == 0) {
-    throw const FormatException(
-      'PDF has no extractable text (scanned or image-only)',
-    );
-  }
-
-  return DirectBookSource.open(
-    SourceBook(
+  return PdfBookSource._(
+    document: document,
+    book: Book(
       id: publicationId,
-      metadata: BookMetadata(title: title, authors: authors),
-      sections: sections,
-      tableOfContents: tableOfContents,
+      metadata: BookMetadata(
+        title: title,
+        authors: [if (author.isNotEmpty) author],
+      ),
+      spine: spine,
+      toc: toc,
+      coverHref: _coverPath,
     ),
   );
 }
 
-class _PdfRasterBookSource implements BookSource {
+/// Fixed-layout PDF source, analogous to desktop Torto's PDF catalog adapter.
+///
+/// Page rasters stay outside the format-neutral IR: sections reference a
+/// synthetic image resource, while [RasterResourceSource] supplies the image
+/// directly. [pageText] exposes the positioned glyph layer for search and
+/// selection without forcing it through reflow pagination.
+class PdfBookSource
+    implements BookSource, RasterResourceSource, DisposableBookSource {
+  static const int _maxTextCacheEntries = 12;
+
   @override
   final Book book;
-  final String filePath;
-  final int pageCount;
 
-  const _PdfRasterBookSource({
-    required this.book,
-    required this.filePath,
-    required this.pageCount,
-  });
+  pdf.PdfDocument? _document;
+  final Map<int, graphics.PdfPageText?> _textCache = {};
+
+  PdfBookSource._({required pdf.PdfDocument document, required this.book})
+    : _document = document;
+
+  pdf.PdfDocument get _activeDocument =>
+      _document ?? (throw StateError('PDF source has been disposed'));
+
+  int get pageCount => _activeDocument.pageCount;
+
+  /// Extracts Unicode text plus page-space glyph geometry on demand.
+  graphics.PdfPageText? pageText(int pageIndex) {
+    _checkPageIndex(pageIndex);
+    if (_textCache.containsKey(pageIndex)) {
+      final cached = _textCache.remove(pageIndex);
+      _textCache[pageIndex] = cached;
+      return cached;
+    }
+    final extracted = () {
+      try {
+        return graphics.PdfTextExtractor.extract(_activeDocument, pageIndex);
+      } catch (_) {
+        return null;
+      }
+    }();
+    _textCache[pageIndex] = extracted;
+    if (_textCache.length > _maxTextCacheEntries) {
+      _textCache.remove(_textCache.keys.first);
+    }
+    return extracted;
+  }
 
   @override
   Future<Section> parseSection(int index) async {
-    if (index < 0 || index >= pageCount) {
-      throw FormatException('PDF page $index is out of range');
-    }
+    _checkPageIndex(index);
     return Section(
       spineIndex: index,
       href: book.spine[index].href,
@@ -160,23 +135,94 @@ class _PdfRasterBookSource implements BookSource {
   }
 
   @override
-  Future<Uint8List?> resource(String href) {
-    if (href == _coverPath) return renderPdfCover(filePath);
+  Future<ui.Image?> rasterResource(
+    String href, {
+    required int maxDimension,
+  }) async {
+    final pageIndex = _pageIndexFromHref(href);
+    if (pageIndex == null) return null;
+    return rasterizePdfPage(
+      _activeDocument.page(pageIndex),
+      maxDimension: maxDimension,
+    );
+  }
+
+  @override
+  Future<Uint8List?> resource(String href) async {
+    if (href == _coverPath) {
+      return encodePdfPagePng(
+        _activeDocument.page(0),
+        maxDimension: _coverDimension,
+      );
+    }
+    final pageIndex = _pageIndexFromHref(href);
+    if (pageIndex == null) return null;
+    // Compatibility path for non-reader consumers. ReaderController uses
+    // rasterResource and therefore does not pay this PNG encode/decode cost.
+    return encodePdfPagePng(
+      _activeDocument.page(pageIndex),
+      maxDimension: _readerPageDimension,
+    );
+  }
+
+  @override
+  void dispose() {
+    if (_document == null) return;
+    _textCache.clear();
+    _document = null;
+    clearPdfRasterCache();
+  }
+
+  int? _pageIndexFromHref(String href) {
     final match = RegExp(r'^Pages/page-([0-9]{5})\.png$').firstMatch(href);
-    if (match == null) return Future.value();
-    final pageIndex = int.parse(match.group(1)!) - 1;
-    if (pageIndex < 0 || pageIndex >= pageCount) return Future.value();
-    return renderPdfPage(filePath, pageIndex);
+    if (match == null) return null;
+    final index = int.parse(match.group(1)!) - 1;
+    return index >= 0 && index < pageCount ? index : null;
+  }
+
+  void _checkPageIndex(int index) {
+    if (index < 0 || index >= pageCount) {
+      throw FormatException('PDF page $index is out of range');
+    }
   }
 }
 
+List<TocEntry> _outlineEntries(
+  List<pdf.PdfOutlineItem> items,
+  List<SpineItem> spine,
+) {
+  final entries = <TocEntry>[];
+  for (final item in items) {
+    final label = item.title.trim();
+    if (label.isEmpty) continue;
+    final destination = item.destination?.pageIndex;
+    final spineIndex =
+        destination != null && destination >= 0 && destination < spine.length
+        ? destination
+        : null;
+    entries.add(
+      TocEntry(
+        label: label,
+        href: spineIndex == null ? '' : spine[spineIndex].href,
+        spineIndex: spineIndex,
+        children: _outlineEntries(item.children, spine),
+      ),
+    );
+  }
+  return entries;
+}
+
+List<TocEntry> _promoteSingleTocRoot(List<TocEntry> entries) {
+  if (entries.length == 1 && entries.single.children.isNotEmpty) {
+    return entries.single.children;
+  }
+  return entries;
+}
+
+String _sectionPath(int index) => 'Text/section-${index + 1}.xhtml';
+
 String _pagePath(int index) =>
     'Pages/page-${(index + 1).toString().padLeft(5, '0')}.png';
-
-String _escapeText(String value) => value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;');
 
 String _titleFromFileName(String fileName) {
   var name = fileName.replaceAll('\\', '/');

@@ -7,5 +7,6 @@ library;
 export 'block.dart';
 export 'book.dart';
 export 'locator.dart';
+export 'raster_resource_source.dart';
 export 'source.dart';
 export 'style.dart';

@@ -424,10 +424,19 @@ class ReaderController extends ChangeNotifier {
     await Future.wait(
       hrefs.map((href) async {
         try {
-          final bytes = await _source!.resource(href);
-          _images[href] = bytes == null
-              ? null
-              : await decodeImageFromList(bytes);
+          final source = _source!;
+          if (source is RasterResourceSource) {
+            final rasterSource = source as RasterResourceSource;
+            _images[href] = await rasterSource.rasterResource(
+              href,
+              maxDimension: 2048,
+            );
+          } else {
+            final bytes = await source.resource(href);
+            _images[href] = bytes == null
+                ? null
+                : await decodeImageFromList(bytes);
+          }
         } catch (_) {
           _images[href] = null; // missing or undecodable: render without it
         }
@@ -452,6 +461,22 @@ class ReaderController extends ChangeNotifier {
       for (final page in _sections.remove(index)!) {
         page.dispose();
       }
+    }
+
+    // Image resources used only by evicted sections are often the largest
+    // part of a fixed-layout book's memory footprint. Keep exactly the images
+    // referenced by the retained current/adjacent page layouts.
+    final retainedImages = <String>{
+      for (final pages in _sections.values)
+        for (final page in pages)
+          for (final item in page.items)
+            if (item is ImagePlacement) item.href,
+    };
+    final staleImages = _images.keys
+        .where((href) => !retainedImages.contains(href))
+        .toList();
+    for (final href in staleImages) {
+      _images.remove(href)?.dispose();
     }
   }
 
@@ -518,6 +543,11 @@ class ReaderController extends ChangeNotifier {
       image?.dispose();
     }
     _images.clear();
+    final source = _source;
+    if (source is DisposableBookSource) {
+      (source as DisposableBookSource).dispose();
+    }
+    _source = null;
     super.dispose();
   }
 }

@@ -18,3 +18,9 @@ abstract class BookSource {
   /// or null when missing.
   Future<Uint8List?> resource(String href);
 }
+
+/// Optional lifecycle capability for sources that retain heavyweight parser
+/// buffers or process-wide caches.
+abstract interface class DisposableBookSource {
+  void dispose();
+}

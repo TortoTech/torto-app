@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 
 import '../../core/formats/formats.dart';
 import '../../core/formats/pdf/pdf_cover.dart';
+import '../../core/ir/source.dart';
 import '../sync/derived_data_store.dart';
 
 /// One imported book on disk.
@@ -252,8 +253,9 @@ class LibraryStore {
     var authors = const <String>[];
     var languages = const <String>[];
     Uint8List? coverBytes;
+    BookSource? source;
     try {
-      final source = await openBook(
+      source = await openBook(
         content,
         sourceFileName ?? _baseName(file.path),
         filePath: file.path,
@@ -271,6 +273,11 @@ class LibraryStore {
     } catch (_) {
       // A damaged book remains visible and openable by file name. Cache the
       // fallback until its size or modification time changes.
+    } finally {
+      final openedSource = source;
+      if (openedSource is DisposableBookSource) {
+        (openedSource as DisposableBookSource).dispose();
+      }
     }
     if (preferredTitle.trim().isNotEmpty) title = preferredTitle.trim();
     final normalizedPreferredAuthors = _normalizedValues(preferredAuthors);
