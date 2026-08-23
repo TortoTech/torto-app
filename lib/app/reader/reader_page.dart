@@ -3,9 +3,11 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import '../../core/ir/style.dart' show LinkRole;
 import '../../core/layout/layout_types.dart';
 import '../../core/render/page_painter.dart';
 import 'reader_controller.dart';
+import 'reader_preferences_store.dart';
 import 'toc_drawer.dart';
 import 'toc_items.dart';
 
@@ -16,8 +18,14 @@ class ReaderPage extends StatefulWidget {
 
   /// Injectable for tests; a fresh controller is created when omitted.
   final ReaderController? controller;
+  final ReaderPreferencesStore? preferencesStore;
 
-  const ReaderPage({super.key, required this.file, this.controller});
+  const ReaderPage({
+    super.key,
+    required this.file,
+    this.controller,
+    this.preferencesStore,
+  });
 
   @override
   State<ReaderPage> createState() => _ReaderPageState();
@@ -28,7 +36,7 @@ enum _TurnPhase { idle, dragging, animating }
 enum _TurnDirection { previous, next }
 
 class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
-  static const ReaderStyle _style = ReaderStyle(
+  static const ReaderStyle _baseStyle = ReaderStyle(
     baseFontSize: 18,
     lineHeight: 1.5,
     marginTop: 32,
@@ -40,7 +48,10 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
   static const _foreground = Color(0xFF000000);
 
   ReaderController? _controller;
+  late final ReaderPreferencesStore _preferencesStore;
+  ReaderStyle _style = _baseStyle;
   bool _ownsController = false;
+  bool _opening = false;
   bool _overlayVisible = false;
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
@@ -61,6 +72,12 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
   /// interacting with the model.
   Timer? _peekTimer;
 
+  @override
+  void initState() {
+    super.initState();
+    _preferencesStore = widget.preferencesStore ?? ReaderPreferencesStore();
+  }
+
   void _startOpen(LayoutViewport viewport) {
     final controller = widget.controller ?? ReaderController();
     _controller = controller;
@@ -73,8 +90,13 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
       });
       return;
     }
+    if (_opening) return;
+    _opening = true;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       try {
+        final mode = await _preferencesStore.loadTypesettingMode();
+        if (!mounted) return;
+        _style = _baseStyle.copyWith(typesettingMode: mode);
         await controller.open(widget.file, viewport, _style);
         // open() may finish before the ListenableBuilder below ever
         // entered the tree (the first build returns the plain spinner),
@@ -89,6 +111,8 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
           const SnackBar(content: Text('Could not open this book.')),
         );
         Navigator.of(context).pop();
+      } finally {
+        _opening = false;
       }
     });
   }
@@ -121,6 +145,11 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
         _turnPhase != _TurnPhase.idle) {
       return;
     }
+    final link = controller.currentPage?.linkAt(details.localPosition);
+    if (link != null) {
+      unawaited(_activateLink(controller, link));
+      return;
+    }
     final fraction = details.localPosition.dx / width;
     if (fraction < 0.3) {
       if (_overlayVisible) setState(() => _overlayVisible = false);
@@ -130,6 +159,64 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
       controller.nextPage().then((_) => _schedulePeekPreparation());
     } else {
       setState(() => _overlayVisible = !_overlayVisible);
+    }
+  }
+
+  Future<void> _activateLink(
+    ReaderController controller,
+    TextLinkRange link,
+  ) async {
+    if (_overlayVisible && mounted) {
+      setState(() => _overlayVisible = false);
+    }
+    if (link.role == LinkRole.footnoteReference) {
+      final note = await controller.resolveFootnote(link);
+      if (!mounted) return;
+      if (note == null) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('无法读取脚注内容')));
+        return;
+      }
+      await showModalBottomSheet<void>(
+        context: context,
+        backgroundColor: _background,
+        showDragHandle: true,
+        builder: (context) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 4, 24, 28),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (note.marker.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: Text(
+                      '脚注 ${note.marker}',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                  ),
+                SelectableText(
+                  note.text,
+                  style: const TextStyle(fontSize: 17, height: 1.55),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      return;
+    }
+
+    final navigated = await controller.goToHref(link.href);
+    if (!mounted) return;
+    if (navigated) {
+      _schedulePeekPreparation();
+    } else {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('暂时无法打开此引用')));
     }
   }
 
@@ -467,11 +554,86 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
                 tooltip: '目录',
                 onPressed: () => _scaffoldKey.currentState?.openDrawer(),
               ),
+              IconButton(
+                key: const Key('reader-style-button'),
+                icon: const Icon(Icons.text_format),
+                tooltip: '版式',
+                onPressed: _showTypesettingSheet,
+              ),
             ],
           ),
         ),
       ),
     ),
+  );
+
+  Future<void> _showTypesettingSheet() async {
+    final controller = _controller;
+    if (controller == null || controller.busy) return;
+    final selected = await showModalBottomSheet<TypesettingMode>(
+      context: context,
+      backgroundColor: _background,
+      builder: (context) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Padding(
+                padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
+                child: Text(
+                  '版式',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
+                ),
+              ),
+              _typesettingChoice(
+                context,
+                TypesettingMode.unified,
+                '统一版式',
+                '统一正文、标题、段落、列表和表格的排版',
+              ),
+              _typesettingChoice(
+                context,
+                TypesettingMode.book,
+                '跟随书籍',
+                '保留书籍自带的字号、行距、缩进和颜色',
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (selected == null || selected == _style.typesettingMode) return;
+    final nextStyle = _style.copyWith(typesettingMode: selected);
+    setState(() {
+      _style = nextStyle;
+      _overlayVisible = false;
+    });
+    try {
+      await _preferencesStore.saveTypesettingMode(selected);
+    } catch (error) {
+      debugPrint('Could not persist reader layout mode: $error');
+    }
+    await controller.updateStyle(nextStyle);
+    _schedulePeekPreparation();
+  }
+
+  Widget _typesettingChoice(
+    BuildContext context,
+    TypesettingMode mode,
+    String title,
+    String subtitle,
+  ) => ListTile(
+    key: Key('typesetting-${mode.name}'),
+    title: Text(title),
+    subtitle: Text(subtitle),
+    selected: _style.typesettingMode == mode,
+    trailing: _style.typesettingMode == mode
+        ? const Icon(Icons.check_circle)
+        : const Icon(Icons.circle_outlined),
+    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+    onTap: () => Navigator.of(context).pop(mode),
   );
 
   /// Left drawer with the book's table of contents; rebuilt with the

@@ -6,11 +6,19 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/painting.dart';
 
 import '../../core/formats/formats.dart';
+import '../../core/html_ir/package_path.dart';
 import '../../core/ir/ir.dart';
 import '../../core/layout/layout_engine.dart';
 import '../../core/layout/layout_types.dart';
 import '../progress_store.dart';
 import '../sync/derived_data_store.dart';
+
+class ReaderFootnote {
+  final String marker;
+  final String text;
+
+  const ReaderFootnote({required this.marker, required this.text});
+}
 
 /// Owns the reading session for one book: the parsed source, paginated
 /// sections (prev/current/next cached), page navigation, image decoding,
@@ -24,6 +32,7 @@ class ReaderController extends ChangeNotifier {
   BookSource? _source;
   LayoutViewport _viewport = const LayoutViewport(width: 0, height: 0);
   ReaderStyle _style = const ReaderStyle();
+  int _paginationGeneration = 0;
 
   /// Paginated sections, kept only for [sectionIndex] ± 1.
   final Map<int, List<PageLayout>> _sections = {};
@@ -66,6 +75,8 @@ class ReaderController extends ChangeNotifier {
   }
 
   int get sectionCount => _source?.book.sectionCount ?? 0;
+
+  ReaderStyle get style => _style;
 
   bool _peekPreparing = false;
 
@@ -149,6 +160,47 @@ class ReaderController extends ChangeNotifier {
     }
   }
 
+  /// Applies a presentation change and repaginates around the current
+  /// logical position. Parsed publication data and decoded images stay
+  /// cached; only layout-dependent pages are rebuilt.
+  Future<void> updateStyle(ReaderStyle nextStyle) async {
+    if (nextStyle == _style) return;
+    _style = nextStyle;
+    if (!opened || busy || _source == null) return;
+
+    final currentSection = sectionIndex;
+    final progression = currentPage?.progression ?? 0.0;
+    final staleSections = Map<int, List<PageLayout>>.of(_sections);
+    _sections.clear();
+    _paginations.clear();
+    _paginationGeneration++;
+    busy = true;
+    notifyListeners();
+
+    // Let the old page leave the render tree before disposing its retained
+    // dart:ui paragraphs.
+    await Future<void>.delayed(Duration.zero);
+    for (final pages in staleSections.values) {
+      _disposePages(pages);
+    }
+
+    try {
+      final pages = await _paginate(currentSection);
+      sectionIndex = currentSection;
+      pageIndex = pages.isEmpty
+          ? 0
+          : (progression * (pages.length - 1)).round().clamp(
+              0,
+              pages.length - 1,
+            );
+      _evictDistantSections();
+    } finally {
+      busy = false;
+      notifyListeners();
+      _scheduleSave();
+    }
+  }
+
   /// Chooses the page matching [locator] within an already-paginated section.
   ///
   /// Anchor rule: map the saved `source.start` (node id + UTF-16 offset) to
@@ -166,26 +218,42 @@ class ReaderController extends ChangeNotifier {
       var textStart = 0.0;
       double? targetOffset;
       for (final block in parsed.blocks) {
-        if (block is! TextBlock) continue;
-        if (block.nodeId == anchor.node) {
-          targetOffset = textStart + anchor.textOffset;
-          break;
+        switch (block) {
+          case TextBlock():
+            if (block.nodeId == anchor.node) {
+              targetOffset = textStart + anchor.textOffset;
+            }
+            textStart += block.plainText.length;
+          case TableBlock():
+            for (final row in block.rows) {
+              for (final cell in row.cells) {
+                if (cell.nodeId == anchor.node) {
+                  targetOffset = textStart + anchor.textOffset;
+                }
+                textStart += cell.plainText.length;
+              }
+            }
+          default:
+            continue;
         }
-        textStart += block.plainText.length;
+        if (targetOffset != null) break;
       }
       if (targetOffset != null) {
         var match = 0;
         for (var i = 0; i < pages.length; i++) {
-          TextPlacement? firstText;
+          double? pageStart;
           for (final item in pages[i].items) {
-            if (item is TextPlacement) {
-              firstText = item;
-              break;
+            switch (item) {
+              case TextPlacement():
+                pageStart = item.sectionTextOffset + item.textOffsetAtStart;
+              case TableCellPlacement():
+                pageStart = item.sectionTextOffset;
+              default:
+                continue;
             }
+            break;
           }
-          if (firstText == null) continue;
-          final pageStart =
-              firstText.sectionTextOffset + firstText.textOffsetAtStart;
+          if (pageStart == null) continue;
           if (pageStart <= targetOffset + 0.5) {
             match = i;
           } else {
@@ -351,6 +419,68 @@ class ReaderController extends ChangeNotifier {
     }
   }
 
+  /// Resolves and jumps to an internal publication link, including fragments.
+  Future<bool> goToHref(String href) async {
+    if (busy || !opened || isExternalHref(href)) return false;
+    final (path, fragment) = splitPackageFragment(href);
+    final target = _book.spine.indexWhere((item) => item.href == path);
+    if (target < 0) return false;
+
+    var navigated = false;
+    busy = true;
+    notifyListeners();
+    try {
+      final section = await _source!.parseSection(target);
+      final pages = await _paginate(target);
+      if (pages.isEmpty) return false;
+      var targetPage = 0;
+      if (fragment != null && fragment.isNotEmpty) {
+        final anchor = _anchorByFragment(section, fragment);
+        if (anchor != null) {
+          final index = pages.indexWhere(
+            (page) => page.items.any(
+              (item) => switch (item) {
+                TextPlacement(:final nodeId) ||
+                TableCellPlacement(
+                  :final nodeId,
+                ) => nodeId == anchor.source.node,
+                _ => false,
+              },
+            ),
+          );
+          if (index >= 0) targetPage = index;
+        }
+      }
+      sectionIndex = target;
+      pageIndex = targetPage;
+      _evictDistantSections();
+      navigated = true;
+      return true;
+    } finally {
+      busy = false;
+      notifyListeners();
+      if (navigated) _scheduleSave();
+    }
+  }
+
+  /// Reads a linked footnote without changing the current reading position.
+  Future<ReaderFootnote?> resolveFootnote(TextLinkRange link) async {
+    if (!opened || isExternalHref(link.href)) return null;
+    final (path, fragment) = splitPackageFragment(link.href);
+    if (fragment == null || fragment.isEmpty) return null;
+    final target = _book.spine.indexWhere((item) => item.href == path);
+    if (target < 0) return null;
+    final section = await _source!.parseSection(target);
+    final anchor = _anchorByFragment(section, fragment);
+    if (anchor == null) return null;
+    final text = _textForSourceNode(section, anchor.source.node);
+    if (text == null || text.trim().isEmpty) return null;
+    return ReaderFootnote(
+      marker: link.marker,
+      text: _withoutFootnoteMarker(text.trim(), link.marker),
+    );
+  }
+
   /// Moves to the adjacent non-empty section, paginating on demand.
   /// Forward lands on the first page, backward on the LAST page.
   Future<void> _stepSection(int direction) async {
@@ -388,7 +518,8 @@ class ReaderController extends ChangeNotifier {
     final inFlight = _paginations[index];
     if (inFlight != null) return inFlight;
 
-    final pagination = _paginateFresh(index);
+    final generation = _paginationGeneration;
+    final pagination = _paginateFresh(index, generation);
     _paginations[index] = pagination;
     try {
       return await pagination;
@@ -399,7 +530,7 @@ class ReaderController extends ChangeNotifier {
     }
   }
 
-  Future<List<PageLayout>> _paginateFresh(int index) async {
+  Future<List<PageLayout>> _paginateFresh(int index, int generation) async {
     final section = await _source!.parseSection(index);
     await _decodeSectionImages(section);
     await Future<void>.delayed(Duration.zero);
@@ -409,6 +540,10 @@ class ReaderController extends ChangeNotifier {
       _style,
       imageSizeResolver: _imageSize,
     );
+    if (generation != _paginationGeneration) {
+      _disposePages(pages);
+      return _sections[index] ?? const [];
+    }
     _sections[index] = pages;
     return pages;
   }
@@ -458,9 +593,7 @@ class ReaderController extends ChangeNotifier {
         .where((index) => (index - sectionIndex).abs() > 1)
         .toList();
     for (final index in stale) {
-      for (final page in _sections.remove(index)!) {
-        page.dispose();
-      }
+      _disposePages(_sections.remove(index)!);
     }
 
     // Image resources used only by evicted sections are often the largest
@@ -477,6 +610,12 @@ class ReaderController extends ChangeNotifier {
         .toList();
     for (final href in staleImages) {
       _images.remove(href)?.dispose();
+    }
+  }
+
+  static void _disposePages(List<PageLayout> pages) {
+    for (final page in pages) {
+      page.dispose();
     }
   }
 
@@ -531,12 +670,11 @@ class ReaderController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _paginationGeneration++;
     _saveTimer?.cancel();
     if (_progressDirty) unawaited(_saveProgress());
     for (final pages in _sections.values) {
-      for (final page in pages) {
-        page.dispose();
-      }
+      _disposePages(pages);
     }
     _sections.clear();
     for (final image in _images.values) {
@@ -550,4 +688,51 @@ class ReaderController extends ChangeNotifier {
     _source = null;
     super.dispose();
   }
+}
+
+SectionAnchor? _anchorByFragment(Section section, String fragment) {
+  for (final anchor in section.anchors) {
+    if (anchor.fragment == fragment) return anchor;
+  }
+  return null;
+}
+
+String? _textForSourceNode(Section section, String nodeId) {
+  for (final block in section.blocks) {
+    switch (block) {
+      case TextBlock():
+        if (block.nodeId == nodeId) return _readableInlineText(block.inlines);
+      case TableBlock():
+        for (final row in block.rows) {
+          for (final cell in row.cells) {
+            if (cell.nodeId == nodeId) return _readableInlineText(cell.inlines);
+          }
+        }
+      default:
+        continue;
+    }
+  }
+  return null;
+}
+
+String _readableInlineText(List<Inline> inlines) {
+  final buffer = StringBuffer();
+  for (final inline in inlines) {
+    switch (inline) {
+      case TextRun(:final text, :final style):
+        if (style.linkRole != LinkRole.footnoteBacklink) buffer.write(text);
+      case BreakInline():
+        buffer.write('\n');
+    }
+  }
+  return buffer.toString();
+}
+
+String _withoutFootnoteMarker(String text, String marker) {
+  var result = text.trim();
+  final trimmedMarker = marker.trim();
+  if (trimmedMarker.isNotEmpty && result.startsWith(trimmedMarker)) {
+    result = result.substring(trimmedMarker.length);
+  }
+  return result.replaceFirst(RegExp(r'^[\s.。．、,，:：;；)）\]】]+'), '').trim();
 }

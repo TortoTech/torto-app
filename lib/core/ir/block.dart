@@ -140,6 +140,63 @@ class TextBlock extends Block {
   }
 }
 
+/// A semantic table retained as a grid instead of being flattened into
+/// unrelated paragraphs. Column and row spans use the same 1-based semantics
+/// as HTML; layout clamps malformed values to a safe range.
+class TableBlock extends Block {
+  final List<TableRow> rows;
+  final BlockStyle style;
+
+  const TableBlock({required this.rows, this.style = BlockStyle.normal});
+
+  int get textLength => rows.fold(
+    0,
+    (total, row) =>
+        total + row.cells.fold(0, (sum, cell) => sum + cell.plainText.length),
+  );
+}
+
+class TableRow {
+  final List<TableCell> cells;
+
+  const TableRow(this.cells);
+}
+
+class TableCell {
+  final List<Inline> inlines;
+  final bool header;
+  final int columnSpan;
+  final int rowSpan;
+  final BlockAlign? authoredAlignment;
+  final BlockStyle style;
+  final SourceRange? source;
+  final String nodeId;
+
+  const TableCell({
+    required this.inlines,
+    this.header = false,
+    this.columnSpan = 1,
+    this.rowSpan = 1,
+    this.authoredAlignment,
+    this.style = BlockStyle.normal,
+    this.source,
+    this.nodeId = '',
+  });
+
+  String get plainText {
+    final buffer = StringBuffer();
+    for (final inline in inlines) {
+      switch (inline) {
+        case TextRun(:final text):
+          buffer.write(text);
+        case BreakInline():
+          buffer.write('\n');
+      }
+    }
+    return buffer.toString();
+  }
+}
+
 class ImageBlock extends Block {
   /// Root-relative href of the image resource within the publication.
   final String href;

@@ -10,46 +10,51 @@ const _viewport = LayoutViewport(width: 300, height: 500);
 const _eps = 0.5;
 
 ReaderStyle _style({double fontSize = 10}) => ReaderStyle(
-      baseFontSize: fontSize,
-      lineHeight: 1.2,
-      marginTop: 10,
-      marginBottom: 10,
-      marginLeft: 10,
-      marginRight: 10,
-    );
+  baseFontSize: fontSize,
+  lineHeight: 1.2,
+  marginTop: 10,
+  marginBottom: 10,
+  marginLeft: 10,
+  marginRight: 10,
+);
 
 Section _section(List<Block> blocks) =>
     Section(spineIndex: 0, href: 's.xhtml', blocks: blocks);
 
-TextBlock _para(String text,
-        {BlockStyle style = BlockStyle.normal,
-        TextBlockKind kind = TextBlockKind.paragraph,
-        int headingLevel = 0,
-        bool listOrdered = false,
-        int listOrdinal = 0,
-        String nodeId = 'n1'}) =>
-    TextBlock(
-      kind: kind,
-      headingLevel: headingLevel,
-      listOrdered: listOrdered,
-      listOrdinal: listOrdinal,
-      nodeId: nodeId,
-      inlines: [TextRun(text)],
-      style: style,
-      source: SourceRange(
-        start: SourceAnchor(spine: 0, node: nodeId, textOffset: 0),
-        end: SourceAnchor(spine: 0, node: nodeId, textOffset: text.length),
-      ),
-    );
+TextBlock _para(
+  String text, {
+  BlockStyle style = BlockStyle.normal,
+  TextBlockKind kind = TextBlockKind.paragraph,
+  int headingLevel = 0,
+  bool listOrdered = false,
+  int listOrdinal = 0,
+  int listDepth = 0,
+  String nodeId = 'n1',
+}) => TextBlock(
+  kind: kind,
+  headingLevel: headingLevel,
+  listOrdered: listOrdered,
+  listOrdinal: listOrdinal,
+  listDepth: listDepth,
+  nodeId: nodeId,
+  inlines: [TextRun(text)],
+  style: style,
+  source: SourceRange(
+    start: SourceAnchor(spine: 0, node: nodeId, textOffset: 0),
+    end: SourceAnchor(spine: 0, node: nodeId, textOffset: text.length),
+  ),
+);
 
 String _lorem(int repetitions) =>
     'Lorem ipsum dolor sit amet, consectetur adipiscing elit. ' * repetitions;
 
 double _itemTop(PageItem item) => switch (item) {
-      TextPlacement(:final y) => y,
-      ImagePlacement(:final rect) => rect.top,
-      SeparatorPlacement(:final rect) => rect.top,
-    };
+  TextPlacement(:final y) => y,
+  ListMarkerPlacement(:final y) => y,
+  TableCellPlacement(:final rect) => rect.top,
+  ImagePlacement(:final rect) => rect.top,
+  SeparatorPlacement(:final rect) => rect.top,
+};
 
 void _disposeAll(List<PageLayout> pages) {
   for (final page in pages) {
@@ -106,11 +111,15 @@ void main() {
       for (final item in page.items) {
         if (item is TextPlacement) {
           expect(item.x, greaterThanOrEqualTo(style.marginLeft - _eps));
-          expect(item.x + item.width,
-              lessThanOrEqualTo(_viewport.width - style.marginRight + _eps));
+          expect(
+            item.x + item.width,
+            lessThanOrEqualTo(_viewport.width - style.marginRight + _eps),
+          );
           expect(item.y, greaterThanOrEqualTo(style.marginTop - _eps));
-          expect(item.y + item.sliceHeight,
-              lessThanOrEqualTo(contentBottom + _eps));
+          expect(
+            item.y + item.sliceHeight,
+            lessThanOrEqualTo(contentBottom + _eps),
+          );
           expect(item.startLine, lessThan(item.endLine));
         }
       }
@@ -155,8 +164,7 @@ void main() {
     );
     final placement = pages.single.items.single as ImagePlacement;
     expect(placement.href, 'img/a.png');
-    expect(placement.rect.width / placement.rect.height,
-        closeTo(2.0, 0.01));
+    expect(placement.rect.width / placement.rect.height, closeTo(2.0, 0.01));
     expect(placement.rect.width, lessThanOrEqualTo(280 + _eps));
     expect(placement.rect.height, lessThanOrEqualTo(480 + _eps));
     _disposeAll(pages);
@@ -171,8 +179,10 @@ void main() {
     );
     final placement = pages.single.items.single as ImagePlacement;
     expect(placement.rect.height, lessThanOrEqualTo(480 + _eps));
-    expect(placement.rect.width / placement.rect.height,
-        closeTo(100 / 2000, 0.01));
+    expect(
+      placement.rect.width / placement.rect.height,
+      closeTo(100 / 2000, 0.01),
+    );
     _disposeAll(pages);
   });
 
@@ -219,7 +229,11 @@ void main() {
 
   test('separator spans the full content width at 1px height', () {
     final pages = engine.paginate(
-      _section([_para('above'), const SeparatorBlock(), _para('below', nodeId: 'n2')]),
+      _section([
+        _para('above'),
+        const SeparatorBlock(),
+        _para('below', nodeId: 'n2'),
+      ]),
       _viewport,
       _style(),
     );
@@ -241,31 +255,39 @@ void main() {
     );
     final headingPages = engine.paginate(
       _section([
-        _para('Heading text line.',
-            kind: TextBlockKind.heading, headingLevel: 1)
+        _para(
+          'Heading text line.',
+          kind: TextBlockKind.heading,
+          headingLevel: 1,
+        ),
       ]),
       _viewport,
       _style(),
     );
     final body = bodyPages.single.items.single as TextPlacement;
     final heading = headingPages.single.items.single as TextPlacement;
-    expect(heading.lineMetrics.first.height,
-        greaterThan(body.lineMetrics.first.height));
+    expect(
+      heading.lineMetrics.first.height,
+      greaterThan(body.lineMetrics.first.height),
+    );
     _disposeAll(bodyPages);
     _disposeAll(headingPages);
   });
 
   test('explicit run sizeScale suppresses heading default scale', () {
+    final bookStyle = _style().copyWith(typesettingMode: TypesettingMode.book);
     final pages = engine.paginate(
       _section([
         TextBlock(
           kind: TextBlockKind.heading,
           headingLevel: 1,
-          inlines: const [TextRun('Sized heading', style: TextStyle(sizeScale: 2.0))],
-        )
+          inlines: const [
+            TextRun('Sized heading', style: TextStyle(sizeScale: 2.0)),
+          ],
+        ),
       ]),
       _viewport,
-      _style(),
+      bookStyle,
     );
     final heading = pages.single.items.single as TextPlacement;
     // sizeScale 2.0 vs base font 10 → line clearly taller than a body line
@@ -273,16 +295,20 @@ void main() {
     // 3.2x). Compare against a plain 2.0-scaled paragraph.
     final refPages = engine.paginate(
       _section([
-        TextBlock(inlines: const [
-          TextRun('Sized heading', style: TextStyle(sizeScale: 2.0))
-        ])
+        TextBlock(
+          inlines: const [
+            TextRun('Sized heading', style: TextStyle(sizeScale: 2.0)),
+          ],
+        ),
       ]),
       _viewport,
-      _style(),
+      bookStyle,
     );
     final ref = refPages.single.items.single as TextPlacement;
-    expect(heading.lineMetrics.first.height,
-        closeTo(ref.lineMetrics.first.height, 1.0));
+    expect(
+      heading.lineMetrics.first.height,
+      closeTo(ref.lineMetrics.first.height, 1.0),
+    );
     _disposeAll(pages);
     _disposeAll(refPages);
   });
@@ -290,7 +316,7 @@ void main() {
   test('list item paginates and offsets exclude the synthetic marker', () {
     final pages = engine.paginate(
       _section([
-        _para(_lorem(80), kind: TextBlockKind.listItem, listOrdinal: 3)
+        _para(_lorem(80), kind: TextBlockKind.listItem, listOrdinal: 3),
       ]),
       _viewport,
       _style(),
@@ -303,11 +329,134 @@ void main() {
     _disposeAll(pages);
   });
 
+  test('linked text remains hit-testable after paragraph layout', () {
+    final block = TextBlock(
+      nodeId: 'linked',
+      inlines: const [
+        TextRun('Body text '),
+        TextRun(
+          '1',
+          link: 's.xhtml#note-1',
+          style: TextStyle(
+            baseline: TextBaselineShift.superscript,
+            linkRole: LinkRole.footnoteReference,
+          ),
+        ),
+      ],
+      source: const SourceRange(
+        start: SourceAnchor(spine: 0, node: 'linked', textOffset: 0),
+        end: SourceAnchor(spine: 0, node: 'linked', textOffset: 11),
+      ),
+    );
+    final pages = engine.paginate(_section([block]), _viewport, _style());
+    addTearDown(() => _disposeAll(pages));
+    final placement = pages.single.items.whereType<TextPlacement>().single;
+    final link = placement.links.single;
+    final box = placement.paragraph
+        .getBoxesForRange(link.start, link.end)
+        .single;
+    final point = ui.Offset(
+      placement.x + (box.left + box.right) / 2,
+      placement.y - placement.sliceTop + (box.top + box.bottom) / 2,
+    );
+
+    expect(pages.single.linkAt(point), same(link));
+    expect(link.role, LinkRole.footnoteReference);
+    expect(link.href, 's.xhtml#note-1');
+  });
+
+  test('list markers use hanging indents and nested levels move inward', () {
+    final pages = engine.paginate(
+      _section([
+        _para(_lorem(3), kind: TextBlockKind.listItem, listOrdinal: 1),
+        _para(
+          'Nested item',
+          kind: TextBlockKind.listItem,
+          listDepth: 1,
+          nodeId: 'n2',
+        ),
+      ]),
+      _viewport,
+      _style(),
+    );
+    final markers = pages
+        .expand((page) => page.items)
+        .whereType<ListMarkerPlacement>()
+        .toList();
+    final text = pages
+        .expand((page) => page.items)
+        .whereType<TextPlacement>()
+        .toList();
+    expect(markers, hasLength(2));
+    expect(text[0].x, greaterThan(markers[0].x));
+    expect(text.last.x, greaterThan(text.first.x));
+    expect(markers[0].marker, '•');
+    expect(markers[1].marker, '◦');
+    _disposeAll(pages);
+  });
+
+  test('table grid retains headers and spans while fitting content width', () {
+    final table = TableBlock(
+      rows: [
+        TableRow([
+          TableCell(
+            inlines: const [TextRun('Header')],
+            header: true,
+            columnSpan: 2,
+          ),
+        ]),
+        const TableRow([
+          TableCell(inlines: [TextRun('A')]),
+          TableCell(inlines: [TextRun('A much longer value')]),
+        ]),
+      ],
+    );
+    final pages = engine.paginate(_section([table]), _viewport, _style());
+    final cells = pages
+        .expand((page) => page.items)
+        .whereType<TableCellPlacement>()
+        .toList();
+    expect(cells, hasLength(3));
+    expect(cells.first.header, isTrue);
+    expect(cells.first.rect.width, closeTo(280, _eps));
+    expect(cells[1].rect.right, closeTo(cells[2].rect.left, _eps));
+    expect(cells[2].rect.right, closeTo(290, _eps));
+    expect(cells.every((cell) => cell.rect.width > 0), isTrue);
+    _disposeAll(pages);
+  });
+
+  test('unified typesetting overrides authored body size and line height', () {
+    final section = _section([
+      TextBlock(
+        inlines: const [
+          TextRun('Authored body', style: TextStyle(sizeScale: 2)),
+        ],
+        style: const BlockStyle(lineHeight: 2),
+      ),
+    ]);
+    final unifiedPages = engine.paginate(section, _viewport, _style());
+    final bookPages = engine.paginate(
+      section,
+      _viewport,
+      _style().copyWith(typesettingMode: TypesettingMode.book),
+    );
+    final unified = unifiedPages.single.items.single as TextPlacement;
+    final book = bookPages.single.items.single as TextPlacement;
+    expect(
+      book.lineMetrics.first.height,
+      greaterThan(unified.lineMetrics.first.height),
+    );
+    _disposeAll(unifiedPages);
+    _disposeAll(bookPages);
+  });
+
   test('preformatted and blockquote blocks paginate', () {
     final pages = engine.paginate(
       _section([
-        _para('line one\nline two\nline three',
-            kind: TextBlockKind.preformatted),
+        _para(
+          'line one\nline two\nline three',
+          kind: TextBlockKind.preformatted,
+        ),
         _para(_lorem(10), kind: TextBlockKind.blockquote, nodeId: 'n2'),
       ]),
       _viewport,
@@ -321,24 +470,27 @@ void main() {
     _disposeAll(pages);
   });
 
-  test('a line taller than the page still gets placed (overflow tolerated)',
-      () {
-    final pages = engine.paginate(
-      _section([
-        TextBlock(inlines: const [
-          TextRun('Huge', style: TextStyle(sizeScale: 3.0))
-        ])
-      ]),
-      const LayoutViewport(width: 300, height: 40),
-      ReaderStyle(
+  test(
+    'a line taller than the page still gets placed (overflow tolerated)',
+    () {
+      final pages = engine.paginate(
+        _section([
+          TextBlock(
+            inlines: const [TextRun('Huge', style: TextStyle(sizeScale: 3.0))],
+          ),
+        ]),
+        const LayoutViewport(width: 300, height: 40),
+        ReaderStyle(
           baseFontSize: 30,
           marginTop: 4,
           marginBottom: 4,
           marginLeft: 4,
-          marginRight: 4),
-    );
-    expect(pages, isNotEmpty);
-    expect(pages.first.items.whereType<TextPlacement>(), isNotEmpty);
-    _disposeAll(pages);
-  });
+          marginRight: 4,
+        ),
+      );
+      expect(pages, isNotEmpty);
+      expect(pages.first.items.whereType<TextPlacement>(), isNotEmpty);
+      _disposeAll(pages);
+    },
+  );
 }

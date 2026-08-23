@@ -32,12 +32,11 @@ class PagePainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     canvas.drawRect(ui.Offset.zero & size, Paint()..color = background);
-    final separatorColor =
-        (foreground ??
-                (background.computeLuminance() > 0.5
-                    ? Colors.black
-                    : Colors.white))
-            .withAlpha(102);
+    final resolvedForeground =
+        foreground ??
+        (background.computeLuminance() > 0.5 ? Colors.black : Colors.white);
+    final separatorColor = resolvedForeground.withAlpha(102);
+    final tableCells = <TableCellPlacement>[];
 
     for (final item in page.items) {
       switch (item) {
@@ -51,6 +50,26 @@ class PagePainter extends CustomPainter {
           canvas.drawParagraph(
             item.paragraph,
             ui.Offset(item.x, item.y - item.sliceTop),
+          );
+          canvas.restore();
+        case ListMarkerPlacement():
+          canvas.drawParagraph(item.paragraph, ui.Offset(item.x, item.y));
+        case TableCellPlacement():
+          tableCells.add(item);
+          if (item.header) {
+            canvas.drawRect(
+              item.rect,
+              Paint()..color = resolvedForeground.withAlpha(22),
+            );
+          }
+          canvas.save();
+          canvas.clipRect(item.rect.deflate(item.padding));
+          canvas.drawParagraph(
+            item.paragraph,
+            ui.Offset(
+              item.rect.left + item.padding,
+              item.rect.top + item.padding,
+            ),
           );
           canvas.restore();
         case ImagePlacement():
@@ -78,6 +97,11 @@ class PagePainter extends CustomPainter {
           );
       }
     }
+
+    // A cell-by-cell rectangle stroke paints every shared edge twice, making
+    // inner rules visibly darker than the table outline. Build the union of
+    // all horizontal and vertical edges and submit it as one path instead.
+    _paintTableGrid(canvas, tableCells, resolvedForeground.withAlpha(96));
   }
 
   @override
@@ -85,6 +109,115 @@ class PagePainter extends CustomPainter {
       !identical(oldDelegate.page, page) ||
       oldDelegate.background != background ||
       oldDelegate.foreground != foreground;
+}
+
+const double _gridMergeTolerance = 0.001;
+const double _gridCoordinateScale = 1000;
+
+void _paintTableGrid(
+  Canvas canvas,
+  List<TableCellPlacement> cells,
+  Color color,
+) {
+  if (cells.isEmpty) return;
+
+  final horizontal = <int, _GridLineBucket>{};
+  final vertical = <int, _GridLineBucket>{};
+
+  for (final cell in cells) {
+    _addGridInterval(
+      horizontal,
+      cell.rect.top,
+      cell.rect.left,
+      cell.rect.right,
+    );
+    _addGridInterval(
+      horizontal,
+      cell.rect.bottom,
+      cell.rect.left,
+      cell.rect.right,
+    );
+    _addGridInterval(vertical, cell.rect.left, cell.rect.top, cell.rect.bottom);
+    _addGridInterval(
+      vertical,
+      cell.rect.right,
+      cell.rect.top,
+      cell.rect.bottom,
+    );
+  }
+
+  final path = ui.Path();
+  _appendGridLines(path, horizontal.values, horizontal: true);
+  _appendGridLines(path, vertical.values, horizontal: false);
+  canvas.drawPath(
+    path,
+    Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1
+      ..strokeCap = StrokeCap.butt,
+  );
+}
+
+void _addGridInterval(
+  Map<int, _GridLineBucket> buckets,
+  double coordinate,
+  double start,
+  double end,
+) {
+  final key = (coordinate * _gridCoordinateScale).round();
+  final bucket = buckets.putIfAbsent(key, () => _GridLineBucket(coordinate));
+  bucket.intervals.add(_GridInterval(start, end));
+}
+
+void _appendGridLines(
+  ui.Path path,
+  Iterable<_GridLineBucket> buckets, {
+  required bool horizontal,
+}) {
+  for (final bucket in buckets) {
+    final intervals = bucket.intervals
+      ..sort((a, b) => a.start.compareTo(b.start));
+    var start = intervals.first.start;
+    var end = intervals.first.end;
+
+    void append() {
+      if (horizontal) {
+        path
+          ..moveTo(start, bucket.coordinate)
+          ..lineTo(end, bucket.coordinate);
+      } else {
+        path
+          ..moveTo(bucket.coordinate, start)
+          ..lineTo(bucket.coordinate, end);
+      }
+    }
+
+    for (final interval in intervals.skip(1)) {
+      if (interval.start <= end + _gridMergeTolerance) {
+        end = interval.end > end ? interval.end : end;
+      } else {
+        append();
+        start = interval.start;
+        end = interval.end;
+      }
+    }
+    append();
+  }
+}
+
+class _GridLineBucket {
+  final double coordinate;
+  final List<_GridInterval> intervals = [];
+
+  _GridLineBucket(this.coordinate);
+}
+
+class _GridInterval {
+  final double start;
+  final double end;
+
+  const _GridInterval(this.start, this.end);
 }
 
 /// Drop-in widget that paints a [PageLayout] at the page's viewport size.

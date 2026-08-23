@@ -55,6 +55,142 @@ String? _attr(XmlElement element, String name) {
   return null;
 }
 
+Map<XmlElement, LinkRole> _classifyFootnoteLinks(
+  XmlDocument document,
+  String sectionHref,
+  String baseDir,
+) {
+  final anchors = document.descendants
+      .whereType<XmlElement>()
+      .where((element) => _name(element) == 'a')
+      .toList();
+  final roles = Map<XmlElement, LinkRole>.identity();
+  for (final anchor in anchors) {
+    final explicit = _explicitLinkRole(anchor);
+    if (explicit != null) roles[anchor] = explicit;
+  }
+
+  // Older EPUBs often expose no semantics at all. Torto recognizes a
+  // reciprocal pair such as ref -> note and note -> ref when both compact
+  // markers match, then uses surrounding prose to determine the direction.
+  final byFragment = <String, XmlElement>{};
+  for (final element in document.descendants.whereType<XmlElement>()) {
+    final fragment = _nodeFragment(element);
+    if (fragment != null) byFragment[fragment] = element;
+  }
+  final sectionPath = splitPackageFragment(sectionHref).$1;
+  for (final anchor in anchors) {
+    final sourceFragment = _nodeFragment(anchor);
+    final rawTarget = _attr(anchor, 'href');
+    if (sourceFragment == null || rawTarget == null) continue;
+    final target = _resolveDocumentLink(sectionHref, baseDir, rawTarget);
+    final (targetPath, targetFragment) = splitPackageFragment(target);
+    if (targetPath != sectionPath || targetFragment == null) continue;
+    final targetNode = byFragment[targetFragment];
+    if (targetNode == null) continue;
+
+    XmlElement? counterpart;
+    final candidates = <XmlElement>[
+      targetNode,
+      ...targetNode.descendants.whereType<XmlElement>(),
+    ];
+    for (final candidate in candidates) {
+      if (_name(candidate) != 'a' || identical(candidate, anchor)) continue;
+      final candidateHref = _attr(candidate, 'href');
+      if (candidateHref == null ||
+          !_matchingFootnoteMarkers(anchor, candidate)) {
+        continue;
+      }
+      final resolved = _resolveDocumentLink(
+        sectionHref,
+        baseDir,
+        candidateHref,
+      );
+      final (path, fragment) = splitPackageFragment(resolved);
+      if (path == sectionPath && fragment == sourceFragment) {
+        counterpart = candidate;
+        break;
+      }
+    }
+    if (counterpart == null) continue;
+
+    final anchorHasProse = _linkHasPrecedingBlockText(anchor);
+    final counterpartHasProse = _linkHasPrecedingBlockText(counterpart);
+    final reference = anchorHasProse && !counterpartHasProse
+        ? anchor
+        : (!anchorHasProse && counterpartHasProse ? counterpart : anchor);
+    final backlink = identical(reference, anchor) ? counterpart : anchor;
+    roles.putIfAbsent(reference, () => LinkRole.footnoteReference);
+    roles.putIfAbsent(backlink, () => LinkRole.footnoteBacklink);
+  }
+  return roles;
+}
+
+LinkRole? _explicitLinkRole(XmlElement anchor) {
+  for (final value in [
+    _attr(anchor, 'type'),
+    _attr(anchor, 'role'),
+    _attr(anchor, 'rel'),
+  ]) {
+    for (final token in (value ?? '').split(RegExp(r'\s+'))) {
+      switch (token.toLowerCase()) {
+        case 'noteref' || 'doc-noteref':
+          return LinkRole.footnoteReference;
+        case 'backlink' || 'doc-backlink':
+          return LinkRole.footnoteBacklink;
+      }
+    }
+  }
+  return null;
+}
+
+String? _nodeFragment(XmlElement element) {
+  final fragment = (_attr(element, 'id') ?? _attr(element, 'name'))?.trim();
+  return fragment == null || fragment.isEmpty ? null : fragment;
+}
+
+String _resolveDocumentLink(
+  String sectionHref,
+  String baseDir,
+  String rawHref,
+) {
+  final trimmed = rawHref.trim();
+  return trimmed.startsWith('#')
+      ? '$sectionHref$trimmed'
+      : resolvePackageHref(baseDir, trimmed);
+}
+
+bool _matchingFootnoteMarkers(XmlElement left, XmlElement right) {
+  String? marker(XmlElement element) {
+    final text = element.descendants
+        .whereType<XmlText>()
+        .map((node) => node.value)
+        .join();
+    final normalized = text
+        .trim()
+        .replaceAll(RegExp(r'^[\[\(（【]+|[\]\)）】]+$'), '')
+        .trim();
+    if (normalized.isEmpty || normalized.runes.length > 8) return null;
+    return normalized.contains(RegExp(r'\s')) ? null : normalized.toLowerCase();
+  }
+
+  final leftMarker = marker(left);
+  return leftMarker != null && leftMarker == marker(right);
+}
+
+bool _linkHasPrecedingBlockText(XmlElement link) {
+  XmlElement? block = link.parentElement;
+  while (block != null && !_isBlockBoundary(_name(block))) {
+    block = block.parentElement;
+  }
+  if (block == null) return false;
+  for (final node in block.descendants) {
+    if (identical(node, link)) break;
+    if (node is XmlText && node.value.trim().isNotEmpty) return true;
+  }
+  return false;
+}
+
 bool _isWhitespaceRune(int rune) =>
     rune == 0x20 ||
     (rune >= 0x09 && rune <= 0x0D) ||
@@ -126,10 +262,13 @@ class _SectionParser {
   final String baseDir;
   final XmlDocument document;
   final _StyleSheet styles = _StyleSheet();
+  late final Map<XmlElement, LinkRole> _footnoteLinks;
   final List<Block> blocks = [];
+  final Map<XmlElement, SourceAnchor> _elementSources = Map.identity();
   int _nextNode = 0;
 
   _SectionParser(this.spineIndex, this.href, this.baseDir, this.document) {
+    _footnoteLinks = _classifyFootnoteLinks(document, href, baseDir);
     for (final element in document.descendants.whereType<XmlElement>()) {
       if (_name(element) == 'style') {
         styles.addCss(
@@ -155,7 +294,22 @@ class _SectionParser {
     }
     root ??= document.rootElement;
     _parseChildren(root);
-    return Section(spineIndex: spineIndex, href: href, blocks: blocks);
+    final anchors = <SectionAnchor>[];
+    final seen = <String>{};
+    for (final element in document.descendants.whereType<XmlElement>()) {
+      final fragment = _nodeFragment(element);
+      if (fragment == null || !seen.add(fragment)) continue;
+      final source = _sourceForElement(element);
+      if (source != null) {
+        anchors.add(SectionAnchor(fragment: fragment, source: source));
+      }
+    }
+    return Section(
+      spineIndex: spineIndex,
+      href: href,
+      blocks: blocks,
+      anchors: anchors,
+    );
   }
 
   String _allocateNode() => 'n${_nextNode++}';
@@ -174,6 +328,7 @@ class _SectionParser {
   }
 
   void _parseNode(XmlElement element, int listDepth) {
+    final blockStart = blocks.length;
     final name = _name(element);
     if (_skippedElements.contains(name)) return;
 
@@ -246,6 +401,47 @@ class _SectionParser {
     if (_isPageBreak(props['page-break-after'] ?? props['break-after'])) {
       blocks.add(const PageBreakBlock());
     }
+    _rememberElementSource(element, blockStart);
+  }
+
+  void _rememberElementSource(XmlElement element, int blockStart) {
+    for (final block in blocks.skip(blockStart)) {
+      final source = _firstBlockSource(block);
+      if (source != null) {
+        _elementSources[element] = source.start;
+        return;
+      }
+    }
+  }
+
+  SourceAnchor? _sourceForElement(XmlElement element) {
+    XmlElement? current = element;
+    while (current != null) {
+      final source = _elementSources[current];
+      if (source != null) return source;
+      current = current.parentElement;
+    }
+    for (final descendant in element.descendants.whereType<XmlElement>()) {
+      final source = _elementSources[descendant];
+      if (source != null) return source;
+    }
+    return null;
+  }
+
+  static SourceRange? _firstBlockSource(Block block) {
+    switch (block) {
+      case TextBlock(:final source) || ImageBlock(:final source):
+        return source;
+      case TableBlock(:final rows):
+        for (final row in rows) {
+          for (final cell in row.cells) {
+            if (cell.source != null) return cell.source;
+          }
+        }
+      default:
+        return null;
+    }
+    return null;
   }
 
   static bool _isPageBreak(String? value) =>
@@ -286,11 +482,20 @@ class _SectionParser {
     required bool ordered,
     required int depth,
   }) {
-    var ordinal = 1;
-    for (final item in list.childElements) {
-      if (_name(item) != 'li') continue;
+    final items = list.childElements
+        .where((item) => _name(item) == 'li')
+        .toList();
+    final reversed = ordered && _attr(list, 'reversed') != null;
+    var ordinal =
+        int.tryParse(_attr(list, 'start') ?? '') ??
+        (reversed ? items.length : 1);
+    for (final item in items) {
+      final blockStart = blocks.length;
+      final explicit = int.tryParse(_attr(item, 'value') ?? '');
+      if (explicit != null) ordinal = explicit;
       _emitListItem(item, ordered: ordered, ordinal: ordinal, depth: depth);
-      ordinal++;
+      _rememberElementSource(item, blockStart);
+      ordinal += reversed ? -1 : 1;
     }
   }
 
@@ -300,15 +505,20 @@ class _SectionParser {
     required int ordinal,
     required int depth,
   }) {
-    var style = _blockStyleFor(item);
-    style = style.copyWith(
-      marginStart: math.max(style.marginStart, 24.0 * (depth + 1)),
-    );
+    // List indentation is resolved from the active reader font in layout.
+    // Baking a fixed 24 px offset here made it get applied a second time and
+    // caused deeply nested lists to collapse into a very narrow column.
+    final style = _blockStyleFor(item);
     final textStyle = _textStyleForBlock(item, TextBlockKind.listItem);
     final collector = _InlineCollector(preserveWhitespace: false);
     for (final child in item.children) {
       if (child is XmlElement && _isStructuredContainer(_name(child))) {
         continue;
+      }
+      if (child is XmlElement &&
+          _isBlockBoundary(_name(child)) &&
+          collector.content.isNotEmpty) {
+        collector.pushBreakIfNeeded();
       }
       _collectInlineNode(child, textStyle, null, collector);
     }
@@ -333,13 +543,13 @@ class _SectionParser {
     }
   }
 
-  /// Tables are a known gap for this milestone: each row's cells are
-  /// extracted as plain paragraphs (header cells bold).
   void _parseTable(XmlElement table) {
+    final parsedRows = <TableRow>[];
     for (final row in table.descendants.whereType<XmlElement>()) {
       if (_name(row) != 'tr' || _nearestTableAncestor(row) != table) {
         continue;
       }
+      final parsedCells = <TableCell>[];
       for (final cell in row.childElements) {
         final cellName = _name(cell);
         if (cellName != 'td' && cellName != 'th') continue;
@@ -348,17 +558,66 @@ class _SectionParser {
           textStyle = _copyTextStyle(textStyle, bold: true);
         }
         final collector = _InlineCollector(preserveWhitespace: false);
-        _collectInline(cell, textStyle, null, collector);
-        collector.finish();
-        if (collector.content.isNotEmpty) {
-          _emitTextBlock(
-            TextBlockKind.paragraph,
-            _blockStyleFor(cell),
-            collector.content,
-          );
+        for (final child in cell.children) {
+          if (child is XmlElement &&
+              _isBlockBoundary(_name(child)) &&
+              collector.content.isNotEmpty) {
+            collector.pushBreakIfNeeded();
+          }
+          _collectInlineNode(child, textStyle, null, collector);
         }
+        collector.finish();
+        final nodeId = _allocateNode();
+        final textLength = collector.content.fold<int>(
+          0,
+          (length, inline) =>
+              length + (inline is TextRun ? inline.text.length : 1),
+        );
+        parsedCells.add(
+          TableCell(
+            inlines: List.unmodifiable(collector.content),
+            header: cellName == 'th',
+            columnSpan: _positiveSpan(_attr(cell, 'colspan')),
+            rowSpan: _positiveSpan(_attr(cell, 'rowspan')),
+            authoredAlignment: _tableCellAlignment(cell),
+            style: _blockStyleFor(cell),
+            source: _sourceFor(nodeId, textLength),
+            nodeId: nodeId,
+          ),
+        );
+        _elementSources[cell] = SourceAnchor(
+          spine: spineIndex,
+          node: nodeId,
+          textOffset: 0,
+        );
+      }
+      if (parsedCells.isNotEmpty) {
+        parsedRows.add(TableRow(List.unmodifiable(parsedCells)));
       }
     }
+    if (parsedRows.isNotEmpty) {
+      blocks.add(
+        TableBlock(
+          rows: List.unmodifiable(parsedRows),
+          style: _blockStyleFor(table),
+        ),
+      );
+    }
+  }
+
+  static int _positiveSpan(String? raw) =>
+      (int.tryParse(raw ?? '') ?? 1).clamp(1, 64).toInt();
+
+  BlockAlign? _tableCellAlignment(XmlElement cell) {
+    final value =
+        styles.cascadedProperties(cell)['text-align'] ?? _attr(cell, 'align');
+    return switch (value?.trim().toLowerCase()) {
+      'center' => BlockAlign.center,
+      'right' || 'end' => BlockAlign.end,
+      'justify' => BlockAlign.justify,
+      'left' || 'start' => BlockAlign.start,
+      _ => null,
+    };
   }
 
   static XmlElement? _nearestTableAncestor(XmlElement element) {
@@ -542,6 +801,12 @@ class _SectionParser {
       case 'big':
         style = _copyTextStyle(style, sizeScale: style.sizeScale * 1.2);
     }
+    final classes = (_attr(node, 'class') ?? '')
+        .split(RegExp(r'\s+'))
+        .map((value) => value.toLowerCase());
+    if (classes.any((value) => value == 'footnote' || value == 'footnote1')) {
+      style = _copyTextStyle(style, inlineRole: InlineRole.footnote);
+    }
     style = _applyCssTextProperties(style, styles.cascadedProperties(node));
 
     var childLink = link;
@@ -549,6 +814,10 @@ class _SectionParser {
       final rawHref = _attr(node, 'href');
       if (rawHref != null && rawHref.trim().isNotEmpty) {
         childLink = _resolveLink(rawHref);
+      }
+      final linkRole = _footnoteLinks[node];
+      if (linkRole != null) {
+        style = _copyTextStyle(style, linkRole: linkRole);
       }
     }
     _collectInline(node, style, childLink, collector);
@@ -710,6 +979,8 @@ TextStyle _copyTextStyle(
   double? sizeScale,
   int? color,
   TextBaselineShift? baseline,
+  LinkRole? linkRole,
+  InlineRole? inlineRole,
 }) {
   return TextStyle(
     bold: bold ?? base.bold,
@@ -719,6 +990,8 @@ TextStyle _copyTextStyle(
     sizeScale: sizeScale ?? base.sizeScale,
     color: color ?? base.color,
     baseline: baseline ?? base.baseline,
+    linkRole: linkRole ?? base.linkRole,
+    inlineRole: inlineRole ?? base.inlineRole,
   );
 }
 
@@ -812,6 +1085,11 @@ class _InlineCollector {
   void pushBreak() {
     content.add(const BreakInline());
     _lastWasSpace = true;
+  }
+
+  void pushBreakIfNeeded() {
+    if (content.isEmpty || content.last is BreakInline) return;
+    pushBreak();
   }
 
   void finish() {

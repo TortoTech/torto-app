@@ -22,6 +22,14 @@ class LayoutViewport {
 }
 
 /// User-controlled values that invalidate pagination.
+enum TypesettingMode {
+  /// Replace publication-authored metrics with one semantic profile.
+  unified,
+
+  /// Preserve publication-authored font sizes, spacing, alignment and color.
+  book,
+}
+
 class ReaderStyle {
   /// Base reading font size, logical px.
   final double baseFontSize;
@@ -42,6 +50,9 @@ class ReaderStyle {
   /// Page background color, ARGB.
   final int background;
 
+  /// Whether semantic reader metrics override the publication's own layout.
+  final TypesettingMode typesettingMode;
+
   const ReaderStyle({
     this.baseFontSize = 18,
     this.lineHeight = 1.5,
@@ -51,7 +62,56 @@ class ReaderStyle {
     this.marginRight = 32,
     this.foreground = 0xFF000000,
     this.background = 0xFFFAF8F3,
+    this.typesettingMode = TypesettingMode.unified,
   });
+
+  ReaderStyle copyWith({
+    double? baseFontSize,
+    double? lineHeight,
+    double? marginTop,
+    double? marginBottom,
+    double? marginLeft,
+    double? marginRight,
+    int? foreground,
+    int? background,
+    TypesettingMode? typesettingMode,
+  }) => ReaderStyle(
+    baseFontSize: baseFontSize ?? this.baseFontSize,
+    lineHeight: lineHeight ?? this.lineHeight,
+    marginTop: marginTop ?? this.marginTop,
+    marginBottom: marginBottom ?? this.marginBottom,
+    marginLeft: marginLeft ?? this.marginLeft,
+    marginRight: marginRight ?? this.marginRight,
+    foreground: foreground ?? this.foreground,
+    background: background ?? this.background,
+    typesettingMode: typesettingMode ?? this.typesettingMode,
+  );
+
+  @override
+  bool operator ==(Object other) =>
+      other is ReaderStyle &&
+      other.baseFontSize == baseFontSize &&
+      other.lineHeight == lineHeight &&
+      other.marginTop == marginTop &&
+      other.marginBottom == marginBottom &&
+      other.marginLeft == marginLeft &&
+      other.marginRight == marginRight &&
+      other.foreground == foreground &&
+      other.background == background &&
+      other.typesettingMode == typesettingMode;
+
+  @override
+  int get hashCode => Object.hash(
+    baseFontSize,
+    lineHeight,
+    marginTop,
+    marginBottom,
+    marginLeft,
+    marginRight,
+    foreground,
+    background,
+    typesettingMode,
+  );
 }
 
 /// Positioned page content.
@@ -104,6 +164,9 @@ class TextPlacement extends PageItem {
   /// section's text. Engine-internal; used for progression computation.
   final double sectionTextOffset;
 
+  /// Interactive link ranges in the retained paragraph's UTF-16 text.
+  final List<TextLinkRange> links;
+
   const TextPlacement({
     required this.paragraph,
     required this.startLine,
@@ -119,6 +182,70 @@ class TextPlacement extends PageItem {
     required this.sliceTop,
     required this.sliceHeight,
     required this.sectionTextOffset,
+    this.links = const [],
+  });
+}
+
+/// One linked UTF-16 range inside a laid-out paragraph.
+class TextLinkRange {
+  final int start;
+  final int end;
+  final String href;
+  final String marker;
+  final LinkRole role;
+
+  const TextLinkRange({
+    required this.start,
+    required this.end,
+    required this.href,
+    required this.marker,
+    required this.role,
+  });
+}
+
+/// Marker for a list item. It is shaped independently so wrapped item text
+/// uses a true hanging indent instead of wrapping beneath the bullet/number.
+class ListMarkerPlacement extends PageItem {
+  final String marker;
+  final ui.Paragraph paragraph;
+  final double x;
+  final double y;
+  final double width;
+  final double height;
+
+  const ListMarkerPlacement({
+    required this.marker,
+    required this.paragraph,
+    required this.x,
+    required this.y,
+    required this.width,
+    required this.height,
+  });
+}
+
+/// One laid-out table cell. Borders and header fill are painted by the render
+/// stage so a table remains crisp at every device density.
+class TableCellPlacement extends PageItem {
+  final ui.Paragraph paragraph;
+  final ui.Rect rect;
+  final double padding;
+  final bool header;
+  final SourceRange? source;
+  final String nodeId;
+  final int spineIndex;
+  final double sectionTextOffset;
+  final List<TextLinkRange> links;
+
+  const TableCellPlacement({
+    required this.paragraph,
+    required this.rect,
+    required this.padding,
+    required this.header,
+    required this.source,
+    required this.nodeId,
+    required this.spineIndex,
+    required this.sectionTextOffset,
+    this.links = const [],
   });
 }
 
@@ -177,17 +304,70 @@ class PageLayout {
     this.disposalPool,
   });
 
+  /// Returns the authored link under [position], including semantic footnote
+  /// role. Geometry comes from the same shaped paragraph used for painting.
+  TextLinkRange? linkAt(ui.Offset position) {
+    for (final item in items.reversed) {
+      final ui.Paragraph paragraph;
+      final List<TextLinkRange> links;
+      final ui.Offset paragraphOffset;
+      final ui.Rect slice;
+      switch (item) {
+        case TextPlacement():
+          paragraph = item.paragraph;
+          links = item.links;
+          paragraphOffset = ui.Offset(item.x, item.y - item.sliceTop);
+          slice = ui.Rect.fromLTWH(
+            item.x,
+            item.y,
+            item.width,
+            item.sliceHeight,
+          );
+        case TableCellPlacement():
+          paragraph = item.paragraph;
+          links = item.links;
+          paragraphOffset = ui.Offset(
+            item.rect.left + item.padding,
+            item.rect.top + item.padding,
+          );
+          slice = item.rect.deflate(item.padding);
+        default:
+          continue;
+      }
+      if (links.isEmpty) continue;
+      if (!slice.contains(position)) continue;
+      for (final link in links) {
+        for (final box in paragraph.getBoxesForRange(link.start, link.end)) {
+          final rect = ui.Rect.fromLTRB(
+            paragraphOffset.dx + box.left,
+            paragraphOffset.dy + box.top,
+            paragraphOffset.dx + box.right,
+            paragraphOffset.dy + box.bottom,
+          ).intersect(slice);
+          if (!rect.isEmpty && rect.inflate(2).contains(position)) return link;
+        }
+      }
+    }
+    return null;
+  }
+
   /// Disposes every retained paragraph exactly once, even when a paragraph
   /// spans several pages (slices of it appear in several [PageLayout]s).
   void dispose() {
     final pool = disposalPool;
     final seen = <ui.Paragraph>{};
     for (final item in items) {
-      if (item is! TextPlacement) continue;
+      final paragraph = switch (item) {
+        TextPlacement(:final paragraph) => paragraph,
+        ListMarkerPlacement(:final paragraph) => paragraph,
+        TableCellPlacement(:final paragraph) => paragraph,
+        _ => null,
+      };
+      if (paragraph == null) continue;
       final firstSeen = pool != null
-          ? pool.markDisposed(item.paragraph)
-          : seen.add(item.paragraph);
-      if (firstSeen) item.paragraph.dispose();
+          ? pool.markDisposed(paragraph)
+          : seen.add(paragraph);
+      if (firstSeen) paragraph.dispose();
     }
   }
 }

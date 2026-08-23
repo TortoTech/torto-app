@@ -3,8 +3,10 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:torto/app/reader/reader_controller.dart';
 import 'package:torto/app/reader/reader_page.dart';
+import 'package:torto/app/reader/reader_preferences_store.dart';
 import 'package:torto/core/layout/layout_types.dart';
 import 'package:torto/core/render/page_painter.dart';
 
@@ -175,10 +177,14 @@ void main() {
     expect(find.byType(PageWidget), findsOneWidget);
   });
 
-  testWidgets('reader overlay shows only back and bottom contents controls', (
+  testWidgets('reader overlay exposes contents and persistent layout mode', (
     tester,
   ) async {
     final controller = _FakeReaderController();
+    SharedPreferences.setMockInitialValues({});
+    final preferences = ReaderPreferencesStore(
+      await SharedPreferences.getInstance(),
+    );
     await tester.binding.setSurfaceSize(const Size(411, 914));
     addTearDown(() async {
       await tester.pumpWidget(const SizedBox.shrink());
@@ -198,6 +204,7 @@ void main() {
                     builder: (_) => ReaderPage(
                       file: File('unused.epub'),
                       controller: controller,
+                      preferencesStore: preferences,
                     ),
                   ),
                 ),
@@ -216,10 +223,12 @@ void main() {
 
     final back = find.byKey(const Key('reader-back-button'));
     final contents = find.byKey(const Key('reader-toc-button'));
+    final style = find.byKey(const Key('reader-style-button'));
     final header = find.byKey(const Key('reader-header'));
     final footer = find.byKey(const Key('reader-footer'));
     expect(back, findsOneWidget);
     expect(contents, findsOneWidget);
+    expect(style, findsOneWidget);
     expect(find.text('目录'), findsNothing);
     expect(find.text('Gesture test'), findsNothing);
     expect(find.textContaining('section'), findsNothing);
@@ -230,6 +239,18 @@ void main() {
     expect(tester.getCenter(back).dy, lessThan(100));
     expect(tester.getCenter(contents).dy, greaterThan(800));
     expect(tester.getCenter(contents).dx, lessThan(100));
+
+    await tester.tap(style);
+    await tester.pumpAndSettle();
+    expect(find.text('统一版式'), findsOneWidget);
+    expect(find.text('跟随书籍'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('typesetting-book')));
+    await tester.pumpAndSettle();
+    expect(await preferences.loadTypesettingMode(), TypesettingMode.book);
+
+    // Reopen the overlay after the sheet dismissed it.
+    await tester.tapAt(const Offset(205, 450));
+    await tester.pump();
 
     // A page-turn gesture dismisses both bars immediately.
     await tester.tapAt(const Offset(350, 450));

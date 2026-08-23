@@ -72,10 +72,20 @@ class Section {
   final int spineIndex;
   final String href;
   final List<Block> blocks;
+  final List<SectionAnchor> anchors;
 
   const Section({
     required this.spineIndex,
     required this.href,
     required this.blocks,
+    this.anchors = const [],
   });
+}
+
+/// An authored HTML `id`/`name` fragment resolved to stable Reading IR.
+class SectionAnchor {
+  final String fragment;
+  final SourceAnchor source;
+
+  const SectionAnchor({required this.fragment, required this.source});
 }

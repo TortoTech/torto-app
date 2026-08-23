@@ -3,12 +3,9 @@
 /// cursor, collapsing margins, line-range slicing of paragraphs across
 /// pages), built on `dart:ui` paragraphs instead of Parley.
 ///
-/// Known v1 approximations (deliberate, see task notes):
-/// - First-line indent ([BlockStyle.indent]) is ignored.
+/// Known approximations:
 /// - Superscript/subscript runs are rendered at 0.7x size with NO baseline
 ///   shift (dart:ui's TextStyle has no baseline-shift support).
-/// - List markers are synthetic prefix runs; wrapped lines align to the
-///   (indented) column edge, not past the marker (no true hanging indent).
 library;
 
 import 'dart:math' as math;
@@ -62,13 +59,17 @@ class LayoutEngine {
     final contentHeight = contentBottom - contentTop;
 
     // Cumulative UTF-16 text offsets, for progression computation.
-    final textStartOf = <TextBlock, double>{};
+    final textStartOf = <Block, double>{};
     var totalText = 0.0;
     for (final block in section.blocks) {
-      if (block is TextBlock) {
-        textStartOf[block] = totalText;
-        totalText += block.plainText.length;
-      }
+      final length = switch (block) {
+        TextBlock(:final plainText) => plainText.length,
+        TableBlock(:final textLength) => textLength,
+        _ => 0,
+      };
+      if (length == 0) continue;
+      textStartOf[block] = totalText;
+      totalText += length;
     }
 
     final paginator = _Paginator(
@@ -104,6 +105,15 @@ class LayoutEngine {
           paginator.pushSeparator(vMargin: style.baseFontSize * 0.75);
         case PageBreakBlock():
           paginator.forcePage();
+        case TableBlock():
+          final prepared = _prepareTable(
+            block,
+            style,
+            section.spineIndex,
+            contentWidth,
+            textStartOf[block] ?? 0,
+          );
+          if (prepared != null) paginator.pushTable(prepared);
       }
     }
 
@@ -115,28 +125,40 @@ class LayoutEngine {
     var carriedProgression = 0.0;
     for (var i = 0; i < rawPages.length; i++) {
       final items = rawPages[i];
-      TextPlacement? firstText;
+      SourceRange? firstSource;
+      String? firstNodeId;
+      int firstSpineIndex = section.spineIndex;
+      var firstTextOffset = 0;
+      double? firstSectionTextOffset;
       for (final item in items) {
-        if (item is TextPlacement) {
-          firstText = item;
-          break;
+        switch (item) {
+          case TextPlacement():
+            firstSource = item.source;
+            firstNodeId = item.nodeId;
+            firstSpineIndex = item.spineIndex;
+            firstTextOffset = item.textOffsetAtStart;
+            firstSectionTextOffset = item.sectionTextOffset;
+          case TableCellPlacement():
+            firstSource = item.source;
+            firstNodeId = item.nodeId;
+            firstSpineIndex = item.spineIndex;
+            firstSectionTextOffset = item.sectionTextOffset;
+          default:
+            continue;
         }
+        break;
       }
       SourceAnchor? anchor;
       var progression = carriedProgression;
-      if (firstText != null) {
+      if (firstSectionTextOffset != null) {
         anchor = SourceAnchor(
-          spine: section.spineIndex,
-          node: firstText.nodeId,
-          textOffset:
-              (firstText.source?.start.textOffset ?? 0) +
-              firstText.textOffsetAtStart,
+          spine: firstSpineIndex,
+          node: firstNodeId ?? '',
+          textOffset: (firstSource?.start.textOffset ?? 0) + firstTextOffset,
         );
         if (totalText > 0) {
-          progression =
-              ((firstText.sectionTextOffset + firstText.textOffsetAtStart) /
-                      totalText)
-                  .clamp(0.0, 1.0);
+          progression = ((firstSectionTextOffset + firstTextOffset) / totalText)
+              .clamp(0.0, 1.0);
         }
         carriedProgression = progression;
       }
@@ -165,36 +187,62 @@ class LayoutEngine {
     double sectionTextOffset,
   ) {
     final baseSize = style.baseFontSize;
+    final unified = style.typesettingMode == TypesettingMode.unified;
     final isHeading = block.kind == TextBlockKind.heading;
     final isPre = block.kind == TextBlockKind.preformatted;
+    final isList = block.kind == TextBlockKind.listItem;
+    final isQuote = block.kind == TextBlockKind.blockquote;
 
     var marginBefore = block.style.marginBefore;
     var marginAfter = block.style.marginAfter;
     var marginStart = block.style.marginStart;
 
-    // Heading defaults: size scale by level (only when the IR left all runs
-    // at scale 1.0), bold, extra margins.
-    var headingScale = 1.0;
-    if (isHeading) {
+    var blockScale = 1.0;
+    var paragraphLineHeight = style.lineHeight * block.style.lineHeight;
+    var resolvedAlign = block.style.align;
+
+    if (unified) {
+      marginBefore = 0;
+      marginAfter = baseSize * 0.5;
+      marginStart = 0;
+      resolvedAlign = isQuote ? block.style.align : BlockAlign.start;
+      paragraphLineHeight = style.lineHeight;
+      if (isHeading) {
+        blockScale = _unifiedHeadingScale(block.headingLevel);
+        paragraphLineHeight = 1.3;
+        marginAfter = baseSize * 0.7;
+      } else if (isPre) {
+        blockScale = 0.9;
+        paragraphLineHeight = 1.45;
+      } else if (isQuote) {
+        blockScale = 0.95;
+        marginStart = baseSize * 2;
+      }
+    } else if (isHeading) {
       final allPlain = block.inlines.every(
         (i) => i is! TextRun || i.style.sizeScale == 1.0,
       );
       if (allPlain) {
-        headingScale = _headingScales[block.headingLevel.clamp(1, 6)] ?? 1.0;
+        blockScale = _headingScales[block.headingLevel.clamp(1, 6)] ?? 1.0;
       }
       marginBefore = math.max(marginBefore, baseSize * 0.8);
       marginAfter = math.max(marginAfter, baseSize * 0.4);
     }
-    if (block.kind == TextBlockKind.blockquote) {
+    if (!unified && isQuote) {
       marginStart += baseSize * 2;
     }
 
-    // List items: synthetic marker run + indented column (simple hanging
-    // indent approximation).
     var marker = '';
-    if (block.kind == TextBlockKind.listItem) {
-      marker = block.listOrdered ? '${block.listOrdinal}. ' : '• ';
-      marginStart += baseSize * 1.5;
+    var markerWidth = 0.0;
+    if (isList) {
+      marker = block.listOrdered
+          ? '${block.listOrdinal}.'
+          : _bulletForDepth(block.listDepth);
+      markerWidth = baseSize * 1.35;
+      final semanticIndent = baseSize * 1.5 * (block.listDepth + 1);
+      marginStart = unified
+          ? semanticIndent
+          : math.max(marginStart, semanticIndent);
     }
 
     final hasText = block.inlines.any(
@@ -204,7 +252,7 @@ class LayoutEngine {
 
     final foreground = ui.Color(style.foreground);
     final fontFamily = isPre ? 'monospace' : null;
-    final align = switch (block.style.align) {
+    final align = switch (resolvedAlign) {
       BlockAlign.start => ui.TextAlign.left,
       BlockAlign.center => ui.TextAlign.center,
       BlockAlign.end => ui.TextAlign.right,
@@ -215,50 +263,75 @@ class LayoutEngine {
       ui.ParagraphStyle(
         textAlign: align,
         textDirection: ui.TextDirection.ltr,
-        fontSize: baseSize * headingScale,
-        height: style.lineHeight * block.style.lineHeight,
+        fontSize: baseSize * blockScale,
+        height: paragraphLineHeight,
         fontFamily: fontFamily,
       ),
     );
 
-    if (marker.isNotEmpty) {
-      builder.pushStyle(
-        ui.TextStyle(
-          color: foreground,
-          fontSize: baseSize * headingScale,
-          fontWeight: isHeading ? ui.FontWeight.bold : null,
-          fontFamily: fontFamily,
-        ),
+    final indentWidth = isList
+        ? 0.0
+        : (unified && block.kind == TextBlockKind.paragraph
+              ? baseSize * 2
+              : block.style.indent);
+    var syntheticPrefixLength = 0;
+    if (indentWidth > 0) {
+      builder.addPlaceholder(
+        indentWidth,
+        baseSize,
+        ui.PlaceholderAlignment.baseline,
+        baseline: ui.TextBaseline.alphabetic,
+        baselineOffset: baseSize * 0.8,
       );
-      builder.addText(marker);
-      builder.pop();
+      syntheticPrefixLength = 1;
     }
+
+    final links = <TextLinkRange>[];
+    var paragraphOffset = syntheticPrefixLength;
 
     for (final inline in block.inlines) {
       switch (inline) {
-        case TextRun(:final text, style: final runStyle):
+        case TextRun(:final text, style: final runStyle, :final link):
           if (text.isEmpty) continue;
-          var scale = runStyle.sizeScale * headingScale;
+          var scale = unified ? blockScale : runStyle.sizeScale * blockScale;
           // Super/subscript: size reduced, baseline shift not approximated.
           if (runStyle.baseline != TextBaselineShift.none) scale *= 0.7;
+          final clearEmphasis = unified && (isHeading || isQuote);
           builder.pushStyle(
             ui.TextStyle(
-              color: runStyle.color != null
+              color: !unified && runStyle.color != null
                   ? ui.Color(runStyle.color!)
                   : foreground,
-              fontWeight: (runStyle.bold || isHeading)
+              fontWeight: ((runStyle.bold && !clearEmphasis) || isHeading)
                   ? ui.FontWeight.bold
                   : null,
-              fontStyle: runStyle.italic ? ui.FontStyle.italic : null,
-              decoration: _decorationFor(runStyle),
+              fontStyle: runStyle.italic && !clearEmphasis
+                  ? ui.FontStyle.italic
+                  : null,
+              decoration: link != null
+                  ? ui.TextDecoration.underline
+                  : _decorationFor(runStyle, includeUnderline: !unified),
               fontSize: baseSize * scale,
               fontFamily: fontFamily,
             ),
           );
           builder.addText(text);
           builder.pop();
+          if (link != null) {
+            links.add(
+              TextLinkRange(
+                start: paragraphOffset,
+                end: paragraphOffset + text.length,
+                href: link,
+                marker: text.trim(),
+                role: runStyle.linkRole,
+              ),
+            );
+          }
+          paragraphOffset += text.length;
         case BreakInline():
           builder.addText('\n');
+          paragraphOffset++;
       }
     }
 
@@ -277,6 +350,22 @@ class LayoutEngine {
       top += m.height;
     }
 
+    ui.Paragraph? markerParagraph;
+    if (marker.isNotEmpty) {
+      final markerBuilder = ui.ParagraphBuilder(
+        ui.ParagraphStyle(
+          textAlign: ui.TextAlign.right,
+          textDirection: ui.TextDirection.ltr,
+          fontSize: baseSize,
+          height: paragraphLineHeight,
+        ),
+      )..pushStyle(ui.TextStyle(color: foreground, fontSize: baseSize));
+      markerBuilder.addText(marker);
+      markerBuilder.pop();
+      markerParagraph = markerBuilder.build()
+        ..layout(ui.ParagraphConstraints(width: markerWidth));
+    }
+
     return _PreparedText(
       paragraph: paragraph,
       metrics: metrics,
@@ -285,13 +374,241 @@ class LayoutEngine {
       width: width,
       marginBefore: marginBefore,
       marginAfter: marginAfter,
-      markerLength: marker.length,
+      syntheticPrefixLength: syntheticPrefixLength,
+      marker: marker,
+      markerParagraph: markerParagraph,
+      markerX: contentLeft + marginStart - markerWidth,
+      markerWidth: markerWidth,
       textLength: block.plainText.length,
       source: block.source,
       nodeId: block.nodeId,
       spineIndex: spineIndex,
       sectionTextOffset: sectionTextOffset,
+      links: links,
     );
+  }
+
+  _PreparedTable? _prepareTable(
+    TableBlock table,
+    ReaderStyle style,
+    int spineIndex,
+    double contentWidth,
+    double sectionTextOffset,
+  ) {
+    if (table.rows.isEmpty) return null;
+    final rowCount = table.rows.length;
+    final occupied = List.generate(rowCount, (_) => <bool>[]);
+    final grid = <_GridTableCell>[];
+    var columnCount = 0;
+
+    for (var rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+      var column = 0;
+      for (final cell in table.rows[rowIndex].cells) {
+        while (column < occupied[rowIndex].length &&
+            occupied[rowIndex][column]) {
+          column++;
+        }
+        final columnSpan = cell.columnSpan.clamp(1, 64);
+        final rowSpan = cell.rowSpan.clamp(1, rowCount - rowIndex);
+        final endColumn = column + columnSpan;
+        for (var row = rowIndex; row < rowIndex + rowSpan; row++) {
+          while (occupied[row].length < endColumn) {
+            occupied[row].add(false);
+          }
+          occupied[row].fillRange(column, endColumn, true);
+        }
+        grid.add(
+          _GridTableCell(
+            row: rowIndex,
+            rowSpan: rowSpan,
+            column: column,
+            columnSpan: columnSpan,
+            cell: cell,
+          ),
+        );
+        column = endColumn;
+        columnCount = math.max(columnCount, endColumn);
+      }
+    }
+    if (columnCount == 0) return null;
+
+    final unified = style.typesettingMode == TypesettingMode.unified;
+    final fontScale = unified ? 0.9 : 1.0;
+    final lineHeight = unified ? 1.45 : 1.3;
+    final padding = unified ? style.baseFontSize * 0.35 : 6.0;
+    final columnWidths = _tableColumnWidths(
+      grid,
+      columnCount,
+      contentWidth,
+      unified,
+    );
+    final minimumRowHeight =
+        style.baseFontSize * fontScale * lineHeight + padding * 2;
+    final rowHeights = List.filled(rowCount, minimumRowHeight);
+    final cells = <_PreparedTableCell>[];
+    var cellTextOffset = sectionTextOffset;
+
+    for (final gridCell in grid) {
+      final cellWidth = columnWidths
+          .skip(gridCell.column)
+          .take(gridCell.columnSpan)
+          .fold(0.0, (sum, width) => sum + width);
+      final paragraph = _buildTableCellParagraph(
+        gridCell.cell,
+        style,
+        math.max(1, cellWidth - padding * 2),
+        fontScale,
+        lineHeight,
+      );
+      final requiredHeight = paragraph.height + padding * 2;
+      if (gridCell.rowSpan == 1) {
+        rowHeights[gridCell.row] = math.max(
+          rowHeights[gridCell.row],
+          requiredHeight,
+        );
+      }
+      cells.add(
+        _PreparedTableCell(
+          grid: gridCell,
+          paragraph: paragraph,
+          links: _linkRangesForInlines(gridCell.cell.inlines),
+          requiredHeight: requiredHeight,
+          sectionTextOffset: cellTextOffset,
+        ),
+      );
+      cellTextOffset += gridCell.cell.plainText.length;
+    }
+
+    for (final prepared in cells.where((cell) => cell.grid.rowSpan > 1)) {
+      final gridCell = prepared.grid;
+      final current = rowHeights
+          .skip(gridCell.row)
+          .take(gridCell.rowSpan)
+          .fold(0.0, (sum, height) => sum + height);
+      if (prepared.requiredHeight <= current) continue;
+      final extra = (prepared.requiredHeight - current) / gridCell.rowSpan;
+      for (
+        var row = gridCell.row;
+        row < gridCell.row + gridCell.rowSpan;
+        row++
+      ) {
+        rowHeights[row] += extra;
+      }
+    }
+
+    final normalizedGap = style.baseFontSize * 0.7;
+    return _PreparedTable(
+      columnWidths: columnWidths,
+      rowHeights: rowHeights,
+      cells: cells,
+      padding: padding,
+      marginBefore: unified
+          ? normalizedGap
+          : math.max(table.style.marginBefore, normalizedGap),
+      marginAfter: unified
+          ? normalizedGap
+          : math.max(table.style.marginAfter, normalizedGap),
+      spineIndex: spineIndex,
+    );
+  }
+
+  List<double> _tableColumnWidths(
+    List<_GridTableCell> cells,
+    int columnCount,
+    double contentWidth,
+    bool adaptive,
+  ) {
+    if (!adaptive) {
+      return List.filled(columnCount, contentWidth / columnCount);
+    }
+    final weights = List.filled(columnCount, 1.0);
+    for (final entry in cells.where((cell) => cell.columnSpan == 1)) {
+      final length = entry.cell.plainText.runes.length.clamp(1, 120);
+      weights[entry.column] = math.max(
+        weights[entry.column],
+        math.sqrt(length / 8).clamp(1.0, 3.0),
+      );
+    }
+    final total = weights.fold(0.0, (sum, weight) => sum + weight);
+    return [for (final weight in weights) contentWidth * weight / total];
+  }
+
+  ui.Paragraph _buildTableCellParagraph(
+    TableCell cell,
+    ReaderStyle style,
+    double width,
+    double fontScale,
+    double lineHeight,
+  ) {
+    final unified = style.typesettingMode == TypesettingMode.unified;
+    final foreground = ui.Color(style.foreground);
+    final alignment = cell.authoredAlignment ?? BlockAlign.center;
+    final builder = ui.ParagraphBuilder(
+      ui.ParagraphStyle(
+        textAlign: switch (alignment) {
+          BlockAlign.start => ui.TextAlign.left,
+          BlockAlign.center => ui.TextAlign.center,
+          BlockAlign.end => ui.TextAlign.right,
+          BlockAlign.justify => ui.TextAlign.justify,
+        },
+        textDirection: ui.TextDirection.ltr,
+        fontSize: style.baseFontSize * fontScale,
+        height: unified ? lineHeight : lineHeight * cell.style.lineHeight,
+      ),
+    );
+    for (final inline in cell.inlines) {
+      switch (inline) {
+        case TextRun(:final text, style: final runStyle, :final link):
+          if (text.isEmpty) continue;
+          var scale = unified ? fontScale : fontScale * runStyle.sizeScale;
+          if (runStyle.baseline != TextBaselineShift.none) scale *= 0.7;
+          builder.pushStyle(
+            ui.TextStyle(
+              color: !unified && runStyle.color != null
+                  ? ui.Color(runStyle.color!)
+                  : foreground,
+              fontWeight: cell.header || runStyle.bold
+                  ? ui.FontWeight.bold
+                  : null,
+              fontStyle: runStyle.italic ? ui.FontStyle.italic : null,
+              decoration: link != null
+                  ? ui.TextDecoration.underline
+                  : _decorationFor(runStyle, includeUnderline: !unified),
+              fontSize: style.baseFontSize * scale,
+            ),
+          );
+          builder.addText(text);
+          builder.pop();
+        case BreakInline():
+          builder.addText('\n');
+      }
+    }
+    return builder.build()..layout(ui.ParagraphConstraints(width: width));
+  }
+
+  static List<TextLinkRange> _linkRangesForInlines(List<Inline> inlines) {
+    final links = <TextLinkRange>[];
+    var offset = 0;
+    for (final inline in inlines) {
+      switch (inline) {
+        case TextRun(:final text, :final style, :final link):
+          if (link != null && text.isNotEmpty) {
+            links.add(
+              TextLinkRange(
+                start: offset,
+                end: offset + text.length,
+                href: link,
+                marker: text.trim(),
+                role: style.linkRole,
+              ),
+            );
+          }
+          offset += text.length;
+        case BreakInline():
+          offset++;
+      }
+    }
+    return links;
   }
 
   void _pushImage(
@@ -344,14 +661,88 @@ class LayoutEngine {
     paginator.pushImage(block.href, width, height, gap: em * 0.5);
   }
 
-  static ui.TextDecoration? _decorationFor(TextStyle style) {
+  static double _unifiedHeadingScale(int level) {
+    const emphasis = 0.6;
+    final factor = switch (level.clamp(1, 6)) {
+      1 => 1.0,
+      2 => 0.72,
+      3 => 0.45,
+      4 => 0.25,
+      5 => 0.12,
+      _ => 0.05,
+    };
+    return 1 + emphasis * factor;
+  }
+
+  static String _bulletForDepth(int depth) => switch (depth % 3) {
+    0 => '•',
+    1 => '◦',
+    _ => '▪',
+  };
+
+  static ui.TextDecoration? _decorationFor(
+    TextStyle style, {
+    bool includeUnderline = true,
+  }) {
     final decorations = <ui.TextDecoration>[
-      if (style.underline) ui.TextDecoration.underline,
+      if (includeUnderline && style.underline) ui.TextDecoration.underline,
       if (style.strikethrough) ui.TextDecoration.lineThrough,
     ];
     if (decorations.isEmpty) return null;
     return ui.TextDecoration.combine(decorations);
   }
+}
+
+class _GridTableCell {
+  final int row;
+  final int rowSpan;
+  final int column;
+  final int columnSpan;
+  final TableCell cell;
+
+  const _GridTableCell({
+    required this.row,
+    required this.rowSpan,
+    required this.column,
+    required this.columnSpan,
+    required this.cell,
+  });
+}
+
+class _PreparedTableCell {
+  final _GridTableCell grid;
+  final ui.Paragraph paragraph;
+  final List<TextLinkRange> links;
+  final double requiredHeight;
+  final double sectionTextOffset;
+
+  const _PreparedTableCell({
+    required this.grid,
+    required this.paragraph,
+    required this.links,
+    required this.requiredHeight,
+    required this.sectionTextOffset,
+  });
+}
+
+class _PreparedTable {
+  final List<double> columnWidths;
+  final List<double> rowHeights;
+  final List<_PreparedTableCell> cells;
+  final double padding;
+  final double marginBefore;
+  final double marginAfter;
+  final int spineIndex;
+
+  const _PreparedTable({
+    required this.columnWidths,
+    required this.rowHeights,
+    required this.cells,
+    required this.padding,
+    required this.marginBefore,
+    required this.marginAfter,
+    required this.spineIndex,
+  });
 }
 
 /// A shaped paragraph plus the metadata the paginator needs to slice it.
@@ -366,14 +757,18 @@ class _PreparedText {
   final double marginBefore;
   final double marginAfter;
 
-  /// UTF-16 length of the synthetic prefix (list marker) not present in the
-  /// block's plainText.
-  final int markerLength;
+  /// UTF-16 length contributed by a first-line indent placeholder.
+  final int syntheticPrefixLength;
+  final String marker;
+  final ui.Paragraph? markerParagraph;
+  final double markerX;
+  final double markerWidth;
   final int textLength;
   final SourceRange? source;
   final String nodeId;
   final int spineIndex;
   final double sectionTextOffset;
+  final List<TextLinkRange> links;
 
   const _PreparedText({
     required this.paragraph,
@@ -383,12 +778,17 @@ class _PreparedText {
     required this.width,
     required this.marginBefore,
     required this.marginAfter,
-    required this.markerLength,
+    required this.syntheticPrefixLength,
+    required this.marker,
+    required this.markerParagraph,
+    required this.markerX,
+    required this.markerWidth,
     required this.textLength,
     required this.source,
     required this.nodeId,
     required this.spineIndex,
     required this.sectionTextOffset,
+    required this.links,
   });
 }
 
@@ -448,6 +848,19 @@ class _Paginator {
       if (lineEnd == lineStart) continue; // page was advanced; retry
 
       final sliceTop = tops[lineStart];
+      final marker = prepared.markerParagraph;
+      if (lineStart == 0 && marker != null) {
+        items.add(
+          ListMarkerPlacement(
+            marker: prepared.marker,
+            paragraph: marker,
+            x: prepared.markerX,
+            y: cursorY,
+            width: prepared.markerWidth,
+            height: marker.height,
+          ),
+        );
+      }
       items.add(
         TextPlacement(
           paragraph: prepared.paragraph,
@@ -466,6 +879,7 @@ class _Paginator {
           sliceTop: sliceTop,
           sliceHeight: sliceBottom - sliceTop,
           sectionTextOffset: prepared.sectionTextOffset,
+          links: prepared.links,
         ),
       );
       hasContent = true;
@@ -474,6 +888,74 @@ class _Paginator {
       if (lineStart < metrics.length) advance();
     }
     _setMarginAfter(prepared.marginAfter);
+  }
+
+  void pushTable(_PreparedTable table) {
+    _collapseMargin(table.marginBefore);
+    var row = 0;
+    while (row < table.rowHeights.length) {
+      var groupEnd = row + 1;
+      var expanded = true;
+      while (expanded) {
+        expanded = false;
+        for (final cell in table.cells) {
+          final start = cell.grid.row;
+          if (start < row || start >= groupEnd) continue;
+          final end = start + cell.grid.rowSpan;
+          if (end > groupEnd) {
+            groupEnd = end;
+            expanded = true;
+          }
+        }
+      }
+      final groupHeight = table.rowHeights
+          .skip(row)
+          .take(groupEnd - row)
+          .fold(0.0, (sum, height) => sum + height);
+      if (groupHeight > remaining + _eps && hasContent) advance();
+      final groupTop = cursorY;
+
+      for (final prepared in table.cells) {
+        final grid = prepared.grid;
+        if (grid.row < row || grid.row >= groupEnd) continue;
+        final x =
+            left +
+            table.columnWidths
+                .take(grid.column)
+                .fold(0.0, (sum, width) => sum + width);
+        final y =
+            groupTop +
+            table.rowHeights
+                .skip(row)
+                .take(grid.row - row)
+                .fold(0.0, (sum, height) => sum + height);
+        final cellWidth = table.columnWidths
+            .skip(grid.column)
+            .take(grid.columnSpan)
+            .fold(0.0, (sum, width) => sum + width);
+        final cellHeight = table.rowHeights
+            .skip(grid.row)
+            .take(grid.rowSpan)
+            .fold(0.0, (sum, height) => sum + height);
+        items.add(
+          TableCellPlacement(
+            paragraph: prepared.paragraph,
+            rect: ui.Rect.fromLTWH(x, y, cellWidth, cellHeight),
+            padding: table.padding,
+            header: grid.cell.header,
+            source: grid.cell.source,
+            nodeId: grid.cell.nodeId,
+            spineIndex: table.spineIndex,
+            sectionTextOffset: prepared.sectionTextOffset,
+            links: prepared.links,
+          ),
+        );
+      }
+      hasContent = true;
+      cursorY += groupHeight;
+      row = groupEnd;
+    }
+    _setMarginAfter(table.marginAfter);
   }
 
   void pushImage(
@@ -555,7 +1037,7 @@ class _Paginator {
     final position = prepared.paragraph.getPositionForOffset(
       ui.Offset(metric.left + 0.1, prepared.lineTops[line] + metric.height / 2),
     );
-    return (position.offset - prepared.markerLength).clamp(
+    return (position.offset - prepared.syntheticPrefixLength).clamp(
       0,
       prepared.textLength,
     );

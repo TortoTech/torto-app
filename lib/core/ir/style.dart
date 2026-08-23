@@ -8,6 +8,12 @@ library;
 /// Vertical baseline shift for inline text (superscript / subscript).
 enum TextBaselineShift { none, superscript, subscript }
 
+/// Semantic role of a link, matching torto's renderer-independent IR.
+enum LinkRole { normal, footnoteReference, footnoteBacklink }
+
+/// Semantic role carried by inline content independently of links.
+enum InlineRole { normal, footnote }
+
 /// Inline text style. All values are resolved (no relative CSS units left).
 class TextStyle {
   final bool bold;
@@ -22,6 +28,8 @@ class TextStyle {
   final int? color;
 
   final TextBaselineShift baseline;
+  final LinkRole linkRole;
+  final InlineRole inlineRole;
 
   const TextStyle({
     this.bold = false,
@@ -31,6 +39,8 @@ class TextStyle {
     this.sizeScale = 1.0,
     this.color,
     this.baseline = TextBaselineShift.none,
+    this.linkRole = LinkRole.normal,
+    this.inlineRole = InlineRole.normal,
   });
 
   static const TextStyle plain = TextStyle();
@@ -48,6 +58,12 @@ class TextStyle {
       baseline: overlay.baseline != TextBaselineShift.none
           ? overlay.baseline
           : baseline,
+      linkRole: overlay.linkRole != LinkRole.normal
+          ? overlay.linkRole
+          : linkRole,
+      inlineRole: overlay.inlineRole != InlineRole.normal
+          ? overlay.inlineRole
+          : inlineRole,
     );
   }
 
@@ -60,7 +76,9 @@ class TextStyle {
       other.strikethrough == strikethrough &&
       other.sizeScale == sizeScale &&
       other.color == color &&
-      other.baseline == baseline;
+      other.baseline == baseline &&
+      other.linkRole == linkRole &&
+      other.inlineRole == inlineRole;
 
   @override
   int get hashCode => Object.hash(
@@ -71,6 +89,8 @@ class TextStyle {
     sizeScale,
     color,
     baseline,
+    linkRole,
+    inlineRole,
   );
 }
 
