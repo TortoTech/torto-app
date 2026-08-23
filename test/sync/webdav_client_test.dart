@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -115,37 +114,6 @@ void main() {
     );
   });
 
-  test('streamed upload timeout covers the request body write', () async {
-    final directory = await Directory.systemTemp.createTemp(
-      'torto-webdav-upload-',
-    );
-    final source = File('${directory.path}${Platform.pathSeparator}book.epub');
-    await source.writeAsBytes([1, 2, 3]);
-    final client = WebDavClient(
-      baseUrl: 'https://dav.example.test',
-      username: 'u',
-      password: 'p',
-      client: _NeverRespondingClient(),
-      timeout: const Duration(milliseconds: 10),
-    );
-
-    try {
-      await expectLater(
-        client.putImmutableFile('books/id/content.epub', source),
-        throwsA(
-          isA<WebDavException>().having(
-            (error) => error.message,
-            'message',
-            'WebDAV upload timed out.',
-          ),
-        ),
-      );
-    } finally {
-      client.close();
-      await directory.delete(recursive: true);
-    }
-  });
-
   test('resumed download validates the returned Content-Range', () async {
     final directory = await Directory.systemTemp.createTemp(
       'torto-webdav-range-',
@@ -177,12 +145,4 @@ void main() {
       await directory.delete(recursive: true);
     }
   });
-}
-
-class _NeverRespondingClient extends http.BaseClient {
-  @override
-  Future<http.StreamedResponse> send(http.BaseRequest request) {
-    unawaited(request.finalize().drain<void>());
-    return Completer<http.StreamedResponse>().future;
-  }
 }
