@@ -11,6 +11,8 @@
 library;
 
 import 'dart:collection';
+import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
@@ -59,7 +61,10 @@ class EpubBookSource implements BookSource {
   /// Throws [FormatException] when the bytes are not a ZIP archive, when
   /// `META-INF/container.xml` is missing or has no rootfile, or when the
   /// package document cannot be parsed at all.
-  static Future<EpubBookSource> fromBytes(Uint8List bytes) async {
+  static Future<EpubBookSource> fromBytes(
+    Uint8List bytes, {
+    String? publicationIdHint,
+  }) async {
     final Archive archive;
     try {
       archive = ZipDecoder().decodeBytes(bytes);
@@ -96,7 +101,10 @@ class EpubBookSource implements BookSource {
       throw FormatException('EPUB package document is not valid XML: $opfPath');
     }
 
-    final id = sha256.convert(bytes).toString();
+    final hintedId = publicationIdHint?.trim() ?? '';
+    final id = hintedId.isNotEmpty
+        ? hintedId
+        : sha256.convert(bytes).toString();
     final model = _PackageModel.parse(package, opfDir);
     final spine = model.buildSpine();
     final toc = source._parseNavigation(model, spine);
@@ -110,6 +118,32 @@ class EpubBookSource implements BookSource {
       coverHref: cover,
     );
     return source;
+  }
+
+  /// Reads and indexes an EPUB outside the UI isolate. This keeps large books
+  /// with thousands of ZIP entries from stalling page transitions while the
+  /// package manifest is opened.
+  static Future<EpubBookSource> fromFileInBackground(
+    String path, {
+    String? publicationIdHint,
+  }) => Isolate.run(() async {
+    final bytes = await File(path).readAsBytes();
+    return fromBytes(bytes, publicationIdHint: publicationIdHint);
+  });
+
+  /// Opens already-loaded EPUB bytes outside the UI isolate. A transferable
+  /// buffer avoids costly message serialization when crossing isolates.
+  static Future<EpubBookSource> fromBytesInBackground(
+    Uint8List bytes, {
+    String? publicationIdHint,
+  }) {
+    final transferable = TransferableTypedData.fromList([bytes]);
+    return Isolate.run(
+      () => fromBytes(
+        transferable.materialize().asUint8List(),
+        publicationIdHint: publicationIdHint,
+      ),
+    );
   }
 
   /// Reads and decodes an XML resource, tolerating BOMs, DOCTYPE

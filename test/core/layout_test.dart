@@ -167,6 +167,7 @@ void main() {
     expect(placement.rect.width / placement.rect.height, closeTo(2.0, 0.01));
     expect(placement.rect.width, lessThanOrEqualTo(280 + _eps));
     expect(placement.rect.height, lessThanOrEqualTo(480 + _eps));
+    expect(placement.rect.left, closeTo(10, _eps));
     _disposeAll(pages);
   });
 
@@ -213,6 +214,9 @@ void main() {
 
     expect(placement.rect.center.dy, closeTo(contentCenter, _eps));
     expect(placement.rect.top, greaterThan(style.marginTop));
+    expect(placement.rect.left, closeTo(0, _eps));
+    expect(placement.rect.right, closeTo(_viewport.width, _eps));
+    expect(placement.rect.width, closeTo(_viewport.width, _eps));
     _disposeAll(pages);
   });
 

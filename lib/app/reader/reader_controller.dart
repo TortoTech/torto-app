@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/painting.dart';
 
 import '../../core/formats/formats.dart';
 import '../../core/html_ir/package_path.dart';
@@ -105,18 +105,26 @@ class ReaderController extends ChangeNotifier {
   ) async {
     _viewport = viewport;
     _style = style;
-    final bytes = await file.readAsBytes();
-    final source = await openBook(
-      bytes,
-      _baseName(file.path),
-      filePath: file.path,
-      titleHint: titleHint,
-      publicationIdHint: publicationIdHint,
-    );
+    final fileName = _baseName(file.path);
+    final format = BookFormat.fromFileName(fileName);
+    final BookSource source;
+    if (format == BookFormat.epub) {
+      source = await EpubBookSource.fromFileInBackground(
+        file.path,
+        publicationIdHint: publicationIdHint,
+      );
+    } else {
+      final bytes = await file.readAsBytes();
+      source = await openBook(
+        bytes,
+        fileName,
+        filePath: file.path,
+        titleHint: titleHint,
+        publicationIdHint: publicationIdHint,
+      );
+    }
     _source = source;
-    _derivedToc = await DerivedDataStore.fromBooksDirectory(
-      file.parent,
-    ).generatedToc(source.book.id, source.book);
+    _derivedToc = const [];
     title = _book.metadata.title.isEmpty
         ? _fileTitle(file.path)
         : _book.metadata.title;
@@ -158,6 +166,21 @@ class ReaderController extends ChangeNotifier {
       busy = false;
       notifyListeners();
     }
+    // Generated/OCR TOC metadata is optional for the first paint. Load it
+    // after the page is visible so a large metadata file cannot delay opening.
+    unawaited(_loadDerivedToc(source, file.parent));
+  }
+
+  Future<void> _loadDerivedToc(
+    BookSource source,
+    Directory booksDirectory,
+  ) async {
+    final toc = await DerivedDataStore.fromBooksDirectory(
+      booksDirectory,
+    ).generatedToc(source.book.id, source.book);
+    if (!identical(_source, source) || toc.isEmpty) return;
+    _derivedToc = toc;
+    notifyListeners();
   }
 
   /// Applies a presentation change and repaginates around the current
@@ -570,7 +593,7 @@ class ReaderController extends ChangeNotifier {
             final bytes = await source.resource(href);
             _images[href] = bytes == null
                 ? null
-                : await decodeImageFromList(bytes);
+                : await _decodeReaderImage(bytes);
           }
         } catch (_) {
           _images[href] = null; // missing or undecodable: render without it
@@ -583,6 +606,32 @@ class ReaderController extends ChangeNotifier {
     final image = _images[href];
     if (image == null) return null;
     return ui.Size(image.width.toDouble(), image.height.toDouble());
+  }
+
+  static Future<ui.Image> _decodeReaderImage(Uint8List bytes) async {
+    const maxDimension = 2048;
+    final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+    try {
+      final codec = await ui.instantiateImageCodecWithSize(
+        buffer,
+        getTargetSize: (width, height) {
+          final longest = math.max(width, height);
+          if (longest <= maxDimension) return const ui.TargetImageSize();
+          final scale = maxDimension / longest;
+          return ui.TargetImageSize(
+            width: math.max(1, (width * scale).round()),
+            height: math.max(1, (height * scale).round()),
+          );
+        },
+      );
+      try {
+        return (await codec.getNextFrame()).image;
+      } finally {
+        codec.dispose();
+      }
+    } finally {
+      buffer.dispose();
+    }
   }
 
   /// Disposes and drops paginated sections outside [sectionIndex] ± 1.

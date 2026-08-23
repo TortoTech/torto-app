@@ -33,7 +33,10 @@ Future<BookSource> openBook(
     throw FormatException('暂不支持 ${format.label} 格式');
   }
   return switch (format) {
-    BookFormat.epub => await EpubBookSource.fromBytes(bytes),
+    BookFormat.epub => await EpubBookSource.fromBytesInBackground(
+      bytes,
+      publicationIdHint: publicationIdHint,
+    ),
     BookFormat.fb2 || BookFormat.fbz => await openFb2(bytes, fileName),
     BookFormat.cbz => await openCbz(bytes, fileName),
     BookFormat.mobi ||

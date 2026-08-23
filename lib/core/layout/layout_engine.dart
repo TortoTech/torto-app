@@ -100,6 +100,7 @@ class LayoutEngine {
             imageSizeResolver,
             contentWidth,
             contentHeight,
+            viewport.width,
           );
         case SeparatorBlock():
           paginator.pushSeparator(vMargin: style.baseFontSize * 0.75);
@@ -690,9 +691,11 @@ class LayoutEngine {
     ui.Size? Function(String href)? imageSizeResolver,
     double contentWidth,
     double contentHeight,
+    double viewportWidth,
   ) {
     final em = style.baseFontSize;
     final intrinsic = imageSizeResolver?.call(block.href);
+    final availableWidth = block.fixedPage ? viewportWidth : contentWidth;
     double width;
     double height;
     if (intrinsic == null || intrinsic.width <= 0 || intrinsic.height <= 0) {
@@ -701,6 +704,22 @@ class LayoutEngine {
     } else {
       final imageStyle = block.style;
       final aspect = intrinsic.width / intrinsic.height;
+      if (block.fixedPage) {
+        // PDF pages use fit-width presentation: span the complete viewport,
+        // preserve page geometry, and allow the viewport to clip unusually
+        // tall pages instead of reintroducing horizontal reading margins.
+        width = availableWidth;
+        height = width / aspect;
+        paginator.pushImage(
+          block.href,
+          width,
+          height,
+          gap: 0,
+          centerVertically: true,
+          fillViewportWidth: true,
+        );
+        return;
+      }
       var requestedHeight = imageStyle.height?.resolve(contentHeight);
       final requestedWidth = math.max(
         1.0,
@@ -736,6 +755,7 @@ class LayoutEngine {
       height,
       gap: block.fixedPage ? 0 : em * 0.5,
       centerVertically: block.fixedPage,
+      fillViewportWidth: block.fixedPage,
     );
   }
 
@@ -1049,10 +1069,11 @@ class _Paginator {
     double height, {
     required double gap,
     bool centerVertically = false,
+    bool fillViewportWidth = false,
   }) {
     _collapseMargin(gap);
     if (height > remaining + _eps && hasContent) advance();
-    final x = left + (this.width - width) / 2;
+    final x = fillViewportWidth ? 0.0 : left + (this.width - width) / 2;
     final y = centerVertically && !hasContent
         ? top + math.max(0, (bottom - top - height) / 2)
         : cursorY;

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
@@ -64,22 +65,22 @@ const _ncx = '''<?xml version="1.0"?>
 
 final _coverBytes = Uint8List.fromList([0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4]);
 
-Uint8List _buildEpub({
-  bool includeNav = true,
-  bool includeContainer = true,
-}) {
+Uint8List _buildEpub({bool includeNav = true, bool includeContainer = true}) {
   final archive = Archive();
   void add(String name, String content) =>
       archive.addFile(ArchiveFile.string(name, content));
-  archive.addFile(ArchiveFile.noCompress('mimetype', 20,
-      utf8.encode('application/epub+zip')));
+  archive.addFile(
+    ArchiveFile.noCompress('mimetype', 20, utf8.encode('application/epub+zip')),
+  );
   if (includeContainer) add('META-INF/container.xml', _container);
   add('OPS/content.opf', _opf);
   add('OPS/text/ch1.xhtml', _ch1);
   add('OPS/text/ch 2.xhtml', _ch2); // decoded name; OPF references ch%202.xhtml
   if (includeNav) add('OPS/nav.xhtml', _nav);
   add('OPS/toc.ncx', _ncx);
-  archive.addFile(ArchiveFile('OPS/images/cover.png', _coverBytes.length, _coverBytes));
+  archive.addFile(
+    ArchiveFile('OPS/images/cover.png', _coverBytes.length, _coverBytes),
+  );
   return ZipEncoder().encodeBytes(archive);
 }
 
@@ -106,11 +107,35 @@ void main() {
     expect(book.coverHref, 'OPS/images/cover.png');
   });
 
+  test('uses an already-known synced publication id', () async {
+    final source = await EpubBookSource.fromBytes(
+      _buildEpub(),
+      publicationIdHint: 'synced-book-id',
+    );
+
+    expect(source.book.id, 'synced-book-id');
+  });
+
+  test('background file opening returns a usable source', () async {
+    final directory = await Directory.systemTemp.createTemp('torto-epub-open-');
+    addTearDown(() => directory.delete(recursive: true));
+    final file = File('${directory.path}${Platform.pathSeparator}book.epub');
+    await file.writeAsBytes(_buildEpub());
+
+    final source = await EpubBookSource.fromFileInBackground(
+      file.path,
+      publicationIdHint: 'background-book-id',
+    );
+
+    expect(source.book.id, 'background-book-id');
+    expect((await source.parseSection(0)).blocks, isNotEmpty);
+  });
+
   test('cover-image property wins over meta cover', () async {
     final opf = _opf.replaceAll(
       '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
       '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>'
-      '<item id="c2" href="images/cover2.png" media-type="image/png" properties="cover-image"/>',
+          '<item id="c2" href="images/cover2.png" media-type="image/png" properties="cover-image"/>',
     );
     final archive = Archive();
     archive.addFile(ArchiveFile.string('META-INF/container.xml', _container));
@@ -137,8 +162,9 @@ void main() {
   });
 
   test('NCX fallback when there is no nav document', () async {
-    final source =
-        await EpubBookSource.fromBytes(_buildEpub(includeNav: false));
+    final source = await EpubBookSource.fromBytes(
+      _buildEpub(includeNav: false),
+    );
     final toc = source.book.toc;
     expect(toc, hasLength(2));
     expect(toc[0].label, 'NCX Chapter 1');
@@ -172,14 +198,16 @@ void main() {
     expect(missing.blocks, isEmpty);
   });
 
-  test('resource returns bytes by root-relative href, null when absent',
-      () async {
-    final source = await EpubBookSource.fromBytes(_buildEpub());
-    expect(await source.resource('OPS/images/cover.png'), _coverBytes);
-    // Percent-encoded lookup form resolves to the same entry.
-    expect(await source.resource('OPS/text/ch%202.xhtml'), isNotNull);
-    expect(await source.resource('OPS/images/nope.png'), isNull);
-  });
+  test(
+    'resource returns bytes by root-relative href, null when absent',
+    () async {
+      final source = await EpubBookSource.fromBytes(_buildEpub());
+      expect(await source.resource('OPS/images/cover.png'), _coverBytes);
+      // Percent-encoded lookup form resolves to the same entry.
+      expect(await source.resource('OPS/text/ch%202.xhtml'), isNotNull);
+      expect(await source.resource('OPS/images/nope.png'), isNull);
+    },
+  );
 
   test('missing container.xml throws a FormatException', () async {
     expect(
