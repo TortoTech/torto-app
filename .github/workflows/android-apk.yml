@@ -1,0 +1,156 @@
+name: Build Android APKs
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-android-apks:
+    name: Build Android APKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Validate tag and package version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(sed -nE 's/^version:[[:space:]]*([^[:space:]#]+).*$/\1/p' pubspec.yaml | head -n 1)"
+          release_version="${package_version%%+*}"
+
+          if [[ -z "$package_version" || -z "$release_version" ]]; then
+            echo "Could not read the package version from pubspec.yaml." >&2
+            exit 1
+          fi
+
+          if [[ "$tag_version" != "$release_version" ]]; then
+            echo "Tag '$GITHUB_REF_NAME' does not match Torto version '$release_version'. Use tag 'v$release_version'." >&2
+            exit 1
+          fi
+
+          echo "TORTO_VERSION=$release_version" >> "$GITHUB_ENV"
+          echo "version=$release_version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: |
+            android/*.gradle*
+            android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.0"
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Run analyzer
+        run: flutter analyze
+
+      - name: Run tests
+        run: flutter test
+
+      - name: Configure release signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          for secret_name in \
+            ANDROID_KEYSTORE_BASE64 \
+            ANDROID_KEY_ALIAS \
+            ANDROID_KEY_PASSWORD \
+            ANDROID_STORE_PASSWORD
+          do
+            if [[ -z "${!secret_name:-}" ]]; then
+              echo "Required repository secret '$secret_name' is not configured." >&2
+              exit 1
+            fi
+          done
+
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/upload-keystore.jks
+          printf '%s\n' \
+            "storePassword=$ANDROID_STORE_PASSWORD" \
+            "keyPassword=$ANDROID_KEY_PASSWORD" \
+            "keyAlias=$ANDROID_KEY_ALIAS" \
+            "storeFile=upload-keystore.jks" \
+            > android/key.properties
+
+          keytool -list \
+            -keystore android/app/upload-keystore.jks \
+            -storepass "$ANDROID_STORE_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" \
+            > /dev/null
+
+      - name: Build release APKs
+        run: flutter build apk --release --split-per-abi
+
+      - name: Remove signing material
+        if: always()
+        shell: bash
+        run: rm -f android/key.properties android/app/upload-keystore.jks
+
+      - name: Package release APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          install -m 0644 \
+            build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk \
+            "dist/Torto-$TORTO_VERSION-android-armeabi-v7a.apk"
+          install -m 0644 \
+            build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+            "dist/Torto-$TORTO_VERSION-android-arm64-v8a.apk"
+          install -m 0644 \
+            build/app/outputs/flutter-apk/app-x86_64-release.apk \
+            "dist/Torto-$TORTO_VERSION-android-x86_64.apk"
+
+          (
+            cd dist
+            sha256sum ./*.apk > "Torto-$TORTO_VERSION-android.sha256"
+          )
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Torto-${{ steps.version.outputs.version }}-android-apks
+          path: |
+            dist/*.apk
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.apk
+            dist/*.sha256
+          fail_on_unmatched_files: true
+          # Release notes are created once by the publishing flow. Asset jobs
+          # must not append a second generated changelog to an existing release.

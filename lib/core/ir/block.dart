@@ -85,7 +85,14 @@ class BreakInline extends Inline {
   const BreakInline();
 }
 
-enum TextBlockKind { paragraph, heading, blockquote, preformatted, listItem }
+enum TextBlockKind {
+  paragraph,
+  heading,
+  blockquote,
+  preformatted,
+  caption,
+  listItem,
+}
 
 /// Top-level content blocks of a section. Mirrors torto's `enum Block`.
 sealed class Block {
@@ -221,6 +228,28 @@ class ImageBlock extends Block {
     this.source,
     this.fixedPage = false,
   });
+}
+
+enum CaptionPosition { before, after }
+
+/// One or more authored images kept together with their semantic caption.
+class FigureBlock extends Block {
+  final List<ImageBlock> images;
+  final List<TextBlock> captions;
+  final CaptionPosition captionPosition;
+  final BlockStyle style;
+  final SourceRange? source;
+
+  const FigureBlock({
+    required this.images,
+    this.captions = const [],
+    this.captionPosition = CaptionPosition.after,
+    this.style = BlockStyle.normal,
+    this.source,
+  });
+
+  int get textLength =>
+      captions.fold(0, (total, caption) => total + caption.plainText.length);
 }
 
 /// Horizontal rule (<hr>).

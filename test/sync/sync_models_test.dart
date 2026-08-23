@@ -3,6 +3,12 @@ import 'package:torto/app/sync/sync_models.dart';
 import 'package:torto/core/ir/ir.dart';
 
 void main() {
+  test('InfiniCloud preset uses the configured account WebDAV node', () {
+    const settings = CloudSettings(provider: CloudProvider.infiniCloud);
+
+    expect(settings.effectiveBaseUrl, 'https://higa.teracloud.jp/dav');
+  });
+
   test('cloud locator deliberately omits incompatible source anchors', () {
     const anchor = SourceAnchor(spine: 2, node: 'n4', textOffset: 7);
     const locator = LocatorV1(

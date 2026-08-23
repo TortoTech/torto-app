@@ -175,12 +175,46 @@ void main() {
       expect(textBlock(section, 2).plainText, 'nested');
     });
 
-    test('figcaption becomes a paragraph', () {
+    test(
+      'figure keeps its image and trailing caption as one semantic block',
+      () {
+        final section = parseSection(
+          '<figure><img src="i.png" alt="diagram"/>'
+          '<figcaption><p>A <b>caption</b></p></figcaption></figure>',
+        );
+        final figure = section.blocks.single as FigureBlock;
+
+        expect(figure.images, hasLength(1));
+        expect(figure.images.single.href, 'OPS/text/i.png');
+        expect(figure.images.single.alt, 'diagram');
+        expect(figure.captionPosition, CaptionPosition.after);
+        expect(figure.captions, hasLength(1));
+        expect(figure.captions.single.kind, TextBlockKind.caption);
+        expect(figure.captions.single.plainText, 'A caption');
+        expect(
+          figure.captions.single.inlines.whereType<TextRun>().last.style.bold,
+          isTrue,
+        );
+        expect(figure.images.single.source, same(figure.source));
+      },
+    );
+
+    test('figure detects a caption placed before its image', () {
       final section = parseSection(
-        '<figure><img src="i.png"/><figcaption>caption</figcaption></figure>',
+        '<figure><figcaption>Before</figcaption><img src="i.png"/></figure>',
       );
-      expect(section.blocks[0], isA<ImageBlock>());
-      expect(textBlock(section, 1).plainText, 'caption');
+      final figure = section.blocks.single as FigureBlock;
+
+      expect(figure.captionPosition, CaptionPosition.before);
+      expect(figure.captions.single.plainText, 'Before');
+    });
+
+    test('captionless figure remains a semantic figure', () {
+      final section = parseSection('<figure><img src="i.png"/></figure>');
+      final figure = section.blocks.single as FigureBlock;
+
+      expect(figure.images, hasLength(1));
+      expect(figure.captions, isEmpty);
     });
 
     test('tables preserve grid cells, headers, spans, and alignment', () {

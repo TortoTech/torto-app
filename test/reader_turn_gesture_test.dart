@@ -239,6 +239,10 @@ void main() {
     expect(tester.getCenter(back).dy, lessThan(100));
     expect(tester.getCenter(contents).dy, greaterThan(800));
     expect(tester.getCenter(contents).dx, lessThan(100));
+    expect(tester.getSize(contents), const Size(64, 56));
+    expect(tester.getSize(style), const Size(64, 56));
+    expect(tester.widget<IconButton>(contents).iconSize, 32);
+    expect(tester.widget<IconButton>(style).iconSize, 32);
 
     await tester.tap(style);
     await tester.pumpAndSettle();

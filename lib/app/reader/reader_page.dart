@@ -553,12 +553,22 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
             children: [
               IconButton(
                 key: const Key('reader-toc-button'),
+                iconSize: 32,
+                constraints: const BoxConstraints.tightFor(
+                  width: 64,
+                  height: 56,
+                ),
                 icon: const Icon(Icons.format_list_bulleted),
                 tooltip: '目录',
                 onPressed: () => _scaffoldKey.currentState?.openDrawer(),
               ),
               IconButton(
                 key: const Key('reader-style-button'),
+                iconSize: 32,
+                constraints: const BoxConstraints.tightFor(
+                  width: 64,
+                  height: 56,
+                ),
                 icon: const Icon(Icons.text_format),
                 tooltip: '版式',
                 onPressed: _showTypesettingSheet,

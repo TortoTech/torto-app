@@ -457,6 +457,8 @@ class _SectionParser {
         blocks.add(const SeparatorBlock());
       case 'table':
         _parseTable(element);
+      case 'figure':
+        _parseFigure(element, listDepth);
       case 'figcaption':
         _pushTextBlock(
           element,
@@ -501,7 +503,9 @@ class _SectionParser {
 
   static SourceRange? _firstBlockSource(Block block) {
     switch (block) {
-      case TextBlock(:final source) || ImageBlock(:final source):
+      case TextBlock(:final source) ||
+          ImageBlock(:final source) ||
+          FigureBlock(:final source):
         return source;
       case TableBlock(:final rows):
         for (final row in rows) {
@@ -855,17 +859,125 @@ class _SectionParser {
     );
   }
 
-  void _pushImage(XmlElement element) {
-    final src = _attr(element, 'src') ?? _attr(element, 'href');
-    if (src == null || src.trim().isEmpty) return;
-    final nodeId = _allocateNode();
-    blocks.add(
-      ImageBlock(
-        href: resolvePackageHref(baseDir, src),
-        alt: _attr(element, 'alt') ?? '',
-        style: _imageStyleFor(element),
-        source: _sourceFor(nodeId, 0),
+  void _parseFigure(XmlElement figure, int listDepth) {
+    final captionNodes = figure.descendants
+        .whereType<XmlElement>()
+        .where(
+          (node) =>
+              _name(node) == 'figcaption' &&
+              !_hasNamedAncestor(node, figure, 'figure'),
+        )
+        .toList();
+    final imageNodes = figure.descendants
+        .whereType<XmlElement>()
+        .where(
+          (node) =>
+              (_name(node) == 'img' || _name(node) == 'image') &&
+              !_hasNamedAncestor(node, figure, 'figure') &&
+              !_hasNamedAncestor(node, figure, 'figcaption'),
+        )
+        .toList();
+    final unsupportedCaption = captionNodes.any(
+      (caption) => caption.descendants.whereType<XmlElement>().any(
+        (node) =>
+            const {'figure', 'img', 'image', 'table'}.contains(_name(node)),
       ),
+    );
+    if (imageNodes.isEmpty || unsupportedCaption) {
+      _parseContainer(figure, listDepth);
+      return;
+    }
+
+    final figureNodeId = _allocateNode();
+    final figureSource = _sourceFor(figureNodeId, 0);
+    var captionPosition = CaptionPosition.after;
+    for (final node in figure.descendants.whereType<XmlElement>()) {
+      if (_hasNamedAncestor(node, figure, 'figure')) continue;
+      final name = _name(node);
+      if (name == 'figcaption') {
+        captionPosition = CaptionPosition.before;
+        break;
+      }
+      if ((name == 'img' || name == 'image') &&
+          !_hasNamedAncestor(node, figure, 'figcaption')) {
+        captionPosition = CaptionPosition.after;
+        break;
+      }
+    }
+
+    final images = <ImageBlock>[];
+    for (final element in imageNodes) {
+      final image = _imageBlockFor(
+        element,
+        source: images.isEmpty ? figureSource : null,
+      );
+      if (image == null) continue;
+      images.add(image);
+      if (image.source != null) {
+        _elementSources[element] = image.source!.start;
+      }
+    }
+    if (images.isEmpty) return;
+
+    final captions = <TextBlock>[];
+    for (final caption in captionNodes) {
+      final blockStart = blocks.length;
+      _parseContainer(caption, listDepth);
+      final parsed = blocks.sublist(blockStart);
+      blocks.removeRange(blockStart, blocks.length);
+      final captionStart = captions.length;
+      for (final block in parsed) {
+        if (block is! TextBlock) continue;
+        captions.add(
+          TextBlock(
+            kind: TextBlockKind.caption,
+            inlines: block.inlines,
+            style: block.style,
+            source: block.source,
+            nodeId: block.nodeId,
+          ),
+        );
+      }
+      if (captions.length > captionStart &&
+          captions[captionStart].source != null) {
+        _elementSources[caption] = captions[captionStart].source!.start;
+      }
+    }
+
+    blocks.add(
+      FigureBlock(
+        images: images,
+        captions: captions,
+        captionPosition: captionPosition,
+        style: _blockStyleFor(figure),
+        source: figureSource,
+      ),
+    );
+  }
+
+  static bool _hasNamedAncestor(XmlElement node, XmlElement root, String name) {
+    var current = node.parentElement;
+    while (current != null && !identical(current, root)) {
+      if (_name(current) == name) return true;
+      current = current.parentElement;
+    }
+    return false;
+  }
+
+  void _pushImage(XmlElement element) {
+    final image = _imageBlockFor(element);
+    if (image != null) blocks.add(image);
+  }
+
+  ImageBlock? _imageBlockFor(XmlElement element, {SourceRange? source}) {
+    final src = _attr(element, 'src') ?? _attr(element, 'href');
+    if (src == null || src.trim().isEmpty) return null;
+    final imageSource = source ?? _sourceFor(_allocateNode(), 0);
+    return ImageBlock(
+      href: resolvePackageHref(baseDir, src),
+      alt: _attr(element, 'alt') ?? '',
+      style: _imageStyleFor(element),
+      source: imageSource,
     );
   }
 

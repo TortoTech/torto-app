@@ -50,6 +50,15 @@ TextBlock _para(
 String _lorem(int repetitions) =>
     'Lorem ipsum dolor sit amet, consectetur adipiscing elit. ' * repetitions;
 
+FigureBlock _figure({
+  String caption = 'A figure caption',
+  CaptionPosition captionPosition = CaptionPosition.after,
+}) => FigureBlock(
+  images: const [ImageBlock(href: 'img/figure.png')],
+  captions: [_para(caption, kind: TextBlockKind.caption, nodeId: 'caption')],
+  captionPosition: captionPosition,
+);
+
 double _itemTop(PageItem item) => switch (item) {
   TextPlacement(:final y) => y,
   ListMarkerPlacement(:final y) => y,
@@ -203,6 +212,75 @@ void main() {
     final placement = pages.single.items.single as ImagePlacement;
     expect(placement.rect.width, closeTo(style.baseFontSize, _eps));
     expect(placement.rect.height, closeTo(style.baseFontSize, _eps));
+    _disposeAll(pages);
+  });
+
+  test('unified figure uses desktop caption scale, gap, and centering', () {
+    final style = _style();
+    final pages = engine.paginate(
+      _section([_figure(caption: 'Short caption')]),
+      _viewport,
+      style,
+      imageSizeResolver: (_) => const ui.Size(100, 80),
+    );
+    final image = pages.single.items.whereType<ImagePlacement>().single;
+    final caption = pages.single.items.whereType<TextPlacement>().single;
+    final firstBox = caption.paragraph.getBoxesForRange(0, 1).single;
+
+    expect(
+      caption.y - image.rect.bottom,
+      closeTo(style.baseFontSize * 0.35, _eps),
+    );
+    expect(caption.lineMetrics.single.height, closeTo(10 * 0.88 * 1.4, 1));
+    expect(firstBox.left, greaterThan(0));
+    _disposeAll(pages);
+  });
+
+  test('unified multi-line figure caption is start-aligned', () {
+    final pages = engine.paginate(
+      _section([_figure(caption: _lorem(8))]),
+      _viewport,
+      _style(),
+      imageSizeResolver: (_) => const ui.Size(100, 80),
+    );
+    final caption = pages
+        .expand((page) => page.items)
+        .whereType<TextPlacement>()
+        .first;
+    final firstBox = caption.paragraph.getBoxesForRange(0, 1).single;
+
+    expect(caption.lineMetrics.length, greaterThan(1));
+    expect(firstBox.left, closeTo(0, _eps));
+    _disposeAll(pages);
+  });
+
+  test('figure caption can precede its image', () {
+    final pages = engine.paginate(
+      _section([_figure(captionPosition: CaptionPosition.before)]),
+      _viewport,
+      _style(),
+      imageSizeResolver: (_) => const ui.Size(100, 80),
+    );
+
+    expect(pages.single.items, hasLength(2));
+    expect(pages.single.items.first, isA<TextPlacement>());
+    expect(pages.single.items.last, isA<ImagePlacement>());
+    _disposeAll(pages);
+  });
+
+  test('image and caption move together when the group fits a fresh page', () {
+    const shortViewport = LayoutViewport(width: 300, height: 180);
+    final pages = engine.paginate(
+      _section([_para('one\ntwo\nthree\nfour\nfive'), _figure()]),
+      shortViewport,
+      _style(),
+      imageSizeResolver: (_) => const ui.Size(100, 100),
+    );
+
+    expect(pages, hasLength(2));
+    expect(pages.first.items.whereType<ImagePlacement>(), isEmpty);
+    expect(pages.last.items.whereType<ImagePlacement>(), hasLength(1));
+    expect(pages.last.items.whereType<TextPlacement>(), hasLength(1));
     _disposeAll(pages);
   });
 

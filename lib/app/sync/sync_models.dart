@@ -7,7 +7,7 @@ const String syncProtocolName = 'rebook-webdav';
 
 enum CloudProvider {
   jianguoyun('Jianguoyun', 'https://dav.jianguoyun.com/dav'),
-  infiniCloud('InfiniCloud', 'https://webdav.infini-cloud.net'),
+  infiniCloud('InfiniCloud', 'https://higa.teracloud.jp/dav'),
   koofr('Koofr', 'https://app.koofr.net/dav/Koofr'),
   hiDrive('HiDrive', 'https://webdav.hidrive.strato.com'),
   yandexDisk('Yandex Disk', 'https://webdav.yandex.com'),

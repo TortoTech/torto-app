@@ -256,6 +256,13 @@ class ReaderController extends ChangeNotifier {
                 textStart += cell.plainText.length;
               }
             }
+          case FigureBlock():
+            for (final caption in block.captions) {
+              if (caption.nodeId == anchor.node) {
+                targetOffset = textStart + anchor.textOffset;
+              }
+              textStart += caption.plainText.length;
+            }
           default:
             continue;
         }
@@ -576,10 +583,19 @@ class ReaderController extends ChangeNotifier {
   /// Decodes every image referenced by [section]'s blocks into [_images]
   /// (null marks known-missing/undecodable). No-op for cached hrefs.
   Future<void> _decodeSectionImages(Section section) async {
-    final hrefs = <String>{
-      for (final block in section.blocks)
-        if (block is ImageBlock && !_images.containsKey(block.href)) block.href,
-    };
+    final hrefs = <String>{};
+    for (final block in section.blocks) {
+      switch (block) {
+        case ImageBlock():
+          if (!_images.containsKey(block.href)) hrefs.add(block.href);
+        case FigureBlock():
+          for (final image in block.images) {
+            if (!_images.containsKey(image.href)) hrefs.add(image.href);
+          }
+        default:
+          continue;
+      }
+    }
     if (hrefs.isEmpty) return;
     await Future.wait(
       hrefs.map((href) async {
@@ -759,6 +775,12 @@ String? _textForSourceNode(Section section, String nodeId) {
         for (final row in block.rows) {
           for (final cell in row.cells) {
             if (cell.nodeId == nodeId) return _readableInlineText(cell.inlines);
+          }
+        }
+      case FigureBlock():
+        for (final caption in block.captions) {
+          if (caption.nodeId == nodeId) {
+            return _readableInlineText(caption.inlines);
           }
         }
       default:

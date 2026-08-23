@@ -210,7 +210,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     final books = _books;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Library'),
+        title: const Text('书架'),
         actions: [
           if (_cloudSync != null)
             IconButton(

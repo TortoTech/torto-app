@@ -67,6 +67,7 @@ class LayoutEngine {
       final length = switch (block) {
         TextBlock(:final plainText) => plainText.length,
         TableBlock(:final textLength) => textLength,
+        FigureBlock(:final textLength) => textLength,
         _ => 0,
       };
       if (length == 0) continue;
@@ -106,6 +107,19 @@ class LayoutEngine {
             contentWidth,
             contentHeight,
             viewport.width,
+          );
+        case FigureBlock():
+          _pushFigure(
+            paginator,
+            block,
+            style,
+            imageSizeResolver,
+            contentLeft,
+            contentWidth,
+            contentHeight,
+            viewport.width,
+            section.spineIndex,
+            textStartOf[block] ?? 0,
           );
         case SeparatorBlock():
           paginator.pushSeparator(vMargin: style.baseFontSize * 0.75);
@@ -205,14 +219,16 @@ class LayoutEngine {
     int spineIndex,
     double contentLeft,
     double contentWidth,
-    double sectionTextOffset,
-  ) {
+    double sectionTextOffset, {
+    BlockAlign? unifiedAlignmentOverride,
+  }) {
     final baseSize = style.baseFontSize;
     final unified = style.typesettingMode == TypesettingMode.unified;
     final isHeading = block.kind == TextBlockKind.heading;
     final isPre = block.kind == TextBlockKind.preformatted;
     final isList = block.kind == TextBlockKind.listItem;
     final isQuote = block.kind == TextBlockKind.blockquote;
+    final isCaption = block.kind == TextBlockKind.caption;
 
     var marginBefore = block.style.marginBefore;
     var marginAfter = block.style.marginAfter;
@@ -226,11 +242,14 @@ class LayoutEngine {
       marginBefore = 0;
       marginAfter = baseSize * 0.5;
       marginStart = 0;
-      resolvedAlign = switch (block.kind) {
-        TextBlockKind.paragraph => BlockAlign.justify,
-        TextBlockKind.blockquote => block.style.align,
-        _ => BlockAlign.start,
-      };
+      resolvedAlign =
+          unifiedAlignmentOverride ??
+          switch (block.kind) {
+            TextBlockKind.paragraph => BlockAlign.justify,
+            TextBlockKind.blockquote => block.style.align,
+            TextBlockKind.caption => BlockAlign.center,
+            _ => BlockAlign.start,
+          };
       paragraphLineHeight = style.lineHeight;
       if (isHeading) {
         blockScale = _unifiedHeadingScale(block.headingLevel);
@@ -239,6 +258,10 @@ class LayoutEngine {
       } else if (isPre) {
         blockScale = 0.9;
         paragraphLineHeight = 1.45;
+      } else if (isCaption) {
+        blockScale = 0.88;
+        paragraphLineHeight = 1.4;
+        marginAfter = 0;
       } else if (isQuote) {
         blockScale = 0.95;
         marginStart = baseSize * 2;
@@ -722,6 +745,32 @@ class LayoutEngine {
     double contentHeight,
     double viewportWidth,
   ) {
+    final prepared = _prepareImage(
+      block,
+      style,
+      imageSizeResolver,
+      contentWidth,
+      contentHeight,
+      viewportWidth,
+    );
+    paginator.pushImage(
+      prepared.href,
+      prepared.width,
+      prepared.height,
+      gap: block.fixedPage ? 0 : style.baseFontSize * 0.5,
+      centerVertically: prepared.centerVertically,
+      fillViewportWidth: prepared.fillViewportWidth,
+    );
+  }
+
+  _PreparedImage _prepareImage(
+    ImageBlock block,
+    ReaderStyle style,
+    ui.Size? Function(String href)? imageSizeResolver,
+    double contentWidth,
+    double contentHeight,
+    double viewportWidth,
+  ) {
     final em = style.baseFontSize;
     final intrinsic = imageSizeResolver?.call(block.href);
     final availableWidth = block.fixedPage ? viewportWidth : contentWidth;
@@ -739,15 +788,13 @@ class LayoutEngine {
         // tall pages instead of reintroducing horizontal reading margins.
         width = availableWidth;
         height = width / aspect;
-        paginator.pushImage(
-          block.href,
-          width,
-          height,
-          gap: 0,
+        return _PreparedImage(
+          href: block.href,
+          width: width,
+          height: height,
           centerVertically: true,
           fillViewportWidth: true,
         );
-        return;
       }
       var requestedHeight = imageStyle.height?.resolve(contentHeight);
       final requestedWidth = math.max(
@@ -778,15 +825,156 @@ class LayoutEngine {
       width = requestedWidth * scale;
       height = requestedHeight * scale;
     }
-    paginator.pushImage(
-      block.href,
-      width,
-      height,
-      gap: block.fixedPage ? 0 : em * 0.5,
+    return _PreparedImage(
+      href: block.href,
+      width: width,
+      height: height,
       centerVertically: block.fixedPage,
       fillViewportWidth: block.fixedPage,
     );
   }
+
+  void _pushFigure(
+    _Paginator paginator,
+    FigureBlock figure,
+    ReaderStyle style,
+    ui.Size? Function(String href)? imageSizeResolver,
+    double contentLeft,
+    double contentWidth,
+    double contentHeight,
+    double viewportWidth,
+    int spineIndex,
+    double sectionTextOffset,
+  ) {
+    final unified = style.typesettingMode == TypesettingMode.unified;
+    final images = figure.images
+        .map(
+          (image) => _prepareImage(
+            image,
+            style,
+            imageSizeResolver,
+            contentWidth,
+            contentHeight,
+            viewportWidth,
+          ),
+        )
+        .toList();
+    final captions = <_PreparedText>[];
+    var captionOffset = sectionTextOffset;
+    for (final caption in figure.captions) {
+      final prepared = _prepareFigureCaption(
+        caption,
+        style,
+        spineIndex,
+        contentLeft,
+        contentWidth,
+        captionOffset,
+      );
+      if (prepared != null) captions.add(prepared);
+      captionOffset += caption.plainText.length;
+    }
+
+    final em = style.baseFontSize;
+    final outerGap = unified
+        ? em
+        : math.max(
+            em * 0.5,
+            math.max(figure.style.marginBefore, figure.style.marginAfter),
+          );
+    final captionGap = unified ? em * 0.35 : 6.0;
+    final imageHeight = images.fold(0.0, (sum, image) => sum + image.height);
+    final captionHeight = captions.fold(
+      0.0,
+      (sum, caption) =>
+          sum +
+          _preparedTextHeight(caption) +
+          math.max(0, caption.marginBefore) +
+          math.max(0, caption.marginAfter),
+    );
+    final internalImageGaps = captionGap * math.max(0, images.length - 1);
+    final imageCaptionGap = images.isEmpty || captions.isEmpty
+        ? 0.0
+        : captionGap;
+    paginator.prepareGroup(
+      imageHeight + captionHeight + internalImageGaps + imageCaptionGap,
+      outerGap,
+    );
+
+    void pushImages() {
+      for (var index = 0; index < images.length; index++) {
+        if (index > 0) paginator.addSemanticSpacing(captionGap);
+        final image = images[index];
+        paginator.pushImage(
+          image.href,
+          image.width,
+          image.height,
+          gap: 0,
+          centerVertically: image.centerVertically,
+          fillViewportWidth: image.fillViewportWidth,
+        );
+      }
+    }
+
+    void pushCaptions() {
+      for (final caption in captions) {
+        paginator.pushText(caption);
+      }
+    }
+
+    switch (figure.captionPosition) {
+      case CaptionPosition.before:
+        pushCaptions();
+        if (captions.isNotEmpty && images.isNotEmpty) {
+          paginator.addSemanticSpacing(captionGap);
+        }
+        pushImages();
+      case CaptionPosition.after:
+        pushImages();
+        if (captions.isNotEmpty && images.isNotEmpty) {
+          paginator.addSemanticSpacing(captionGap);
+        }
+        pushCaptions();
+    }
+    paginator.finishGroup(outerGap);
+  }
+
+  _PreparedText? _prepareFigureCaption(
+    TextBlock caption,
+    ReaderStyle style,
+    int spineIndex,
+    double contentLeft,
+    double contentWidth,
+    double sectionTextOffset,
+  ) {
+    var prepared = _prepareText(
+      caption,
+      style,
+      spineIndex,
+      contentLeft,
+      contentWidth,
+      sectionTextOffset,
+    );
+    if (prepared == null ||
+        style.typesettingMode != TypesettingMode.unified ||
+        prepared.metrics.length <= 1) {
+      return prepared;
+    }
+    prepared.paragraph.dispose();
+    prepared.markerParagraph?.dispose();
+    prepared = _prepareText(
+      caption,
+      style,
+      spineIndex,
+      contentLeft,
+      contentWidth,
+      sectionTextOffset,
+      unifiedAlignmentOverride: BlockAlign.start,
+    );
+    return prepared;
+  }
+
+  static double _preparedTextHeight(_PreparedText prepared) =>
+      prepared.lineTops.last + prepared.metrics.last.height;
 
   static double _unifiedHeadingScale(int level) {
     const emphasis = 0.6;
@@ -923,6 +1111,22 @@ class _PreparedText {
     required this.spineIndex,
     required this.sectionTextOffset,
     required this.links,
+  });
+}
+
+class _PreparedImage {
+  final String href;
+  final double width;
+  final double height;
+  final bool centerVertically;
+  final bool fillViewportWidth;
+
+  const _PreparedImage({
+    required this.href,
+    required this.width,
+    required this.height,
+    required this.centerVertically,
+    required this.fillViewportWidth,
   });
 }
 
@@ -1115,6 +1319,22 @@ class _Paginator {
     cursorY = y + height;
     _setMarginAfter(gap);
   }
+
+  /// Keeps a semantic media group together when it fits on a fresh page.
+  /// Oversized groups keep their normal item-by-item overflow behavior.
+  void prepareGroup(double contentHeight, double outerGap) {
+    _collapseMargin(outerGap);
+    final pageHeight = bottom - top;
+    if (contentHeight <= pageHeight + _eps &&
+        contentHeight > remaining + _eps &&
+        hasContent) {
+      advance();
+    }
+  }
+
+  void addSemanticSpacing(double amount) => _collapseMargin(amount);
+
+  void finishGroup(double outerGap) => _setMarginAfter(outerGap);
 
   void pushSeparator({required double vMargin}) {
     _addSpacing(vMargin);
