@@ -193,6 +193,10 @@ class TextLinkRange {
   final String href;
   final String marker;
   final LinkRole role;
+  final bool footnoteIcon;
+
+  /// Body of an inline footnote whose authored text was replaced by [footnoteIcon].
+  final String? inlineNote;
 
   const TextLinkRange({
     required this.start,
@@ -200,6 +204,8 @@ class TextLinkRange {
     required this.href,
     required this.marker,
     required this.role,
+    this.footnoteIcon = false,
+    this.inlineNote,
   });
 }
 

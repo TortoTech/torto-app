@@ -357,7 +357,19 @@ class _SectionParser {
           _blockStyleFor(element),
         );
       case 'blockquote':
-        final style = _blockStyleFor(element);
+        var style = _blockStyleFor(element);
+        // The Reading IR currently flattens a quote's nested paragraphs into
+        // one semantic block. Preserve the first authored inner alignment;
+        // EPUBs commonly put text-align on `<blockquote><p>` rather than on
+        // the outer blockquote itself.
+        for (final child in element.descendants.whereType<XmlElement>()) {
+          if (!_isQuoteTextContainer(child)) continue;
+          final align = _authoredBlockAlign(child);
+          if (align != null) {
+            style = style.copyWith(align: align);
+            break;
+          }
+        }
         _pushTextBlock(
           element,
           TextBlockKind.blockquote,
@@ -446,6 +458,16 @@ class _SectionParser {
 
   static bool _isPageBreak(String? value) =>
       value == 'always' || value == 'page';
+
+  static bool _isQuoteTextContainer(XmlElement element) =>
+      const {'p', 'div', 'dd', 'dt', 'cite'}.contains(_name(element));
+
+  BlockAlign? _authoredBlockAlign(XmlElement element) {
+    final value =
+        styles.cascadedProperties(element)['text-align'] ??
+        _attr(element, 'align');
+    return _blockAlign(value);
+  }
 
   /// Handles containers with mixed inline and block children: inline runs
   /// between block-level children are collected into paragraphs.
@@ -868,16 +890,8 @@ class _SectionParser {
             _firstOf(props, const ['padding-inline-start', 'padding-left']),
           ) ??
           0;
-      switch (props['text-align']) {
-        case 'center':
-          align = BlockAlign.center;
-        case 'right' || 'end':
-          align = BlockAlign.end;
-        case 'justify':
-          align = BlockAlign.justify;
-        case 'left' || 'start':
-          align = BlockAlign.start;
-      }
+      align =
+          _blockAlign(props['text-align'] ?? _attr(ancestor, 'align')) ?? align;
       final textIndent = _cssLength(props['text-indent']);
       if (textIndent != null) indent = textIndent;
       final cssLineHeight = _cssLineHeight(props['line-height']);
@@ -899,6 +913,15 @@ class _SectionParser {
       lineHeight: lineHeight,
     );
   }
+
+  static BlockAlign? _blockAlign(String? value) =>
+      switch (value?.trim().toLowerCase()) {
+        'center' => BlockAlign.center,
+        'right' || 'end' => BlockAlign.end,
+        'justify' => BlockAlign.justify,
+        'left' || 'start' => BlockAlign.start,
+        _ => null,
+      };
 
   TextStyle _textStyleForBlock(
     XmlElement element,

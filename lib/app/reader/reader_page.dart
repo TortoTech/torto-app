@@ -169,8 +169,11 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     if (_overlayVisible && mounted) {
       setState(() => _overlayVisible = false);
     }
-    if (link.role == LinkRole.footnoteReference) {
-      final note = await controller.resolveFootnote(link);
+    if (link.footnoteIcon || link.role == LinkRole.footnoteReference) {
+      final inlineNote = link.inlineNote;
+      final note = inlineNote == null
+          ? await controller.resolveFootnote(link)
+          : ReaderFootnote(marker: '', text: inlineNote);
       if (!mounted) return;
       if (note == null) {
         ScaffoldMessenger.of(

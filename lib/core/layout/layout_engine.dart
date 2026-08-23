@@ -293,6 +293,32 @@ class LayoutEngine {
       switch (inline) {
         case TextRun(:final text, style: final runStyle, :final link):
           if (text.isEmpty) continue;
+          final footnoteIcon = _usesFootnoteIcon(runStyle, link);
+          if (footnoteIcon) {
+            final authoredScale = unified
+                ? blockScale
+                : runStyle.sizeScale * blockScale;
+            _appendFootnotePlaceholder(
+              builder,
+              text,
+              (baseSize * authoredScale * 0.78).clamp(8.0, 12.0),
+            );
+            links.add(
+              TextLinkRange(
+                start: paragraphOffset,
+                end: paragraphOffset + text.length,
+                href: link ?? '',
+                marker: link == null ? '' : text.trim(),
+                role: runStyle.linkRole,
+                footnoteIcon: true,
+                inlineNote: runStyle.inlineRole == InlineRole.footnote
+                    ? text.trim()
+                    : null,
+              ),
+            );
+            paragraphOffset += text.length;
+            continue;
+          }
           var scale = unified ? blockScale : runStyle.sizeScale * blockScale;
           // Super/subscript: size reduced, baseline shift not approximated.
           if (runStyle.baseline != TextBaselineShift.none) scale *= 0.7;
@@ -388,6 +414,33 @@ class LayoutEngine {
     );
   }
 
+  static bool _usesFootnoteIcon(TextStyle style, String? link) {
+    if (style.inlineRole == InlineRole.footnote) return true;
+    if (link == null || !link.contains('#')) return false;
+    return style.linkRole == LinkRole.footnoteReference ||
+        (style.linkRole == LinkRole.normal &&
+            style.baseline == TextBaselineShift.superscript);
+  }
+
+  static void _appendFootnotePlaceholder(
+    ui.ParagraphBuilder builder,
+    String source,
+    double size,
+  ) {
+    builder.addPlaceholder(
+      size,
+      size,
+      ui.PlaceholderAlignment.baseline,
+      baseline: ui.TextBaseline.alphabetic,
+      baselineOffset: size * 1.18,
+    );
+    if (source.length > 1) {
+      builder.addText(
+        String.fromCharCodes(List.filled(source.length - 1, 0x2060)),
+      );
+    }
+  }
+
   _PreparedTable? _prepareTable(
     TableBlock table,
     ReaderStyle style,
@@ -453,13 +506,14 @@ class LayoutEngine {
           .skip(gridCell.column)
           .take(gridCell.columnSpan)
           .fold(0.0, (sum, width) => sum + width);
-      final paragraph = _buildTableCellParagraph(
+      final builtCell = _buildTableCellParagraph(
         gridCell.cell,
         style,
         math.max(1, cellWidth - padding * 2),
         fontScale,
         lineHeight,
       );
+      final paragraph = builtCell.paragraph;
       final requiredHeight = paragraph.height + padding * 2;
       if (gridCell.rowSpan == 1) {
         rowHeights[gridCell.row] = math.max(
@@ -471,7 +525,7 @@ class LayoutEngine {
         _PreparedTableCell(
           grid: gridCell,
           paragraph: paragraph,
-          links: _linkRangesForInlines(gridCell.cell.inlines),
+          links: builtCell.links,
           requiredHeight: requiredHeight,
           sectionTextOffset: cellTextOffset,
         ),
@@ -533,7 +587,7 @@ class LayoutEngine {
     return [for (final weight in weights) contentWidth * weight / total];
   }
 
-  ui.Paragraph _buildTableCellParagraph(
+  _BuiltTableCellParagraph _buildTableCellParagraph(
     TableCell cell,
     ReaderStyle style,
     double width,
@@ -556,10 +610,38 @@ class LayoutEngine {
         height: unified ? lineHeight : lineHeight * cell.style.lineHeight,
       ),
     );
+    final links = <TextLinkRange>[];
+    var paragraphOffset = 0;
     for (final inline in cell.inlines) {
       switch (inline) {
         case TextRun(:final text, style: final runStyle, :final link):
           if (text.isEmpty) continue;
+          final footnoteIcon = _usesFootnoteIcon(runStyle, link);
+          if (footnoteIcon) {
+            final authoredScale = unified
+                ? fontScale
+                : fontScale * runStyle.sizeScale;
+            _appendFootnotePlaceholder(
+              builder,
+              text,
+              (style.baseFontSize * authoredScale * 0.78).clamp(8.0, 12.0),
+            );
+            links.add(
+              TextLinkRange(
+                start: paragraphOffset,
+                end: paragraphOffset + text.length,
+                href: link ?? '',
+                marker: link == null ? '' : text.trim(),
+                role: runStyle.linkRole,
+                footnoteIcon: true,
+                inlineNote: runStyle.inlineRole == InlineRole.footnote
+                    ? text.trim()
+                    : null,
+              ),
+            );
+            paragraphOffset += text.length;
+            continue;
+          }
           var scale = unified ? fontScale : fontScale * runStyle.sizeScale;
           if (runStyle.baseline != TextBaselineShift.none) scale *= 0.7;
           builder.pushStyle(
@@ -579,36 +661,26 @@ class LayoutEngine {
           );
           builder.addText(text);
           builder.pop();
-        case BreakInline():
-          builder.addText('\n');
-      }
-    }
-    return builder.build()..layout(ui.ParagraphConstraints(width: width));
-  }
-
-  static List<TextLinkRange> _linkRangesForInlines(List<Inline> inlines) {
-    final links = <TextLinkRange>[];
-    var offset = 0;
-    for (final inline in inlines) {
-      switch (inline) {
-        case TextRun(:final text, :final style, :final link):
-          if (link != null && text.isNotEmpty) {
+          if (link != null) {
             links.add(
               TextLinkRange(
-                start: offset,
-                end: offset + text.length,
+                start: paragraphOffset,
+                end: paragraphOffset + text.length,
                 href: link,
                 marker: text.trim(),
-                role: style.linkRole,
+                role: runStyle.linkRole,
               ),
             );
           }
-          offset += text.length;
+          paragraphOffset += text.length;
         case BreakInline():
-          offset++;
+          builder.addText('\n');
+          paragraphOffset++;
       }
     }
-    return links;
+    final paragraph = builder.build()
+      ..layout(ui.ParagraphConstraints(width: width));
+    return _BuiltTableCellParagraph(paragraph, links);
   }
 
   void _pushImage(
@@ -658,7 +730,13 @@ class LayoutEngine {
       width = requestedWidth * scale;
       height = requestedHeight * scale;
     }
-    paginator.pushImage(block.href, width, height, gap: em * 0.5);
+    paginator.pushImage(
+      block.href,
+      width,
+      height,
+      gap: block.fixedPage ? 0 : em * 0.5,
+      centerVertically: block.fixedPage,
+    );
   }
 
   static double _unifiedHeadingScale(int level) {
@@ -707,6 +785,13 @@ class _GridTableCell {
     required this.columnSpan,
     required this.cell,
   });
+}
+
+class _BuiltTableCellParagraph {
+  final ui.Paragraph paragraph;
+  final List<TextLinkRange> links;
+
+  const _BuiltTableCellParagraph(this.paragraph, this.links);
 }
 
 class _PreparedTableCell {
@@ -963,18 +1048,19 @@ class _Paginator {
     double width,
     double height, {
     required double gap,
+    bool centerVertically = false,
   }) {
     _collapseMargin(gap);
     if (height > remaining + _eps && hasContent) advance();
     final x = left + (this.width - width) / 2;
+    final y = centerVertically && !hasContent
+        ? top + math.max(0, (bottom - top - height) / 2)
+        : cursorY;
     items.add(
-      ImagePlacement(
-        href: href,
-        rect: ui.Rect.fromLTWH(x, cursorY, width, height),
-      ),
+      ImagePlacement(href: href, rect: ui.Rect.fromLTWH(x, y, width, height)),
     );
     hasContent = true;
-    cursorY += height;
+    cursorY = y + height;
     _setMarginAfter(gap);
   }
 

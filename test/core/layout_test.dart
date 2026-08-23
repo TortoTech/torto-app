@@ -199,6 +199,23 @@ void main() {
     _disposeAll(pages);
   });
 
+  test('fixed PDF page is vertically centered in the content area', () {
+    final style = _style();
+    final pages = engine.paginate(
+      _section([const ImageBlock(href: 'page:0', fixedPage: true)]),
+      _viewport,
+      style,
+      imageSizeResolver: (_) => const ui.Size(100, 100),
+    );
+    final placement = pages.single.items.single as ImagePlacement;
+    final contentCenter =
+        (style.marginTop + _viewport.height - style.marginBottom) / 2;
+
+    expect(placement.rect.center.dy, closeTo(contentCenter, _eps));
+    expect(placement.rect.top, greaterThan(style.marginTop));
+    _disposeAll(pages);
+  });
+
   test('CJK text paginates across pages', () {
     final cjk = '天地玄黄宇宙洪荒日月盈昃辰宿列张寒来暑往秋收冬藏' * 80;
     final pages = engine.paginate(_section([_para(cjk)]), _viewport, _style());
@@ -363,6 +380,54 @@ void main() {
     expect(pages.single.linkAt(point), same(link));
     expect(link.role, LinkRole.footnoteReference);
     expect(link.href, 's.xhtml#note-1');
+    expect(link.footnoteIcon, isTrue);
+  });
+
+  test('inline footnote is laid out as the same interactive icon', () {
+    final block = TextBlock(
+      nodeId: 'inline-note',
+      inlines: const [
+        TextRun('Body text '),
+        TextRun(
+          'An inline footnote.',
+          style: TextStyle(inlineRole: InlineRole.footnote),
+        ),
+      ],
+    );
+    final pages = engine.paginate(_section([block]), _viewport, _style());
+    addTearDown(() => _disposeAll(pages));
+    final placement = pages.single.items.whereType<TextPlacement>().single;
+    final link = placement.links.single;
+    final box = placement.paragraph
+        .getBoxesForRange(link.start, link.end)
+        .firstWhere((candidate) => candidate.right > candidate.left);
+    final point = ui.Offset(
+      placement.x + (box.left + box.right) / 2,
+      placement.y - placement.sliceTop + (box.top + box.bottom) / 2,
+    );
+
+    expect(link.footnoteIcon, isTrue);
+    expect(link.inlineNote, 'An inline footnote.');
+    expect(pages.single.linkAt(point), same(link));
+  });
+
+  test('blockquote keeps its authored end alignment during layout', () {
+    final pages = engine.paginate(
+      _section([
+        _para(
+          'quoted',
+          kind: TextBlockKind.blockquote,
+          style: const BlockStyle(align: BlockAlign.end),
+        ),
+      ]),
+      _viewport,
+      _style(),
+    );
+    final placement = pages.single.items.whereType<TextPlacement>().single;
+    final box = placement.paragraph.getBoxesForRange(0, 6).first;
+
+    expect(box.left, greaterThan(placement.width / 2));
+    _disposeAll(pages);
   });
 
   test('list markers use hanging indents and nested levels move inward', () {

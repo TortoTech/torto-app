@@ -204,11 +204,17 @@ class ImageBlock extends Block {
   final ImageStyle style;
   final SourceRange? source;
 
+  /// True for one-page fixed-layout resources such as PDF pages. Layout may
+  /// center these within the whole reading area; ordinary book illustrations
+  /// remain in normal document flow.
+  final bool fixedPage;
+
   const ImageBlock({
     required this.href,
     this.alt = '',
     this.style = ImageStyle.normal,
     this.source,
+    this.fixedPage = false,
   });
 }
 

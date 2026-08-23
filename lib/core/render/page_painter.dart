@@ -1,6 +1,7 @@
 /// Render stage: paints a [PageLayout] display list onto a Flutter canvas.
 library;
 
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -102,6 +103,7 @@ class PagePainter extends CustomPainter {
     // inner rules visibly darker than the table outline. Build the union of
     // all horizontal and vertical edges and submit it as one path instead.
     _paintTableGrid(canvas, tableCells, resolvedForeground.withAlpha(96));
+    _paintFootnoteIcons(canvas, page.items, resolvedForeground);
   }
 
   @override
@@ -109,6 +111,83 @@ class PagePainter extends CustomPainter {
       !identical(oldDelegate.page, page) ||
       oldDelegate.background != background ||
       oldDelegate.foreground != foreground;
+}
+
+void _paintFootnoteIcons(Canvas canvas, List<PageItem> items, Color color) {
+  for (final item in items) {
+    final ui.Paragraph paragraph;
+    final List<TextLinkRange> links;
+    final ui.Offset paragraphOffset;
+    final ui.Rect clip;
+    switch (item) {
+      case TextPlacement():
+        paragraph = item.paragraph;
+        links = item.links;
+        paragraphOffset = ui.Offset(item.x, item.y - item.sliceTop);
+        clip = ui.Rect.fromLTWH(item.x, item.y, item.width, item.sliceHeight);
+      case TableCellPlacement():
+        paragraph = item.paragraph;
+        links = item.links;
+        paragraphOffset = ui.Offset(
+          item.rect.left + item.padding,
+          item.rect.top + item.padding,
+        );
+        clip = item.rect.deflate(item.padding);
+      default:
+        continue;
+    }
+
+    for (final link in links.where((link) => link.footnoteIcon)) {
+      final boxes = paragraph.getBoxesForRange(link.start, link.end);
+      for (final box in boxes) {
+        if (box.right - box.left < 0.5 || box.bottom - box.top < 0.5) {
+          continue;
+        }
+        final bounds = ui.Rect.fromLTRB(
+          paragraphOffset.dx + box.left,
+          paragraphOffset.dy + box.top,
+          paragraphOffset.dx + box.right,
+          paragraphOffset.dy + box.bottom,
+        ).intersect(clip);
+        if (!bounds.isEmpty) _drawFootnoteIcon(canvas, bounds, color);
+        break;
+      }
+    }
+  }
+}
+
+void _drawFootnoteIcon(Canvas canvas, ui.Rect slot, Color color) {
+  final size = math.min(slot.width, slot.height);
+  if (size <= 0) return;
+  final bounds = ui.Rect.fromCenter(
+    center: slot.center,
+    width: size,
+    height: size,
+  );
+  final scale = size / 12;
+  final centerX = bounds.center.dx;
+  final stroke = Paint()
+    ..color = color
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 1.15 * scale;
+  canvas.drawCircle(bounds.center, size / 2, stroke);
+  canvas.drawRect(
+    ui.Rect.fromLTRB(
+      centerX - 0.7 * scale,
+      bounds.top + 2 * scale,
+      centerX + 0.7 * scale,
+      bounds.top + 3.4 * scale,
+    ),
+    Paint()..color = color,
+  );
+  canvas.drawLine(
+    ui.Offset(centerX, bounds.top + 5 * scale),
+    ui.Offset(centerX, bounds.bottom - 2 * scale),
+    Paint()
+      ..color = color
+      ..strokeWidth = 1.2 * scale
+      ..strokeCap = StrokeCap.butt,
+  );
 }
 
 const double _gridMergeTolerance = 0.001;

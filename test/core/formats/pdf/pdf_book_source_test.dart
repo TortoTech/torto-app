@@ -95,6 +95,7 @@ void main() {
     final block = section.blocks.single as ImageBlock;
 
     expect(block.href, 'Pages/page-00001.png');
+    expect(block.fixedPage, isTrue);
     final image = await tester.runAsync(
       () => source.rasterResource(block.href, maxDimension: 256),
     );

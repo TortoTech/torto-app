@@ -129,7 +129,11 @@ class PdfBookSource
       spineIndex: index,
       href: book.spine[index].href,
       blocks: [
-        ImageBlock(href: _pagePath(index), alt: 'PDF page ${index + 1}'),
+        ImageBlock(
+          href: _pagePath(index),
+          alt: 'PDF page ${index + 1}',
+          fixedPage: true,
+        ),
       ],
     );
   }

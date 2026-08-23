@@ -62,6 +62,16 @@ void main() {
       expect(block.style.indent, 24);
     });
 
+    test('blockquote keeps alignment authored on its nested paragraph', () {
+      final section = parseSection(
+        '<blockquote><p style="text-align: right">quoted</p></blockquote>',
+      );
+      final block = textBlock(section, 0);
+
+      expect(block.kind, TextBlockKind.blockquote);
+      expect(block.style.align, BlockAlign.end);
+    });
+
     test('pre preserves whitespace and newlines', () {
       final section = parseSection('<pre>line1\n  line2</pre>');
       final block = textBlock(section, 0);
