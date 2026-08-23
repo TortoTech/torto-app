@@ -25,20 +25,21 @@ class WebDavException implements Exception {
 
 /// Small WebDAV client constrained to the Torto/Rebook v1 remote root.
 class WebDavClient {
-  static const _timeout = Duration(seconds: 45);
-
   final Uri root;
   final String username;
   final String password;
   final http.Client _client;
+  final Duration _timeout;
 
   WebDavClient({
     required String baseUrl,
     required this.username,
     required this.password,
     http.Client? client,
+    Duration timeout = const Duration(seconds: 45),
   }) : root = _protocolRoot(baseUrl),
-       _client = client ?? http.Client();
+       _client = client ?? http.Client(),
+       _timeout = timeout;
 
   void close() => _client.close();
 
@@ -168,10 +169,12 @@ class WebDavClient {
       HttpHeaders.contentTypeHeader: 'application/octet-stream',
     });
     request.contentLength = await file.length();
-    final sending = _client.send(request).timeout(_timeout);
-    await request.sink.addStream(file.openRead());
-    await request.sink.close();
-    final response = await sending;
+    final response = await _withTimeout(() async {
+      final sending = _client.send(request);
+      await request.sink.addStream(file.openRead());
+      await request.sink.close();
+      return sending;
+    }(), 'WebDAV upload timed out.');
     await response.stream.drain<void>();
     if (response.isRedirect) {
       throw const WebDavException(
@@ -248,7 +251,10 @@ class WebDavClient {
     request.headers.addAll(_authorization);
     if (offset > 0) request.headers[HttpHeaders.rangeHeader] = 'bytes=$offset-';
     request.followRedirects = false;
-    final response = await _client.send(request).timeout(_timeout);
+    final response = await _withTimeout(
+      _client.send(request),
+      'WebDAV download timed out.',
+    );
     if (response.isRedirect) {
       throw const WebDavException(
         'WebDAV redirected a download; update the server URL.',
@@ -279,11 +285,13 @@ class WebDavClient {
     );
     var received = offset;
     try {
-      await for (final chunk in response.stream) {
+      await for (final chunk in response.stream.timeout(_timeout)) {
         sink.add(chunk);
         received += chunk.length;
         onProgress?.call(received, expectedLength);
       }
+    } on TimeoutException {
+      throw const WebDavException('WebDAV download timed out.');
     } finally {
       await sink.close();
     }
@@ -314,7 +322,10 @@ class WebDavClient {
         ..headers.addAll(headers)
         ..followRedirects = false;
       if (body != null) request.bodyBytes = body;
-      final streamed = await _client.send(request).timeout(_timeout);
+      final streamed = await _withTimeout(
+        _client.send(request),
+        'WebDAV request timed out.',
+      );
       final response = await http.Response.fromStream(streamed);
       if (!response.isRedirect) return response;
       final location = response.headers[HttpHeaders.locationHeader];
@@ -330,6 +341,14 @@ class WebDavClient {
 
   static bool _sameOrigin(Uri a, Uri b) =>
       a.scheme == b.scheme && a.host == b.host && a.port == b.port;
+
+  Future<T> _withTimeout<T>(Future<T> operation, String message) async {
+    try {
+      return await operation.timeout(_timeout);
+    } on TimeoutException {
+      throw WebDavException(message);
+    }
+  }
 
   static int? _contentRangeStart(String? value) {
     if (value == null || !value.startsWith('bytes ')) return null;
