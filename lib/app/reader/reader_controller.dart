@@ -562,6 +562,8 @@ class ReaderController extends ChangeNotifier {
       _viewport,
       _style,
       imageSizeResolver: _imageSize,
+      coverHref: _book.coverHref,
+      renditionLayout: _book.metadata.layout,
     );
     if (generation != _paginationGeneration) {
       _disposePages(pages);
@@ -595,7 +597,10 @@ class ReaderController extends ChangeNotifier {
                 ? null
                 : await _decodeReaderImage(bytes);
           }
-        } catch (_) {
+        } catch (error, stackTrace) {
+          debugPrint(
+            'Could not decode reader image $href: $error\n$stackTrace',
+          );
           _images[href] = null; // missing or undecodable: render without it
         }
       }),
@@ -611,26 +616,25 @@ class ReaderController extends ChangeNotifier {
   static Future<ui.Image> _decodeReaderImage(Uint8List bytes) async {
     const maxDimension = 2048;
     final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+    // instantiateImageCodecWithSize takes ownership of [buffer] and disposes
+    // it after creating the codec. Disposing it again here makes a successful
+    // decode look like a failure and leaves image-only pages blank.
+    final codec = await ui.instantiateImageCodecWithSize(
+      buffer,
+      getTargetSize: (width, height) {
+        final longest = math.max(width, height);
+        if (longest <= maxDimension) return const ui.TargetImageSize();
+        final scale = maxDimension / longest;
+        return ui.TargetImageSize(
+          width: math.max(1, (width * scale).round()),
+          height: math.max(1, (height * scale).round()),
+        );
+      },
+    );
     try {
-      final codec = await ui.instantiateImageCodecWithSize(
-        buffer,
-        getTargetSize: (width, height) {
-          final longest = math.max(width, height);
-          if (longest <= maxDimension) return const ui.TargetImageSize();
-          final scale = maxDimension / longest;
-          return ui.TargetImageSize(
-            width: math.max(1, (width * scale).round()),
-            height: math.max(1, (height * scale).round()),
-          );
-        },
-      );
-      try {
-        return (await codec.getNextFrame()).image;
-      } finally {
-        codec.dispose();
-      }
+      return (await codec.getNextFrame()).image;
     } finally {
-      buffer.dispose();
+      codec.dispose();
     }
   }
 

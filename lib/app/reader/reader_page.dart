@@ -37,7 +37,7 @@ enum _TurnDirection { previous, next }
 
 class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
   static const ReaderStyle _baseStyle = ReaderStyle(
-    baseFontSize: 18,
+    baseFontSize: 20,
     lineHeight: 1.5,
     marginTop: 32,
     marginBottom: 32,

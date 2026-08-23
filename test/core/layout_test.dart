@@ -29,6 +29,7 @@ TextBlock _para(
   bool listOrdered = false,
   int listOrdinal = 0,
   int listDepth = 0,
+  bool listMarkerVisible = true,
   String nodeId = 'n1',
 }) => TextBlock(
   kind: kind,
@@ -36,6 +37,7 @@ TextBlock _para(
   listOrdered: listOrdered,
   listOrdinal: listOrdinal,
   listDepth: listDepth,
+  listMarkerVisible: listMarkerVisible,
   nodeId: nodeId,
   inlines: [TextRun(text)],
   style: style,
@@ -64,6 +66,10 @@ void _disposeAll(List<PageLayout> pages) {
 
 void main() {
   const engine = LayoutEngine();
+
+  test('reader style defaults to a 20 logical-pixel font size', () {
+    expect(const ReaderStyle().baseFontSize, 20);
+  });
 
   test('empty section produces zero pages', () {
     expect(engine.paginate(_section(const []), _viewport, _style()), isEmpty);
@@ -217,6 +223,60 @@ void main() {
     expect(placement.rect.left, closeTo(0, _eps));
     expect(placement.rect.right, closeTo(_viewport.width, _eps));
     expect(placement.rect.width, closeTo(_viewport.width, _eps));
+    _disposeAll(pages);
+  });
+
+  test('reflowable standalone cover is vertically centered', () {
+    final style = _style();
+    final pages = engine.paginate(
+      _section(const [
+        PageBreakBlock(),
+        ImageBlock(href: 'images/cover.jpg'),
+        PageBreakBlock(),
+      ]),
+      _viewport,
+      style,
+      imageSizeResolver: (_) => const ui.Size(100, 200),
+      coverHref: 'images/cover.jpg',
+    );
+    final placement = pages.single.items.single as ImagePlacement;
+    final contentCenter =
+        (style.marginTop + _viewport.height - style.marginBottom) / 2;
+
+    expect(placement.rect.center.dy, closeTo(contentCenter, _eps));
+    expect(placement.rect.top, greaterThan(style.marginTop));
+    _disposeAll(pages);
+  });
+
+  test('reflowable standalone non-cover image remains in normal flow', () {
+    final style = _style();
+    final pages = engine.paginate(
+      _section(const [ImageBlock(href: 'images/illustration.jpg')]),
+      _viewport,
+      style,
+      imageSizeResolver: (_) => const ui.Size(100, 200),
+      coverHref: 'images/cover.jpg',
+    );
+    final placement = pages.single.items.single as ImagePlacement;
+
+    expect(placement.rect.top, closeTo(style.marginTop, _eps));
+    _disposeAll(pages);
+  });
+
+  test('pre-paginated standalone image is vertically centered', () {
+    final style = _style();
+    final pages = engine.paginate(
+      _section(const [ImageBlock(href: 'images/fixed-page.jpg')]),
+      _viewport,
+      style,
+      imageSizeResolver: (_) => const ui.Size(100, 200),
+      renditionLayout: RenditionLayout.prePaginated,
+    );
+    final placement = pages.single.items.single as ImagePlacement;
+    final contentCenter =
+        (style.marginTop + _viewport.height - style.marginBottom) / 2;
+
+    expect(placement.rect.center.dy, closeTo(contentCenter, _eps));
     _disposeAll(pages);
   });
 
@@ -457,12 +517,35 @@ void main() {
         .whereType<TextPlacement>()
         .toList();
     expect(markers, hasLength(2));
-    expect(text[0].x, greaterThan(markers[0].x));
+    expect(markers[0].x, closeTo(25, _eps));
+    expect(text[0].x, closeTo(markers[0].x + markers[0].width, _eps));
     expect(text.last.x, greaterThan(text.first.x));
     expect(markers[0].marker, '•');
     expect(markers[1].marker, '◦');
     _disposeAll(pages);
   });
+
+  test(
+    'marker-less nested list paragraphs keep indentation without a bullet',
+    () {
+      final pages = engine.paginate(
+        _section([
+          _para(
+            'Nested continuation',
+            kind: TextBlockKind.listItem,
+            listDepth: 1,
+            listMarkerVisible: false,
+          ),
+        ]),
+        _viewport,
+        _style(),
+      );
+      final items = pages.single.items;
+      expect(items.whereType<ListMarkerPlacement>(), isEmpty);
+      expect(items.whereType<TextPlacement>().single.x, closeTo(40, _eps));
+      _disposeAll(pages);
+    },
+  );
 
   test('table grid retains headers and spans while fitting content width', () {
     final table = TableBlock(
@@ -517,6 +600,42 @@ void main() {
     );
     _disposeAll(unifiedPages);
     _disposeAll(bookPages);
+  });
+
+  test('unified typesetting justifies ordinary body paragraphs', () {
+    final pages = engine.paginate(
+      _section([
+        _para(_lorem(4), style: const BlockStyle(align: BlockAlign.end)),
+      ]),
+      _viewport,
+      _style(),
+    );
+    final placement = pages.first.items.whereType<TextPlacement>().single;
+    final firstLine = placement.lineMetrics.first;
+
+    expect(firstLine.hardBreak, isFalse);
+    expect(firstLine.width, closeTo(placement.width, _eps));
+    _disposeAll(pages);
+  });
+
+  test('unified typesetting keeps headings start-aligned', () {
+    final pages = engine.paginate(
+      _section([
+        _para(
+          'A heading',
+          kind: TextBlockKind.heading,
+          headingLevel: 2,
+          style: const BlockStyle(align: BlockAlign.end),
+        ),
+      ]),
+      _viewport,
+      _style(),
+    );
+    final placement = pages.single.items.single as TextPlacement;
+    final box = placement.paragraph.getBoxesForRange(0, 1).single;
+
+    expect(box.left, closeTo(0, _eps));
+    _disposeAll(pages);
   });
 
   test('preformatted and blockquote blocks paginate', () {

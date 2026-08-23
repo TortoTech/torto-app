@@ -107,6 +107,43 @@ void main() {
       expect(items.map((item) => item.listOrdinal), [3, 8, 2, 1]);
     });
 
+    test('recovers CSS hanging paragraphs as nested list items', () {
+      const head = '''
+        <style>
+          .bullet { margin-left: 24px; text-indent: -12px; }
+          .bulletind { margin-left: 48px; text-indent: -12px; }
+          .bulletind2 { margin-left: 72px; text-indent: -12px; }
+        </style>
+      ''';
+      final section = parseSection(
+        '<p class="bullet"><span class="enumerator">•</span> Parent</p>'
+        '<p class="bulletind">Child continuation</p>'
+        '<p class="bulletind2"><span class="enumerator">▪</span> Grandchild</p>'
+        '<p class="bullet"><span class="enumerator">•</span> Next parent</p>',
+        head: head,
+      );
+      final items = section.blocks.cast<TextBlock>();
+
+      expect(
+        items.map((item) => item.kind),
+        everyElement(TextBlockKind.listItem),
+      );
+      expect(items.map((item) => item.listDepth), [0, 1, 2, 0]);
+      expect(items.map((item) => item.listMarkerVisible), [
+        true,
+        false,
+        true,
+        true,
+      ]);
+      expect(items.map((item) => item.plainText), [
+        'Parent',
+        'Child continuation',
+        'Grandchild',
+        'Next parent',
+      ]);
+      expect(items.every((item) => item.style.indent == 0), isTrue);
+    });
+
     test('block paragraphs inside list items keep line boundaries', () {
       final section = parseSection(
         '<ul><li><p>first paragraph</p><p>second paragraph</p></li></ul>',

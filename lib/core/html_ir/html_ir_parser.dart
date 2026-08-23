@@ -256,6 +256,45 @@ const Set<String> _transparentContainers = {
 bool _isStructuredContainer(String name) =>
     name == 'ul' || name == 'ol' || name == 'dl';
 
+const _semanticListMarkers = {'•', '◦', '▪', '‣', '»'};
+
+bool _hasExplicitParagraphListMarker(XmlElement element) {
+  for (final descendant in element.descendants.whereType<XmlElement>()) {
+    if (_name(descendant) != 'span') continue;
+    final classes = (_attr(descendant, 'class') ?? '').split(RegExp(r'\s+'));
+    if (!classes.any((name) => name.toLowerCase() == 'enumerator')) continue;
+    final marker = descendant.descendants
+        .whereType<XmlText>()
+        .map((text) => text.value)
+        .join()
+        .trim();
+    if (_semanticListMarkers.contains(marker)) return true;
+  }
+  return false;
+}
+
+void _stripAuthoredListMarker(List<Inline> content) {
+  for (var index = 0; index < content.length; index++) {
+    final inline = content[index];
+    if (inline is! TextRun) continue;
+    final trimmed = inline.text.trimLeft();
+    if (trimmed.isEmpty) continue;
+    final marker = String.fromCharCode(trimmed.runes.first);
+    if (!_semanticListMarkers.contains(marker)) continue;
+    final remainder = trimmed.substring(marker.length).trimLeft();
+    if (remainder.isEmpty) {
+      content.removeAt(index);
+    } else {
+      content[index] = TextRun(
+        remainder,
+        style: inline.style,
+        link: inline.link,
+      );
+    }
+    return;
+  }
+}
+
 class _SectionParser {
   final int spineIndex;
   final String href;
@@ -265,6 +304,7 @@ class _SectionParser {
   late final Map<XmlElement, LinkRole> _footnoteLinks;
   final List<Block> blocks = [];
   final Map<XmlElement, SourceAnchor> _elementSources = Map.identity();
+  final List<double> _paragraphListIndents = [];
   int _nextNode = 0;
 
   _SectionParser(this.spineIndex, this.href, this.baseDir, this.document) {
@@ -331,6 +371,7 @@ class _SectionParser {
     final blockStart = blocks.length;
     final name = _name(element);
     if (_skippedElements.contains(name)) return;
+    if (name != 'p') _paragraphListIndents.clear();
 
     final props = styles.cascadedProperties(element);
     if (_isPageBreak(props['page-break-before'] ?? props['break-before'])) {
@@ -351,11 +392,29 @@ class _SectionParser {
           headingLevel: level,
         );
       case 'p':
-        _pushTextBlock(
-          element,
-          TextBlockKind.paragraph,
-          _blockStyleFor(element),
-        );
+        var style = _blockStyleFor(element);
+        final hasMarker = _hasExplicitParagraphListMarker(element);
+        final markerlessNestedItem =
+            !hasMarker &&
+            style.indent < -0.5 &&
+            _paragraphListIndents.isNotEmpty &&
+            style.marginStart > _paragraphListIndents.first + 4;
+        if (hasMarker || markerlessNestedItem) {
+          final depth = _paragraphListDepth(style);
+          style = style.copyWith(indent: 0);
+          _pushTextBlock(
+            element,
+            TextBlockKind.listItem,
+            style,
+            listOrdinal: 1,
+            listDepth: depth,
+            listMarkerVisible: hasMarker,
+            stripAuthoredListMarker: hasMarker,
+          );
+        } else {
+          _paragraphListIndents.clear();
+          _pushTextBlock(element, TextBlockKind.paragraph, style);
+        }
       case 'blockquote':
         var style = _blockStyleFor(element);
         // The Reading IR currently flattens a quote's nested paragraphs into
@@ -519,6 +578,46 @@ class _SectionParser {
       _rememberElementSource(item, blockStart);
       ordinal += reversed ? -1 : 1;
     }
+  }
+
+  int _paragraphListDepth(BlockStyle style) {
+    const indentTolerance = 4.0;
+    final indent = style.marginStart;
+    if (_paragraphListIndents.isEmpty) {
+      _paragraphListIndents.add(indent);
+      return 0;
+    }
+
+    final previous = _paragraphListIndents.last;
+    if (indent > previous + indentTolerance) {
+      _paragraphListIndents.add(indent);
+    } else {
+      final knownLevel = _paragraphListIndents.lastIndexWhere(
+        (known) => (indent - known).abs() <= indentTolerance,
+      );
+      if (knownLevel >= 0) {
+        _paragraphListIndents.removeRange(
+          knownLevel + 1,
+          _paragraphListIndents.length,
+        );
+      } else {
+        final parent = _paragraphListIndents.lastIndexWhere(
+          (known) => known < indent,
+        );
+        if (parent >= 0) {
+          _paragraphListIndents.removeRange(
+            parent + 1,
+            _paragraphListIndents.length,
+          );
+          _paragraphListIndents.add(indent);
+        } else {
+          _paragraphListIndents
+            ..clear()
+            ..add(indent);
+        }
+      }
+    }
+    return _paragraphListIndents.length - 1;
   }
 
   void _emitListItem(
@@ -686,6 +785,11 @@ class _SectionParser {
     BlockStyle style, {
     int headingLevel = 0,
     bool preserveWhitespace = false,
+    bool listOrdered = false,
+    int listOrdinal = 0,
+    int listDepth = 0,
+    bool listMarkerVisible = true,
+    bool stripAuthoredListMarker = false,
   }) {
     final textStyle = _textStyleForBlock(
       element,
@@ -695,12 +799,19 @@ class _SectionParser {
     final collector = _InlineCollector(preserveWhitespace: preserveWhitespace);
     _collectInline(element, textStyle, null, collector);
     collector.finish();
+    if (stripAuthoredListMarker) {
+      _stripAuthoredListMarker(collector.content);
+    }
     if (collector.content.isNotEmpty) {
       _emitTextBlock(
         kind,
         style,
         collector.content,
         headingLevel: headingLevel,
+        listOrdered: listOrdered,
+        listOrdinal: listOrdinal,
+        listDepth: listDepth,
+        listMarkerVisible: listMarkerVisible,
       );
     }
     for (final image in _descendantImages(element)) {
@@ -716,6 +827,7 @@ class _SectionParser {
     bool listOrdered = false,
     int listOrdinal = 0,
     int listDepth = 0,
+    bool listMarkerVisible = true,
   }) {
     final nodeId = _allocateNode();
     // Source range spans the block's normalized plain text (UTF-16 units;
@@ -734,6 +846,7 @@ class _SectionParser {
         listOrdered: listOrdered,
         listOrdinal: listOrdinal,
         listDepth: listDepth,
+        listMarkerVisible: listMarkerVisible,
         inlines: inlines,
         style: style,
         source: _sourceFor(nodeId, textLength),

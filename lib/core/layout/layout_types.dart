@@ -54,7 +54,7 @@ class ReaderStyle {
   final TypesettingMode typesettingMode;
 
   const ReaderStyle({
-    this.baseFontSize = 18,
+    this.baseFontSize = 20,
     this.lineHeight = 1.5,
     this.marginTop = 24,
     this.marginBottom = 24,

@@ -146,6 +146,22 @@ void main() {
     expect(source.book.coverHref, 'OPS/images/cover2.png');
   });
 
+  test('reads the package rendition layout', () async {
+    final opf = _opf.replaceFirst(
+      '</metadata>',
+      '<meta property="rendition:layout">pre-paginated</meta></metadata>',
+    );
+    final archive = Archive()
+      ..addFile(ArchiveFile.string('META-INF/container.xml', _container))
+      ..addFile(ArchiveFile.string('OPS/content.opf', opf))
+      ..addFile(ArchiveFile.string('OPS/text/ch1.xhtml', _ch1));
+    final source = await EpubBookSource.fromBytes(
+      ZipEncoder().encodeBytes(archive),
+    );
+
+    expect(source.book.metadata.layout, RenditionLayout.prePaginated);
+  });
+
   test('TOC prefers the nav document and resolves spine indexes', () async {
     final source = await EpubBookSource.fromBytes(_buildEpub());
     final toc = source.book.toc;

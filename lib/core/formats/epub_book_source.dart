@@ -424,6 +424,7 @@ class _PackageModel {
     var title = '';
     final authors = <String>[];
     final languages = <String>[];
+    var layout = RenditionLayout.reflowable;
     String? coverMetaId;
     for (final child in package.childElements) {
       if (_localName(child) != 'metadata') continue;
@@ -440,6 +441,11 @@ class _PackageModel {
           case 'meta':
             if (_localAttr(field, 'name') == 'cover') {
               coverMetaId = _localAttr(field, 'content');
+            }
+            if ((_localAttr(field, 'property') ?? '').toLowerCase() ==
+                    'rendition:layout' &&
+                _normalizedText(field).toLowerCase() == 'pre-paginated') {
+              layout = RenditionLayout.prePaginated;
             }
         }
       }
@@ -507,6 +513,7 @@ class _PackageModel {
         title: title,
         authors: authors,
         languages: languages,
+        layout: layout,
       ),
       manifest: manifest,
       items: items,

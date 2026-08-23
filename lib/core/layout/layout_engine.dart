@@ -43,6 +43,8 @@ class LayoutEngine {
     ReaderStyle style, {
     ui.Image? Function(String href)? imageResolver,
     ui.Size? Function(String href)? imageSizeResolver,
+    String? coverHref,
+    RenditionLayout renditionLayout = RenditionLayout.reflowable,
   }) {
     if (section.blocks.isEmpty) return const [];
 
@@ -77,6 +79,9 @@ class LayoutEngine {
       bottom: contentBottom,
       left: contentLeft,
       width: contentWidth,
+      centerStandaloneImage:
+          renditionLayout == RenditionLayout.prePaginated ||
+          _isStandaloneCover(section, coverHref),
     );
 
     for (final block in section.blocks) {
@@ -177,6 +182,21 @@ class LayoutEngine {
     return pages;
   }
 
+  /// Matches torto desktop's cover-alignment boundary: page breaks are not
+  /// visible content, and an ordinary standalone illustration must remain in
+  /// normal document flow rather than being mistaken for a cover.
+  static bool _isStandaloneCover(Section section, String? coverHref) {
+    if (coverHref == null) return false;
+    final visibleBlocks = section.blocks
+        .where((block) => block is! PageBreakBlock)
+        .iterator;
+    if (!visibleBlocks.moveNext()) return false;
+    final first = visibleBlocks.current;
+    return first is ImageBlock &&
+        first.href == coverHref &&
+        !visibleBlocks.moveNext();
+  }
+
   /// Builds and lays out one paragraph for [block], or null when the block
   /// has no renderable text.
   _PreparedText? _prepareText(
@@ -206,7 +226,11 @@ class LayoutEngine {
       marginBefore = 0;
       marginAfter = baseSize * 0.5;
       marginStart = 0;
-      resolvedAlign = isQuote ? block.style.align : BlockAlign.start;
+      resolvedAlign = switch (block.kind) {
+        TextBlockKind.paragraph => BlockAlign.justify,
+        TextBlockKind.blockquote => block.style.align,
+        _ => BlockAlign.start,
+      };
       paragraphLineHeight = style.lineHeight;
       if (isHeading) {
         blockScale = _unifiedHeadingScale(block.headingLevel);
@@ -236,10 +260,11 @@ class LayoutEngine {
     var marker = '';
     var markerWidth = 0.0;
     if (isList) {
-      marker = block.listOrdered
-          ? '${block.listOrdinal}.'
-          : _bulletForDepth(block.listDepth);
-      markerWidth = baseSize * 1.35;
+      if (block.listMarkerVisible) {
+        marker = block.listOrdered
+            ? '${block.listOrdinal}.'
+            : _bulletForDepth(block.listDepth);
+      }
       final semanticIndent = baseSize * 1.5 * (block.listDepth + 1);
       marginStart = unified
           ? semanticIndent
@@ -362,12 +387,32 @@ class LayoutEngine {
       }
     }
 
+    ui.Paragraph? markerParagraph;
+    if (marker.isNotEmpty) {
+      final markerBuilder = ui.ParagraphBuilder(
+        ui.ParagraphStyle(
+          textAlign: ui.TextAlign.left,
+          textDirection: ui.TextDirection.ltr,
+          fontSize: baseSize,
+          height: paragraphLineHeight,
+        ),
+      )..pushStyle(ui.TextStyle(color: foreground, fontSize: baseSize));
+      markerBuilder.addText('$marker\u00a0');
+      markerBuilder.pop();
+      markerParagraph = markerBuilder.build();
+      markerParagraph.layout(const ui.ParagraphConstraints(width: 10000));
+      markerWidth = markerParagraph.maxIntrinsicWidth;
+      markerParagraph.layout(ui.ParagraphConstraints(width: markerWidth));
+    }
+
     final paragraph = builder.build();
-    final width = math.max(1.0, contentWidth - marginStart);
+    final textStart = marginStart + markerWidth;
+    final width = math.max(1.0, contentWidth - textStart);
     paragraph.layout(ui.ParagraphConstraints(width: width));
     final metrics = paragraph.computeLineMetrics();
     if (metrics.isEmpty) {
       paragraph.dispose();
+      markerParagraph?.dispose();
       return null;
     }
     final lineTops = <double>[];
@@ -377,34 +422,18 @@ class LayoutEngine {
       top += m.height;
     }
 
-    ui.Paragraph? markerParagraph;
-    if (marker.isNotEmpty) {
-      final markerBuilder = ui.ParagraphBuilder(
-        ui.ParagraphStyle(
-          textAlign: ui.TextAlign.right,
-          textDirection: ui.TextDirection.ltr,
-          fontSize: baseSize,
-          height: paragraphLineHeight,
-        ),
-      )..pushStyle(ui.TextStyle(color: foreground, fontSize: baseSize));
-      markerBuilder.addText(marker);
-      markerBuilder.pop();
-      markerParagraph = markerBuilder.build()
-        ..layout(ui.ParagraphConstraints(width: markerWidth));
-    }
-
     return _PreparedText(
       paragraph: paragraph,
       metrics: metrics,
       lineTops: lineTops,
-      x: contentLeft + marginStart,
+      x: contentLeft + textStart,
       width: width,
       marginBefore: marginBefore,
       marginAfter: marginAfter,
       syntheticPrefixLength: syntheticPrefixLength,
       marker: marker,
       markerParagraph: markerParagraph,
-      markerX: contentLeft + marginStart - markerWidth,
+      markerX: contentLeft + marginStart,
       markerWidth: markerWidth,
       textLength: block.plainText.length,
       source: block.source,
@@ -903,6 +932,7 @@ class _Paginator {
   final double bottom;
   final double left;
   final double width;
+  final bool centerStandaloneImage;
 
   double cursorY;
   bool hasContent = false;
@@ -919,6 +949,7 @@ class _Paginator {
     required this.bottom,
     required this.left,
     required this.width,
+    required this.centerStandaloneImage,
   }) : cursorY = top;
 
   double get remaining => bottom - cursorY;
@@ -1103,6 +1134,22 @@ class _Paginator {
   /// Commits the current page. Never emits an empty page.
   void advance() {
     if (items.isNotEmpty) {
+      if (centerStandaloneImage &&
+          items.length == 1 &&
+          items.single is ImagePlacement) {
+        final image = items.single as ImagePlacement;
+        final centeredTop =
+            top + math.max(0, (bottom - top - image.rect.height) / 2);
+        items[0] = ImagePlacement(
+          href: image.href,
+          rect: ui.Rect.fromLTWH(
+            image.rect.left,
+            centeredTop,
+            image.rect.width,
+            image.rect.height,
+          ),
+        );
+      }
       pages.add(items);
       items = [];
     }

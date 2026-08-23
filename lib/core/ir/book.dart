@@ -4,15 +4,21 @@ import 'block.dart';
 /// torto's webdav-sync-v1 book identity rule.
 typedef PublicationId = String;
 
+/// EPUB package-level rendition mode. Reflowable is the safe default for
+/// formats that do not declare fixed pagination.
+enum RenditionLayout { reflowable, prePaginated }
+
 class BookMetadata {
   final String title;
   final List<String> authors;
   final List<String> languages;
+  final RenditionLayout layout;
 
   const BookMetadata({
     this.title = '',
     this.authors = const [],
     this.languages = const [],
+    this.layout = RenditionLayout.reflowable,
   });
 
   /// First declared language, kept as a convenience for typography callers.
