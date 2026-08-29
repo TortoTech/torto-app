@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../../core/ir/style.dart' show LinkRole;
 import '../../core/layout/layout_types.dart';
 import '../../core/render/page_painter.dart';
+import 'footnote_sheet.dart';
 import 'reader_controller.dart';
 import 'reader_preferences_store.dart';
 import 'toc_drawer.dart';
@@ -181,25 +182,11 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
         ).showSnackBar(const SnackBar(content: Text('无法读取脚注内容')));
         return;
       }
-      await showModalBottomSheet<void>(
-        context: context,
-        backgroundColor: _background,
-        showDragHandle: true,
-        builder: (context) => SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(24, 4, 24, 28),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                SelectableText(
-                  note.text,
-                  style: const TextStyle(fontSize: 17, height: 1.55),
-                ),
-              ],
-            ),
-          ),
-        ),
+      await showReaderFootnoteSheet(
+        context,
+        text: note.text,
+        background: _background,
+        foreground: _foreground,
       );
       return;
     }

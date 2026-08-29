@@ -128,6 +128,7 @@ class ParagraphOptimizer {
   ParagraphPlan? plan({
     required String text,
     required List<MeasuredCluster> clusters,
+    required Set<int> legalBreaks,
     required double lineWidth,
     required double firstLineIndent,
     required double defaultEm,
@@ -193,8 +194,7 @@ class ParagraphOptimizer {
       final whitespace = source.runes.every(_isWhitespace);
       final breakableSpace = source.runes.every(_isBreakableSpace);
       final breakAfter =
-          index == clusters.length - 1 ||
-          _legalBreakAfter(text, clusters, index, last);
+          index == clusters.length - 1 || legalBreaks.contains(cluster.end);
       items.add(
         _Item(
           width: cluster.advance,
@@ -468,32 +468,6 @@ class ParagraphOptimizer {
     }
   }
 
-  bool _legalBreakAfter(
-    String text,
-    List<MeasuredCluster> clusters,
-    int index,
-    int currentLast,
-  ) {
-    final current = text.substring(clusters[index].start, clusters[index].end);
-    if (current.runes.every(_isBreakableSpace) || currentLast == 0x200b) {
-      return true;
-    }
-    if (currentLast == 0x00a0 || currentLast == 0x2060) return false;
-    if (index + 1 >= clusters.length) return true;
-    final nextText = text.substring(
-      clusters[index + 1].start,
-      clusters[index + 1].end,
-    );
-    final nextFirst = nextText.runes.first;
-    if (_isOpeningPunctuation(currentLast, true) ||
-        _isClosingPunctuation(nextFirst, true) ||
-        _isCombiningOrVariation(nextFirst)) {
-      return false;
-    }
-    if (_isCjkScript(currentLast) || _isCjkScript(nextFirst)) return true;
-    return const {0x2d, 0x2010, 0x2013, 0x2014}.contains(currentLast);
-  }
-
   (double, double) _punctuation(MeasuredCluster cluster, int first, int last) {
     final fullWidthQuote = cluster.advance >= cluster.em * 0.75;
     final leading = _isOpeningPunctuation(first, fullWidthQuote)
@@ -589,12 +563,6 @@ bool _isClosingPunctuation(int rune, bool fullWidthQuote) =>
     (fullWidthQuote && const {0x201d, 0x2019}.contains(rune));
 
 bool _isCenteredPunctuation(int rune) => const {0x00b7, 0x30fb}.contains(rune);
-
-bool _isCombiningOrVariation(int rune) =>
-    (rune >= 0x0300 && rune <= 0x036f) ||
-    (rune >= 0xfe00 && rune <= 0xfe0f) ||
-    (rune >= 0xe0100 && rune <= 0xe01ef) ||
-    rune == 0x200d;
 
 bool _supportedLtrProse(String text) => text.runes.every((rune) {
   if (const {0x0a, 0x0d, 0x09}.contains(rune)) return false;

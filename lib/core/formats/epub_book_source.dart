@@ -198,6 +198,10 @@ class EpubBookSource implements BookSource {
           hints: SectionParseHints(
             noteSection: _noteSectionIndexes.contains(index),
           ),
+          loadStylesheet: (href) {
+            final bytes = _readEntry(href);
+            return bytes == null ? null : decodeXmlBytes(bytes);
+          },
           isDecorativeSeparatorImage: (href) {
             final bytes = _readEntry(href);
             return bytes != null && isDecorativeSeparatorImage(bytes);

@@ -16,6 +16,7 @@ import 'package:flutter/foundation.dart';
 
 import '../ir/ir.dart';
 import '../linebreak/paragraph_optimizer.dart';
+import '../linebreak/unicode_line_breaker.dart';
 import 'layout_types.dart';
 
 /// Default heading size scales by level, applied only when the IR left every
@@ -31,6 +32,9 @@ const Map<int, double> _headingScales = {
 
 /// Tolerance for floating-point fit checks, logical px.
 const double _eps = 0.01;
+
+/// Desktop torto's minimum spacing around authored images in book mode.
+const double _imageBlockGap = 14.0;
 
 class LayoutEngine {
   const LayoutEngine();
@@ -52,6 +56,22 @@ class LayoutEngine {
     isQuote: isQuote,
     isDefinitionTerm: isDefinitionTerm,
   );
+
+  @visibleForTesting
+  static BlockAlign debugResolvedUnifiedAlignment(
+    TextBlock block, {
+    BlockAlign? override,
+  }) => _resolvedUnifiedAlignment(block, override: override);
+
+  @visibleForTesting
+  static int debugResolvedBookTextColor(
+    TextStyle runStyle, {
+    required int foreground,
+  }) => _resolvedRunColor(
+    runStyle: runStyle,
+    unified: false,
+    foreground: ui.Color(foreground),
+  ).toARGB32();
 
   /// Paginates [section] for [viewport] with [style]. Returns zero pages for
   /// a section with no placeable content (the caller handles that case).
@@ -355,21 +375,10 @@ class LayoutEngine {
       marginBefore = 0;
       marginAfter = baseSize * 0.5;
       marginStart = 0;
-      resolvedAlign =
-          unifiedAlignmentOverride ??
-          switch (block.kind) {
-            TextBlockKind.paragraph => BlockAlign.justify,
-            TextBlockKind.blockquote =>
-              block.style.authoredAlignment ??
-                  (block.style.align == BlockAlign.start
-                      ? BlockAlign.justify
-                      : block.style.align),
-            TextBlockKind.quoteAttribution => BlockAlign.end,
-            TextBlockKind.caption => BlockAlign.center,
-            TextBlockKind.listItem when _supportsSpaceJustification(block) =>
-              BlockAlign.justify,
-            _ => BlockAlign.start,
-          };
+      resolvedAlign = _resolvedUnifiedAlignment(
+        block,
+        override: unifiedAlignmentOverride,
+      );
       paragraphLineHeight = style.lineHeight;
       if (isHeading) {
         blockScale = _unifiedHeadingScale(block.headingLevel);
@@ -452,7 +461,8 @@ class LayoutEngine {
     final indentWidth = isList
         ? 0.0
         : switch ((unified, block.kind)) {
-            (true, TextBlockKind.paragraph) => baseSize * 2,
+            (true, TextBlockKind.paragraph) =>
+              baseSize * style.paragraphIndentEm,
             (true, TextBlockKind.blockquote) when block.style.indent > _eps =>
               baseSize * 2,
             _ => block.style.indent,
@@ -576,7 +586,8 @@ class LayoutEngine {
     List<int>? displayToSource;
     if (style.lineBreakStrategy == LineBreakStrategy.optimized &&
         metrics.length > 1 &&
-        ((block.kind == TextBlockKind.paragraph &&
+        (((block.kind == TextBlockKind.paragraph ||
+                    block.kind == TextBlockKind.blockquote) &&
                 resolvedAlign == BlockAlign.justify) ||
             (block.kind == TextBlockKind.caption &&
                 resolvedAlign == BlockAlign.start))) {
@@ -662,9 +673,11 @@ class LayoutEngine {
       isDefinitionTerm: isDefinitionTerm,
     );
     return ui.TextStyle(
-      color: !unified && runStyle.color != null
-          ? ui.Color(runStyle.color!)
-          : foreground,
+      color: _resolvedRunColor(
+        runStyle: runStyle,
+        unified: unified,
+        foreground: foreground,
+      ),
       fontWeight: emphasis.bold ? ui.FontWeight.bold : null,
       fontStyle: emphasis.italic ? ui.FontStyle.italic : null,
       decoration: _resolvedDecoration(
@@ -675,6 +688,18 @@ class LayoutEngine {
       fontFamily: fontFamily,
       letterSpacing: letterSpacing,
     );
+  }
+
+  static ui.Color _resolvedRunColor({
+    required TextStyle runStyle,
+    required bool unified,
+    required ui.Color foreground,
+  }) {
+    final authored = runStyle.color;
+    if (unified || authored == null || authored == 0xFF000000) {
+      return foreground;
+    }
+    return ui.Color(authored);
   }
 
   static ({bool bold, bool italic, bool underline, bool strikethrough})
@@ -742,6 +767,9 @@ class LayoutEngine {
     }
     final sourceText = text.toString();
     if (sourceText.isEmpty || slices.isEmpty) return null;
+    final legalBreaks = Icu4xLineBreaker.instance.breakOpportunities(
+      sourceText,
+    );
 
     final measureBuilder = ui.ParagraphBuilder(
       ui.ParagraphStyle(
@@ -772,7 +800,7 @@ class LayoutEngine {
     }
     final measurement = measureBuilder.build()
       ..layout(const ui.ParagraphConstraints(width: 1000000));
-    final ranges = _measurementRanges(sourceText, slices);
+    final ranges = _measurementRanges(sourceText, slices, legalBreaks);
     if (ranges == null) {
       measurement.dispose();
       return null;
@@ -819,6 +847,7 @@ class LayoutEngine {
     final plan = const ParagraphOptimizer().plan(
       text: sourceText,
       clusters: measured,
+      legalBreaks: legalBreaks,
       lineWidth: width,
       firstLineIndent: firstLineIndent,
       defaultEm: baseSize,
@@ -991,6 +1020,7 @@ class LayoutEngine {
   static List<_MeasurementRange>? _measurementRanges(
     String text,
     List<_SourceRunSlice> slices,
+    Set<int> legalBreaks,
   ) {
     final ranges = <_MeasurementRange>[];
     var offset = 0;
@@ -1020,7 +1050,9 @@ class LayoutEngine {
         groupedStart ??= offset;
       }
       offset = end;
-      if (offset == slices[sliceIndex].end) flushGroup();
+      if (legalBreaks.contains(offset) || offset == slices[sliceIndex].end) {
+        flushGroup();
+      }
     }
     flushGroup();
     return offset == text.length ? ranges : null;
@@ -1388,9 +1420,11 @@ class LayoutEngine {
           if (runStyle.baseline != TextBaselineShift.none) scale *= 0.7;
           builder.pushStyle(
             ui.TextStyle(
-              color: !unified && runStyle.color != null
-                  ? ui.Color(runStyle.color!)
-                  : foreground,
+              color: _resolvedRunColor(
+                runStyle: runStyle,
+                unified: unified,
+                foreground: foreground,
+              ),
               fontWeight: cell.header || runStyle.bold
                   ? ui.FontWeight.bold
                   : null,
@@ -1446,13 +1480,16 @@ class LayoutEngine {
     double sectionTextOffset,
   ) {
     final unified = style.typesettingMode == TypesettingMode.unified;
-    final horizontalPadding = unified ? style.baseFontSize * 2 : 0.0;
+    final horizontalPadding = unified
+        ? style.baseFontSize * style.paragraphIndentEm
+        : 0.0;
     final quoteLeft = contentLeft + horizontalPadding;
     final quoteWidth = math.max(40.0, contentWidth - horizontalPadding * 2);
     final prepared = <_PreparedText>[];
     var offset = sectionTextOffset;
-    for (final body in quote.body) {
-      final value = _prepareText(
+    for (var index = 0; index < quote.body.length; index++) {
+      final body = quote.body[index];
+      var value = _prepareText(
         body,
         style,
         spineIndex,
@@ -1460,6 +1497,12 @@ class LayoutEngine {
         quoteWidth,
         offset,
       );
+      if (value != null &&
+          unified &&
+          quote.attribution == null &&
+          index + 1 == quote.body.length) {
+        value = value.copyWith(marginAfter: 0);
+      }
       if (value != null) prepared.add(value);
       offset += body.plainText.length;
     }
@@ -1522,7 +1565,16 @@ class LayoutEngine {
       prepared.href,
       prepared.width,
       prepared.height,
-      gap: block.fixedPage ? 0 : style.baseFontSize * 0.5,
+      marginBefore: block.fixedPage
+          ? 0
+          : style.typesettingMode == TypesettingMode.unified
+          ? style.baseFontSize
+          : math.max(_imageBlockGap, block.style.marginBefore),
+      marginAfter: block.fixedPage
+          ? 0
+          : style.typesettingMode == TypesettingMode.unified
+          ? style.baseFontSize
+          : math.max(_imageBlockGap, block.style.marginAfter),
       centerVertically: prepared.centerVertically,
       fillViewportWidth: prepared.fillViewportWidth,
     );
@@ -1640,11 +1692,21 @@ class LayoutEngine {
     }
 
     final em = style.baseFontSize;
+    final authoredImageGap = figure.images.fold<double>(
+      0,
+      (gap, image) => math.max(
+        gap,
+        math.max(image.style.marginBefore, image.style.marginAfter),
+      ),
+    );
     final outerGap = unified
         ? em
         : math.max(
-            em * 0.5,
-            math.max(figure.style.marginBefore, figure.style.marginAfter),
+            _imageBlockGap,
+            math.max(
+              authoredImageGap,
+              math.max(figure.style.marginBefore, figure.style.marginAfter),
+            ),
           );
     final captionGap = unified ? em * 0.35 : 6.0;
     final imageHeight = images.fold(0.0, (sum, image) => sum + image.height);
@@ -1673,7 +1735,8 @@ class LayoutEngine {
           image.href,
           image.width,
           image.height,
-          gap: 0,
+          marginBefore: 0,
+          marginAfter: 0,
           centerVertically: image.centerVertically,
           fillViewportWidth: image.fillViewportWidth,
         );
@@ -1759,6 +1822,30 @@ class LayoutEngine {
     1 => '◦',
     _ => '▪',
   };
+
+  static BlockAlign _resolvedUnifiedAlignment(
+    TextBlock block, {
+    BlockAlign? override,
+  }) {
+    if (override != null) return override;
+    final prose =
+        block.kind == TextBlockKind.paragraph ||
+        block.kind == TextBlockKind.blockquote;
+    final authored = block.style.authoredAlignment;
+    if (prose && authored != null && authored != BlockAlign.start) {
+      return authored;
+    }
+    if (prose ||
+        block.kind == TextBlockKind.listItem &&
+            _supportsSpaceJustification(block)) {
+      return BlockAlign.justify;
+    }
+    return switch (block.kind) {
+      TextBlockKind.caption => BlockAlign.center,
+      TextBlockKind.quoteAttribution => BlockAlign.end,
+      _ => BlockAlign.start,
+    };
+  }
 
   static bool _supportsSpaceJustification(TextBlock block) {
     for (final inline in block.inlines) {
@@ -1943,6 +2030,28 @@ class _PreparedText {
     required this.links,
     required this.displayToSource,
   });
+
+  _PreparedText copyWith({double? marginAfter}) => _PreparedText(
+    paragraph: paragraph,
+    metrics: metrics,
+    lineTops: lineTops,
+    x: x,
+    width: width,
+    marginBefore: marginBefore,
+    marginAfter: marginAfter ?? this.marginAfter,
+    syntheticPrefixLength: syntheticPrefixLength,
+    marker: marker,
+    markerParagraph: markerParagraph,
+    markerX: markerX,
+    markerWidth: markerWidth,
+    textLength: textLength,
+    source: source,
+    nodeId: nodeId,
+    spineIndex: spineIndex,
+    sectionTextOffset: sectionTextOffset,
+    links: links,
+    displayToSource: displayToSource,
+  );
 }
 
 class _PreparedImage {
@@ -2146,11 +2255,12 @@ class _Paginator {
     String href,
     double width,
     double height, {
-    required double gap,
+    required double marginBefore,
+    required double marginAfter,
     bool centerVertically = false,
     bool fillViewportWidth = false,
   }) {
-    _collapseMargin(gap);
+    _collapseMargin(marginBefore);
     if (height > remaining + _eps && hasContent) advance();
     final x = fillViewportWidth ? 0.0 : left + (this.width - width) / 2;
     final y = centerVertically && !hasContent
@@ -2161,7 +2271,7 @@ class _Paginator {
     );
     hasContent = true;
     cursorY = y + height;
-    _setMarginAfter(gap);
+    _setMarginAfter(marginAfter);
   }
 
   /// Keeps a semantic media group together when it fits on a fresh page.

@@ -12,6 +12,7 @@ import 'dart:typed_data';
 
 import '../html_ir/html_ir_parser.dart';
 import '../html_ir/package_path.dart';
+import '../html_ir/tolerant_xml.dart';
 import '../ir/ir.dart';
 import 'toc_heading_promoter.dart';
 import 'image_dimensions.dart';
@@ -185,6 +186,10 @@ class DirectBookSource implements BookSource {
               '<html xmlns="http://www.w3.org/1999/xhtml">'
               '<head><title></title></head><body>$html</body></html>',
           basePath: 'Text',
+          loadStylesheet: (href) {
+            final resource = _resources[href];
+            return resource == null ? null : decodeXmlBytes(resource.bytes);
+          },
           isDecorativeSeparatorImage: (href) {
             final bytes = _resources[href]?.bytes;
             return bytes != null && isDecorativeSeparatorImage(bytes);

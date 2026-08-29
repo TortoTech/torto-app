@@ -59,6 +59,9 @@ class ReaderStyle {
   /// Unicode-aware whole-paragraph optimizer.
   final LineBreakStrategy lineBreakStrategy;
 
+  /// Publication-wide script hint used by automatic unified indentation.
+  final WritingSystem writingSystem;
+
   const ReaderStyle({
     this.baseFontSize = 20,
     this.lineHeight = 1.5,
@@ -70,7 +73,15 @@ class ReaderStyle {
     this.background = 0xFFFAF8F3,
     this.typesettingMode = TypesettingMode.unified,
     this.lineBreakStrategy = LineBreakStrategy.optimized,
+    this.writingSystem = WritingSystem.unknown,
   });
+
+  /// Matches torto desktop's automatic paragraph/quote indentation profile.
+  double get paragraphIndentEm => switch (writingSystem) {
+    WritingSystem.cjk => 2.0,
+    WritingSystem.latin => 1.5,
+    WritingSystem.other || WritingSystem.unknown => 2.0,
+  };
 
   ReaderStyle copyWith({
     double? baseFontSize,
@@ -83,6 +94,7 @@ class ReaderStyle {
     int? background,
     TypesettingMode? typesettingMode,
     LineBreakStrategy? lineBreakStrategy,
+    WritingSystem? writingSystem,
   }) => ReaderStyle(
     baseFontSize: baseFontSize ?? this.baseFontSize,
     lineHeight: lineHeight ?? this.lineHeight,
@@ -94,6 +106,7 @@ class ReaderStyle {
     background: background ?? this.background,
     typesettingMode: typesettingMode ?? this.typesettingMode,
     lineBreakStrategy: lineBreakStrategy ?? this.lineBreakStrategy,
+    writingSystem: writingSystem ?? this.writingSystem,
   );
 
   @override
@@ -108,7 +121,8 @@ class ReaderStyle {
       other.foreground == foreground &&
       other.background == background &&
       other.typesettingMode == typesettingMode &&
-      other.lineBreakStrategy == lineBreakStrategy;
+      other.lineBreakStrategy == lineBreakStrategy &&
+      other.writingSystem == writingSystem;
 
   @override
   int get hashCode => Object.hash(
@@ -122,6 +136,7 @@ class ReaderStyle {
     background,
     typesettingMode,
     lineBreakStrategy,
+    writingSystem,
   );
 }
 

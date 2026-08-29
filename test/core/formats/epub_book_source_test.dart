@@ -71,6 +71,7 @@ Uint8List _buildEpub({
   String navText = _nav,
   String chapter1Text = _ch1,
   String chapter2Text = _ch2,
+  String? stylesheetText,
 }) {
   final archive = Archive();
   void add(String name, String content) =>
@@ -87,6 +88,9 @@ Uint8List _buildEpub({
   ); // decoded name; OPF references ch%202.xhtml
   if (includeNav) add('OPS/nav.xhtml', navText);
   add('OPS/toc.ncx', _ncx);
+  if (stylesheetText != null) {
+    add('OPS/styles/book.css', stylesheetText);
+  }
   archive.addFile(
     ArchiveFile('OPS/images/cover.png', _coverBytes.length, _coverBytes),
   );
@@ -244,6 +248,33 @@ void main() {
       expect((blocks[2].inlines.single as TextRun).style.italic, isTrue);
     },
   );
+
+  test('loads external CSS alignment into authored block styles', () async {
+    const chapter = '''<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head>
+  <link rel="alternate stylesheet" href="../styles/book.css"/>
+</head><body>
+  <p class="centered">Centered paragraph</p>
+  <p class="right">Right paragraph</p>
+</body></html>''';
+    final source = await EpubBookSource.fromBytes(
+      _buildEpub(
+        chapter1Text: chapter,
+        stylesheetText: '''
+          .centered { text-align: center; }
+          .right { text-align: right; }
+        ''',
+      ),
+    );
+
+    final blocks = (await source.parseSection(
+      0,
+    )).blocks.whereType<TextBlock>().toList();
+    expect(blocks[0].style.align, BlockAlign.center);
+    expect(blocks[0].style.authoredAlignment, BlockAlign.center);
+    expect(blocks[1].style.align, BlockAlign.end);
+    expect(blocks[1].style.authoredAlignment, BlockAlign.end);
+  });
 
   test(
     'path-only TOC labels promote matching chapter-opening paragraphs',

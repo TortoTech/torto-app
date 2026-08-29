@@ -1,6 +1,7 @@
 import 'package:characters/characters.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:torto/core/linebreak/paragraph_optimizer.dart';
+import 'package:torto/core/linebreak/unicode_line_breaker.dart';
 
 List<MeasuredCluster> clustersFor(String text, {double width = 10}) {
   final clusters = <MeasuredCluster>[];
@@ -24,6 +25,7 @@ void main() {
     final plan = optimizer.plan(
       text: text,
       clusters: clusters,
+      legalBreaks: Icu4xLineBreaker.instance.breakOpportunities(text),
       lineWidth: 70,
       firstLineIndent: 20,
       defaultEm: 10,
@@ -49,6 +51,7 @@ void main() {
     final plan = optimizer.plan(
       text: text,
       clusters: clusters,
+      legalBreaks: Icu4xLineBreaker.instance.breakOpportunities(text),
       lineWidth: 120,
       firstLineIndent: 0,
       defaultEm: 10,
@@ -65,6 +68,7 @@ void main() {
       optimizer.plan(
         text: text,
         clusters: clustersFor(text),
+        legalBreaks: Icu4xLineBreaker.instance.breakOpportunities(text),
         lineWidth: 100,
         firstLineIndent: 0,
         defaultEm: 10,

@@ -83,6 +83,23 @@ void main() {
       expect(block.style.authoredAlignment, BlockAlign.end);
     });
 
+    test('preserves alignment from a sole block inline wrapper', () {
+      final section = parseSection(
+        '<p><span><span class="signature">Visual memo no. 100</span></span></p>'
+        '<p>Following prose</p>',
+        head: '''<style>
+          .signature { display: block; text-align: right; }
+        </style>''',
+      );
+
+      final signature = textBlock(section, 0);
+      final prose = textBlock(section, 1);
+      expect(signature.style.align, BlockAlign.end);
+      expect(signature.style.authoredAlignment, BlockAlign.end);
+      expect(prose.style.align, BlockAlign.start);
+      expect(prose.style.authoredAlignment, isNull);
+    });
+
     test('pre preserves whitespace and newlines', () {
       final section = parseSection('<pre>line1\n  line2</pre>');
       final block = textBlock(section, 0);
@@ -165,14 +182,118 @@ void main() {
 
     test('recognizes a structural quote and right-aligned attribution', () {
       final section = parseSection(
-        '<div><p style="margin-left:24px;font-style:italic">Quoted prose.</p>'
-        '<p style="text-align:right">— Author</p></div>',
+        '<div class="quote-card"><p class="quote-body">Quoted prose.</p>'
+        '<p class="quote-tail">— Author</p></div>',
+        head: '''<style>
+          .quote-card { padding: 5px; background-color: #eee; }
+          .quote-body { margin: 1em 2em; font-style: italic; }
+          .quote-tail { margin: 0 2em 2em 0; text-align: right; }
+        </style>''',
       );
 
       final quote = section.blocks.single as QuoteBlock;
       expect(quote.body.single.plainText, 'Quoted prose.');
       expect(quote.attribution?.plainText, '— Author');
       expect(quote.attribution?.kind, TextBlockKind.quoteAttribution);
+    });
+
+    test('groups sibling verse lines, stanza break, and attribution', () {
+      final section = parseSection(
+        '<p class="verse-line">Line one</p>'
+        '<p class="verse-line">Line two</p>'
+        '<p class="verse-line">Line three</p><br/>'
+        '<p class="verse-line">Line four</p>'
+        '<p class="verse-source">Poet</p>',
+        head: '''<style>
+          .verse-line {
+            font-style: italic; line-height: 130%; text-align: justify;
+            text-indent: 2em; margin: 4pt 2em;
+          }
+          .verse-source {
+            font-size: .83333em; line-height: 130%; text-align: right;
+            text-indent: 2em; margin: .8em 0 5pt;
+          }
+        </style>''',
+      );
+
+      final quote = section.blocks.single as QuoteBlock;
+      expect(quote.body.map((block) => block.plainText), [
+        'Line one',
+        'Line two',
+        'Line three',
+        'Line four',
+      ]);
+      expect(quote.body[2].style.hardBreakAfter, isTrue);
+      expect(quote.attribution?.plainText, 'Poet');
+    });
+
+    test('repeated inset prose without quote typography remains prose', () {
+      final section = parseSection(
+        '<p class="indented">First prose paragraph.</p>'
+        '<p class="indented">Second prose paragraph.</p>',
+        head: '<style>.indented { margin: 1em 2em; }</style>',
+      );
+
+      expect(section.blocks, hasLength(2));
+      expect(section.blocks.every((block) => block is TextBlock), isTrue);
+    });
+
+    test('quote-like class without quote layout remains prose', () {
+      final section = parseSection(
+        '<p class="quote-status">A normal status paragraph.</p>'
+        '<p class="quote-aside">A one-sided aside.</p>',
+        head: '''<style>
+          .quote-status { margin: 1em 0; text-indent: 0; }
+          .quote-aside { margin: 1em 0 1em 2em; }
+        </style>''',
+      );
+
+      expect(section.blocks, hasLength(2));
+      expect(section.blocks.every((block) => block is TextBlock), isTrue);
+    });
+
+    test('visually bounded card without role difference is not a quote', () {
+      final section = parseSection(
+        '<div class="card"><p>Ordinary card text.</p>'
+        '<p class="tail">Metadata</p></div>',
+        head: '''<style>
+          .card { padding: 5px; background-color: #eee; }
+          .tail { text-align: right; }
+        </style>''',
+      );
+
+      expect(section.blocks, hasLength(2));
+      expect(section.blocks.every((block) => block is TextBlock), isTrue);
+    });
+
+    test('finds sibling quotes inside a mixed-content container', () {
+      final section = parseSection(
+        '<div>Introduction '
+        '<p class="verse-line">First line</p>'
+        '<p class="verse-line">Second line</p>'
+        '<p class="verse-source">Source</p></div>',
+        head: '''<style>
+          .verse-line { margin: 4pt 2em; font-style: italic; }
+          .verse-source { margin: 4pt 0; font-size: .8em; text-align: right; }
+        </style>''',
+      );
+
+      expect(section.blocks, hasLength(2));
+      expect((section.blocks.first as TextBlock).plainText, 'Introduction');
+      final quote = section.blocks.last as QuoteBlock;
+      expect(quote.body, hasLength(2));
+      expect(quote.attribution?.plainText, 'Source');
+    });
+
+    test('semantic blockquote keeps direct cite as attribution', () {
+      final section = parseSection(
+        '<blockquote><p>Quoted text.</p><cite>Book title</cite></blockquote>',
+      );
+
+      final quote = section.blocks.single as QuoteBlock;
+      expect(quote.body.single.plainText, 'Quoted text.');
+      expect(quote.attribution?.plainText, 'Book title');
+      expect(quote.attribution?.style.align, BlockAlign.start);
     });
 
     test('groups multi-block implicit note definitions', () {
@@ -377,6 +498,32 @@ void main() {
       expect(spanning.rowSpan, 2);
       expect(spanning.authoredAlignment, BlockAlign.end);
       expect(table.rows[2].cells.single.plainText, 'c');
+    });
+
+    test('table cells retain nested and inherited authored alignment', () {
+      final section = parseSection(
+        '<table><tr>'
+        '<td><p class="left">Left paragraph</p></td>'
+        '<td class="right">Right cell</td>'
+        '<td>Default cell</td>'
+        '</tr></table>'
+        '<table class="centered"><tr><td>Inherited center</td></tr></table>',
+        head: '''<style>
+          .left { text-align: left; }
+          .right { text-align: right; }
+          .centered { text-align: center; }
+        </style>''',
+      );
+
+      final first = section.blocks[0] as TableBlock;
+      expect(first.rows.single.cells[0].authoredAlignment, BlockAlign.start);
+      expect(first.rows.single.cells[1].authoredAlignment, BlockAlign.end);
+      expect(first.rows.single.cells[2].authoredAlignment, isNull);
+      final inherited = section.blocks[1] as TableBlock;
+      expect(
+        inherited.rows.single.cells.single.authoredAlignment,
+        BlockAlign.center,
+      );
     });
 
     test('table cell paragraphs retain line boundaries', () {
@@ -588,6 +735,15 @@ void main() {
       expect(style.marginStart, 0);
     });
 
+    test('logical-axis margin and padding shorthands preserve start inset', () {
+      final section = parseSection(
+        '<div style="margin-inline: 10px 20px; padding-inline: 6px 8px">'
+        '<p>t</p></div>',
+      );
+
+      expect(textBlock(section, 0).style.marginStart, closeTo(16, 1e-9));
+    });
+
     test('font-size: px absolute vs 16px base; em multiplies', () {
       final section = parseSection(
         '<p style="font-size: 24px">a<span style="font-size: 2em">b</span></p>',
@@ -595,6 +751,18 @@ void main() {
       final runs = textBlock(section, 0).inlines.cast<TextRun>();
       expect(runs[0].style.sizeScale, closeTo(1.5, 1e-9));
       expect(runs[1].style.sizeScale, closeTo(3.0, 1e-9));
+    });
+
+    test('authored font size overrides semantic heading and small scales', () {
+      final section = parseSection(
+        '<h1 style="font-size: 2em">heading</h1>'
+        '<p><small style="font-size: 2em">small</small></p>',
+      );
+
+      final heading = textBlock(section, 0).inlines.single as TextRun;
+      final small = textBlock(section, 1).inlines.single as TextRun;
+      expect(heading.style.sizeScale, closeTo(2, 1e-9));
+      expect(small.style.sizeScale, closeTo(2, 1e-9));
     });
 
     test('font-weight/font-style/text-decoration/vertical-align via CSS', () {
@@ -658,6 +826,18 @@ void main() {
       final image = section.blocks.single as ImageBlock;
       expect((image.style.width! as ImageFraction).value, closeTo(0.8, 1e-9));
       expect((image.style.maxWidth! as ImagePixels).value, 420);
+    });
+
+    test('image and image-only container margins are preserved', () {
+      final section = parseSection(
+        '<div style="margin-top: 25px; margin-bottom: 10px">'
+        '<span><img src="a.png" style="margin: 5px 0 18px"/></span>'
+        '</div>',
+      );
+      final image = section.blocks.single as ImageBlock;
+
+      expect(image.style.marginBefore, closeTo(25, 1e-9));
+      expect(image.style.marginAfter, closeTo(18, 1e-9));
     });
 
     test('percent-encoded src is decoded for the canonical href', () {

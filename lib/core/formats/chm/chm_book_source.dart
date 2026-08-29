@@ -91,6 +91,10 @@ class ChmBookSource implements BookSource {
           href: item.href,
           xhtml: xhtml,
           basePath: packageDirname(item.href),
+          loadStylesheet: (href) {
+            final css = _resources[href.toLowerCase()];
+            return css == null ? null : decodeChmText(css.bytes);
+          },
           isDecorativeSeparatorImage: (href) {
             final bytes = _resources[href.toLowerCase()]?.bytes;
             return bytes != null && isDecorativeSeparatorImage(bytes);

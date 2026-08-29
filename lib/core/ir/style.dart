@@ -203,7 +203,19 @@ class ImageStyle {
   final ImageLength? maxWidth;
   final ImageLength? maxHeight;
 
-  const ImageStyle({this.width, this.height, this.maxWidth, this.maxHeight});
+  /// Block spacing before/after the image. Image-only containers can
+  /// contribute their authored margins here when the HTML boxes are flattened.
+  final double marginBefore;
+  final double marginAfter;
+
+  const ImageStyle({
+    this.width,
+    this.height,
+    this.maxWidth,
+    this.maxHeight,
+    this.marginBefore = 0,
+    this.marginAfter = 0,
+  });
 
   static const ImageStyle normal = ImageStyle();
 }

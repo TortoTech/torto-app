@@ -122,7 +122,7 @@ class PagePainter extends CustomPainter {
     // inner rules visibly darker than the table outline. Build the union of
     // all horizontal and vertical edges and submit it as one path instead.
     _paintTableGrid(canvas, tableCells, resolvedForeground.withAlpha(96));
-    _paintFootnoteIcons(canvas, page.items, resolvedForeground);
+    _paintFootnoteIcons(canvas, page.items, footnoteIconColor(background));
   }
 
   @override
@@ -131,6 +131,12 @@ class PagePainter extends CustomPainter {
       oldDelegate.background != background ||
       oldDelegate.foreground != foreground;
 }
+
+/// Matches torto desktop's semantic footnote-link blue in light and dark
+/// reader themes.
+Color footnoteIconColor(Color background) => background.computeLuminance() < 0.5
+    ? const Color(0xFF60A5FA)
+    : const Color(0xFF2563EB);
 
 void _paintFootnoteIcons(Canvas canvas, List<PageItem> items, Color color) {
   for (final item in items) {

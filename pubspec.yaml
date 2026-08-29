@@ -60,6 +60,10 @@ dependencies:
   # Unicode extended-grapheme traversal used to batch shape-safe measurement
   # ranges for the optimized paragraph breaker.
   characters: ^1.4.1
+  # Unicode UAX #14 line-break opportunities. This is the same ICU4X
+  # segmenter family used by the desktop renderer; Knuth-Plass selection
+  # remains implemented in Dart.
+  icu4x: ^2.3.1
 
 dev_dependencies:
   flutter_test:

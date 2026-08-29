@@ -20,7 +20,8 @@ class HtmlIrParser {
   /// Parses [xhtml] (one spine section). [href] is the section's
   /// root-relative package path; [basePath] its root-relative directory,
   /// used to resolve relative links and image sources. [spineIndex] is used
-  /// for source anchors.
+  /// for source anchors. [loadStylesheet] receives canonical root-relative
+  /// paths resolved from authored `<link rel="stylesheet">` elements.
   ///
   /// Never throws: unrecoverable markup yields a section with empty blocks.
   Section parse({
@@ -29,6 +30,7 @@ class HtmlIrParser {
     required String xhtml,
     required String basePath,
     SectionParseHints hints = const SectionParseHints(),
+    String? Function(String href)? loadStylesheet,
     bool Function(String href)? isDecorativeSeparatorImage,
   }) {
     try {
@@ -42,6 +44,7 @@ class HtmlIrParser {
         basePath,
         document,
         hints,
+        loadStylesheet,
         isDecorativeSeparatorImage,
       ).run();
     } catch (_) {
@@ -471,28 +474,6 @@ bool _isNoteSectionLabel(String value) {
   ).hasMatch(normalized);
 }
 
-bool _isQuoteAttribution(XmlElement element) {
-  final name = _name(element);
-  if (name == 'cite' || name == 'footer') return true;
-  final semantic = [
-    _attr(element, 'class'),
-    _attr(element, 'id'),
-    _attr(element, 'role'),
-  ].whereType<String>().join(' ').toLowerCase();
-  return RegExp(
-    r'(^|[\s_-])(attribution|credit|source|signature)([\s_-]|$)',
-  ).hasMatch(semantic);
-}
-
-bool _looksLikeAttribution(String text) {
-  final trimmed = text.trim();
-  return trimmed.length <= 80 &&
-      (trimmed.startsWith('—') ||
-          trimmed.startsWith('–') ||
-          trimmed.startsWith('―') ||
-          trimmed.startsWith('--'));
-}
-
 TextBlock _copyTextBlock(
   TextBlock block, {
   TextBlockKind? kind,
@@ -561,12 +542,42 @@ SourceRange? _combinedBlockSource(List<Block> blocks) {
   return SourceRange(start: values.first.start, end: values.last.end);
 }
 
+class _QuoteLayoutMetrics {
+  const _QuoteLayoutMetrics({
+    required this.start,
+    required this.end,
+    required this.before,
+    required this.after,
+  });
+
+  final double start;
+  final double end;
+  final double before;
+  final double after;
+
+  bool get hasSymmetricInset {
+    const minimumHorizontalInset = 4.0;
+    final symmetryTolerance = math.max(4.0, math.max(start, end) * 0.25);
+    return start >= minimumHorizontalInset &&
+        end >= minimumHorizontalInset &&
+        (start - end).abs() <= symmetryTolerance;
+  }
+
+  bool compatibleWith(_QuoteLayoutMetrics other) {
+    final largestInset = [start, end, other.start, other.end].reduce(math.max);
+    final tolerance = math.max(4.0, largestInset * 0.25);
+    return (start - other.start).abs() <= tolerance &&
+        (end - other.end).abs() <= tolerance;
+  }
+}
+
 class _SectionParser {
   final int spineIndex;
   final String href;
   final String baseDir;
   final XmlDocument document;
   final SectionParseHints hints;
+  final String? Function(String href)? loadStylesheet;
   final bool Function(String href)? isDecorativeSeparatorImage;
   final _StyleSheet styles = _StyleSheet();
   late final Map<XmlElement, LinkRole> _footnoteLinks;
@@ -583,20 +594,32 @@ class _SectionParser {
     this.baseDir,
     this.document,
     this.hints,
+    this.loadStylesheet,
     this.isDecorativeSeparatorImage,
   ) {
     _footnoteLinks = _classifyFootnoteLinks(document, href, baseDir);
     for (final element in document.descendants.whereType<XmlElement>()) {
-      if (_name(element) == 'style') {
-        styles.addCss(
-          element.descendants
-              .where((node) => node is XmlText || node is XmlCDATA)
-              .map(
-                (node) =>
-                    node is XmlText ? node.value : (node as XmlCDATA).value,
-              )
-              .join(),
-        );
+      switch (_name(element)) {
+        case 'style':
+          styles.addCss(
+            element.descendants
+                .where((node) => node is XmlText || node is XmlCDATA)
+                .map(
+                  (node) =>
+                      node is XmlText ? node.value : (node as XmlCDATA).value,
+                )
+                .join(),
+          );
+        case 'link':
+          final stylesheet = (_attr(element, 'rel') ?? '')
+              .split(RegExp(r'\s+'))
+              .any((token) => token.toLowerCase() == 'stylesheet');
+          final rawHref = _attr(element, 'href');
+          if (!stylesheet || rawHref == null || rawHref.trim().isEmpty) break;
+          final resolved = resolvePackageHref(baseDir, rawHref);
+          final (resourceHref, _) = splitPackageFragment(resolved);
+          final css = loadStylesheet?.call(resourceHref);
+          if (css != null) styles.addCss(css);
       }
     }
   }
@@ -807,54 +830,220 @@ class _SectionParser {
     }
   }
 
-  double _effectiveStart(BlockStyle style) =>
+  double _effectiveStartOffset(BlockStyle style) =>
       style.marginStart + style.marginStartFraction * 1000;
 
   bool _hasDistinctQuoteTypography(XmlElement element) {
-    final style = _textStyleForBlock(element, TextBlockKind.paragraph);
-    return style.italic || style.sizeScale != 1.0;
-  }
+    final properties = styles.cascadedProperties(element);
+    final parent = element.parentElement;
+    final parentProperties = parent == null
+        ? null
+        : styles.cascadedProperties(parent);
 
-  bool _quoteLayoutCandidate(XmlElement element) {
-    if (!_isQuoteTextCandidate(element)) return false;
-    final style = _blockStyleFor(element);
-    return _effectiveStart(style) >= 8 || _hasQuoteSemanticWord(element);
-  }
-
-  int _tryParseSiblingQuote(List<XmlElement> siblings, int start) {
-    if (start >= siblings.length || !_quoteLayoutCandidate(siblings[start])) {
-      return 0;
+    bool differsFromParent(String name) {
+      final value = properties[name]?.trim();
+      if (value == null ||
+          value.isEmpty ||
+          const {'inherit', 'initial', 'unset', 'normal'}.contains(value)) {
+        return false;
+      }
+      return parentProperties?[name]?.trim() != value;
     }
-    final first = siblings[start];
-    final firstStyle = _blockStyleFor(first);
-    if (firstStyle.align == BlockAlign.end) return 0;
-    final firstOffset = _effectiveStart(firstStyle);
-    final tag = _name(first);
+
+    final declaredAlignment = _blockAlign(
+      properties['text-align'] ?? _attr(element, 'align'),
+    );
+    return differsFromParent('font-family') ||
+        differsFromParent('font-style') ||
+        differsFromParent('font-weight') ||
+        declaredAlignment == BlockAlign.center;
+  }
+
+  _QuoteLayoutMetrics _quoteLayoutMetrics(XmlElement element) {
+    const referenceWidth = 1000.0;
+    final properties = styles.cascadedProperties(element);
+
+    double horizontal(String logical, String physical) {
+      final length = _cssHorizontalLength(
+        properties[logical] ?? properties[physical],
+      );
+      if (length == null) return 0;
+      return length.$1 + length.$2 * referenceWidth;
+    }
+
+    double vertical(String logical, String physical) {
+      final length = _cssLength(properties[logical] ?? properties[physical]);
+      return length == null || !length.isFinite ? 0 : length;
+    }
+
+    return _QuoteLayoutMetrics(
+      start:
+          horizontal('margin-inline-start', 'margin-left') +
+          horizontal('padding-inline-start', 'padding-left'),
+      end:
+          horizontal('margin-inline-end', 'margin-right') +
+          horizontal('padding-inline-end', 'padding-right'),
+      before:
+          vertical('margin-block-start', 'margin-top') +
+          vertical('padding-block-start', 'padding-top'),
+      after:
+          vertical('margin-block-end', 'margin-bottom') +
+          vertical('padding-block-end', 'padding-bottom'),
+    );
+  }
+
+  _QuoteLayoutMetrics? _groupedQuoteBodyLayout(XmlElement element) {
+    const minimumVerticalSpacing = 0.5;
+    final layout = _quoteLayoutMetrics(element);
+    return layout.hasSymmetricInset &&
+            (layout.before > minimumVerticalSpacing ||
+                layout.after > minimumVerticalSpacing)
+        ? layout
+        : null;
+  }
+
+  bool _hasSiblingQuoteAttributionRole(
+    XmlElement element,
+    _QuoteLayoutMetrics bodyLayout,
+    TextStyle bodyTextStyle,
+  ) {
+    final attributionLayout = _quoteLayoutMetrics(element);
+    final attributionTextStyle = _textStyleForBlock(
+      element,
+      TextBlockKind.quoteAttribution,
+    );
+    return attributionTextStyle.sizeScale + 0.05 < bodyTextStyle.sizeScale ||
+        attributionTextStyle.italic != bodyTextStyle.italic ||
+        attributionLayout.start + 4 < bodyLayout.start ||
+        attributionLayout.end + 4 < bodyLayout.end;
+  }
+
+  bool _hasStandaloneQuoteLayout(XmlElement element) {
+    const minimumVerticalSpacing = 0.5;
+    final layout = _quoteLayoutMetrics(element);
+    return layout.hasSymmetricInset &&
+        layout.before > minimumVerticalSpacing &&
+        layout.after > minimumVerticalSpacing;
+  }
+
+  bool _hasVisualBoundary(XmlElement element) {
+    final properties = styles.cascadedProperties(element);
+
+    bool visiblePaint(String? value) {
+      final normalized = value?.trim() ?? '';
+      return normalized.isNotEmpty &&
+          !const {
+            'none',
+            'transparent',
+            'inherit',
+            'initial',
+            'unset',
+            '0',
+          }.contains(normalized);
+    }
+
+    if (const [
+      'background',
+      'background-color',
+      'border',
+      'border-left',
+      'border-right',
+    ].any((name) => visiblePaint(properties[name]))) {
+      return true;
+    }
+    return const [
+      'padding-left',
+      'padding-right',
+      'padding-top',
+      'padding-bottom',
+      'padding-inline-start',
+      'padding-inline-end',
+    ].any((name) => (_cssLength(properties[name]) ?? 0) > 0);
+  }
+
+  int _tryParseSiblingQuote(List<XmlNode> siblings, int start) {
+    const minimumAttributedBodyBlocks = 1;
+    const minimumUnattributedBodyBlocks = 2;
+
     final body = <XmlElement>[];
-    var hasDistinctTypography = false;
+    _QuoteLayoutMetrics? referenceLayout;
+    TextStyle? referenceTextStyle;
+    String? referenceTag;
+    final stanzaBreakAfter = <int>{};
+    int? pendingStanzaBreak;
+    var bodyHasDistinctTypography = false;
+    var lastBodyConsumed = 0;
     var index = start;
     while (index < siblings.length) {
-      final candidate = siblings[index];
+      final node = siblings[index];
+      if (node is XmlText) {
+        if (node.value.trim().isEmpty) {
+          index++;
+          continue;
+        }
+        break;
+      }
+      if (node is! XmlElement) {
+        index++;
+        continue;
+      }
+      if (_name(node) == 'br' && body.isNotEmpty) {
+        pendingStanzaBreak = body.length - 1;
+        index++;
+        continue;
+      }
+      final candidate = node;
       if (!_isQuoteTextCandidate(candidate)) break;
       final style = _blockStyleFor(candidate);
       if (style.align == BlockAlign.end) {
-        if (body.isEmpty) return 0;
-        _parseQuoteElements(body, candidate);
+        if (body.length < minimumAttributedBodyBlocks ||
+            referenceLayout == null ||
+            referenceTextStyle == null ||
+            !_hasSiblingQuoteAttributionRole(
+              candidate,
+              referenceLayout,
+              referenceTextStyle,
+            )) {
+          break;
+        }
+        if (pendingStanzaBreak case final pending?) {
+          stanzaBreakAfter.add(pending);
+        }
+        _parseQuoteElements(
+          body,
+          candidate,
+          stanzaBreakAfter: stanzaBreakAfter,
+        );
         return index - start + 1;
       }
-      if (_name(candidate) != tag ||
-          (_effectiveStart(style) - firstOffset).abs() > 4) {
+
+      final layout = _groupedQuoteBodyLayout(candidate);
+      if (layout == null) break;
+      final tag = _name(candidate);
+      if ((referenceTag != null && tag != referenceTag) ||
+          (referenceLayout != null &&
+              !layout.compatibleWith(referenceLayout))) {
         break;
       }
+      if (pendingStanzaBreak case final pending?) {
+        stanzaBreakAfter.add(pending);
+        pendingStanzaBreak = null;
+      }
+      referenceLayout ??= layout;
+      referenceTextStyle ??= _textStyleForBlock(
+        candidate,
+        TextBlockKind.paragraph,
+      );
+      referenceTag ??= tag;
       body.add(candidate);
-      hasDistinctTypography |=
-          _hasDistinctQuoteTypography(candidate) ||
-          _hasQuoteSemanticWord(candidate);
+      bodyHasDistinctTypography |= _hasDistinctQuoteTypography(candidate);
       index++;
+      lastBodyConsumed = index - start;
     }
-    if (body.length >= 2 && hasDistinctTypography) {
-      _parseQuoteElements(body, null);
-      return body.length;
+    if (body.length >= minimumUnattributedBodyBlocks &&
+        bodyHasDistinctTypography) {
+      _parseQuoteElements(body, null, stanzaBreakAfter: stanzaBreakAfter);
+      return lastBodyConsumed;
     }
     return 0;
   }
@@ -876,21 +1065,24 @@ class _SectionParser {
     )) {
       return false;
     }
-    final bodyHasRole = body.any(
-      (element) =>
-          _effectiveStart(_blockStyleFor(element)) >= 8 ||
-          _hasDistinctQuoteTypography(element) ||
-          _hasQuoteSemanticWord(element),
-    );
-    if (!bodyHasRole) return false;
+    final attributionStart = _effectiveStartOffset(_blockStyleFor(attribution));
+    final bodyHasRole = body.any((element) {
+      final style = _blockStyleFor(element);
+      final textStyle = _textStyleForBlock(element, TextBlockKind.paragraph);
+      return textStyle.italic ||
+          _effectiveStartOffset(style) > attributionStart + 4;
+    });
+    if (!bodyHasRole || !_hasVisualBoundary(container)) return false;
     _parseQuoteElements(body, attribution);
     return true;
   }
 
   void _parseQuoteElements(
     List<XmlElement> bodyElements,
-    XmlElement? attributionElement,
-  ) {
+    XmlElement? attributionElement, {
+    Set<int> stanzaBreakAfter = const {},
+    bool semanticBlockquote = false,
+  }) {
     final start = blocks.length;
     final previous = _insideQuote;
     _insideQuote = true;
@@ -910,25 +1102,37 @@ class _SectionParser {
       }
     }
     _insideQuote = previous;
-    final parsed = blocks.sublist(start).whereType<TextBlock>().toList();
+    final parsed = blocks.sublist(start);
     blocks.removeRange(start, blocks.length);
-    if (parsed.isEmpty) return;
     final body = parsed
+        .whereType<TextBlock>()
         .map(
           (block) => _copyTextBlock(
             block,
             kind: TextBlockKind.blockquote,
-            style: _defaultQuoteStyle(block.style),
+            style: semanticBlockquote
+                ? _defaultQuoteStyle(block.style)
+                : block.style,
           ),
         )
-        .toList(growable: false);
+        .toList();
+    final detached = parsed.where((block) => block is! TextBlock).toList();
+    if (body.isEmpty) {
+      blocks.addAll(detached);
+      return;
+    }
+    for (final index in stanzaBreakAfter) {
+      if (index < 0 || index >= body.length) continue;
+      final block = body[index];
+      body[index] = _copyTextBlock(
+        block,
+        style: block.style.copyWith(hardBreakAfter: true),
+      );
+    }
     final resolvedAttribution = attribution == null
         ? null
-        : _copyTextBlock(
-            attribution,
-            kind: TextBlockKind.quoteAttribution,
-            style: attribution.style.copyWith(align: BlockAlign.end),
-          );
+        : _copyTextBlock(attribution, kind: TextBlockKind.quoteAttribution);
+    blocks.addAll(detached);
     blocks.add(
       QuoteBlock(
         body: body,
@@ -980,7 +1184,7 @@ class _SectionParser {
         );
       case 'p':
         var style = _blockStyleFor(element);
-        if (_quoteLayoutCandidate(element) &&
+        if (_hasStandaloneQuoteLayout(element) &&
             (_hasQuoteSemanticWord(element) ||
                 _hasDistinctQuoteTypography(element))) {
           _parseQuoteElements([element], null);
@@ -1163,79 +1367,46 @@ class _SectionParser {
   }
 
   void _parseQuote(XmlElement quote) {
-    final start = blocks.length;
-    final previous = _insideQuote;
-    _insideQuote = true;
-    _parseContainer(quote, 0);
-    _insideQuote = previous;
-    final parsed = blocks.sublist(start);
-    blocks.removeRange(start, blocks.length);
-
-    final text = <TextBlock>[];
-    for (final candidate in parsed.whereType<TextBlock>()) {
-      final breakOnly =
-          candidate.inlines.isNotEmpty &&
-          candidate.inlines.every((inline) => inline is BreakInline);
-      if (breakOnly && text.isNotEmpty) {
-        final previous = text.removeLast();
-        text.add(
-          _copyTextBlock(
-            previous,
-            style: previous.style.copyWith(hardBreakAfter: true),
-          ),
-        );
-      } else {
-        text.add(candidate);
+    final children = <XmlElement>[];
+    final stanzaBreakAfter = <int>{};
+    for (final child in quote.childElements) {
+      if (_name(child) == 'br' && children.isNotEmpty) {
+        stanzaBreakAfter.add(children.length - 1);
+      } else if (_isQuoteTextCandidate(child) ||
+          const {'cite', 'footer'}.contains(_name(child))) {
+        children.add(child);
       }
     }
-    if (text.isEmpty) {
-      blocks.addAll(parsed);
+    if (children.isEmpty) {
+      final start = blocks.length;
+      final previous = _insideQuote;
+      _insideQuote = true;
+      _pushTextBlock(
+        quote,
+        TextBlockKind.blockquote,
+        _defaultQuoteStyle(_blockStyleFor(quote)),
+      );
+      _insideQuote = previous;
+      final parsed = blocks.sublist(start);
+      blocks.removeRange(start, blocks.length);
+      final body = parsed.whereType<TextBlock>().toList(growable: false);
+      blocks.addAll(parsed.where((block) => block is! TextBlock));
+      if (body.isNotEmpty) {
+        blocks.add(QuoteBlock(body: body, source: _combinedTextSource(body)));
+      }
       return;
     }
-    TextBlock? attribution;
-    XmlElement? attributionElement;
-    for (final candidate in quote.descendants.whereType<XmlElement>()) {
-      if (_isQuoteAttribution(candidate)) {
-        attributionElement = candidate;
-        break;
-      }
-    }
-    if (attributionElement != null) {
-      final marker = _nodeText(attributionElement);
-      final index = text.lastIndexWhere(
-        (block) => block.plainText.trim() == marker,
-      );
-      if (index >= 0) attribution = text.removeAt(index);
-    }
-    if (attribution == null &&
-        text.length > 1 &&
-        _looksLikeAttribution(text.last.plainText)) {
-      attribution = text.removeLast();
-    }
-    final body = text
-        .map(
-          (block) => _copyTextBlock(
-            block,
-            kind: TextBlockKind.blockquote,
-            style: _defaultQuoteStyle(block.style),
-          ),
-        )
-        .toList(growable: false);
-    final resolvedAttribution = attribution == null
-        ? null
-        : _copyTextBlock(
-            attribution,
-            kind: TextBlockKind.quoteAttribution,
-            style: attribution.style.copyWith(align: BlockAlign.end),
-          );
-    blocks.add(
-      QuoteBlock(
-        body: body,
-        attribution: resolvedAttribution,
-        source: _combinedTextSource([...body, ?resolvedAttribution]),
-      ),
+
+    final last = children.last;
+    final lastIsAttribution =
+        const {'cite', 'footer'}.contains(_name(last)) ||
+        (children.length > 1 && _blockStyleFor(last).align == BlockAlign.end);
+    _parseQuoteElements(
+      lastIsAttribution ? children.sublist(0, children.length - 1) : children,
+      lastIsAttribution ? last : null,
+      stanzaBreakAfter: stanzaBreakAfter,
+      semanticBlockquote: true,
     );
-    blocks.addAll(parsed.where((block) => block is! TextBlock));
   }
 
   void _parseDefinitionList(XmlElement list, int depth) {
@@ -1317,18 +1488,29 @@ class _SectionParser {
       collector = _InlineCollector(preserveWhitespace: false);
     }
 
-    for (final child in container.children) {
+    final children = container.children.toList();
+    var index = 0;
+    while (index < children.length) {
+      final child = children[index];
       if (child is XmlElement && _isBlockBoundary(_name(child))) {
         flush();
+        final quoteCount = _tryParseSiblingQuote(children, index);
+        if (quoteCount > 0) {
+          index += quoteCount;
+          continue;
+        }
         _parseNode(child, listDepth);
+        index++;
         continue;
       }
       if (child is XmlElement && _hasDescendantImage(child)) {
         flush();
         _pushTextBlock(child, TextBlockKind.paragraph, style);
+        index++;
         continue;
       }
       _collectInlineNode(child, textStyle, null, collector);
+      index++;
     }
     flush();
   }
@@ -1431,8 +1613,21 @@ class _SectionParser {
         listDepth: depth,
       );
     }
-    for (final image in _descendantImages(item, skipNestedLists: true)) {
-      _pushImage(image);
+    final images = _descendantImages(
+      item,
+      skipNestedLists: true,
+    ).toList(growable: false);
+    for (var index = 0; index < images.length; index++) {
+      _pushImage(
+        images[index],
+        containerMarginBefore: collector.content.isEmpty && index == 0
+            ? style.marginBefore
+            : null,
+        containerMarginAfter:
+            collector.content.isEmpty && index + 1 == images.length
+            ? style.marginAfter
+            : null,
+      );
     }
     for (final child in item.childElements) {
       if (_isStructuredContainer(_name(child))) {
@@ -1515,15 +1710,14 @@ class _SectionParser {
       (int.tryParse(raw ?? '') ?? 1).clamp(1, 64).toInt();
 
   BlockAlign? _tableCellAlignment(XmlElement cell) {
-    final value =
-        styles.cascadedProperties(cell)['text-align'] ?? _attr(cell, 'align');
-    return switch (value?.trim().toLowerCase()) {
-      'center' => BlockAlign.center,
-      'right' || 'end' => BlockAlign.end,
-      'justify' => BlockAlign.justify,
-      'left' || 'start' => BlockAlign.start,
-      _ => null,
-    };
+    final inherited = _inheritedTextAlignment(cell);
+    if (inherited != null) return inherited;
+    for (final descendant in cell.descendants.whereType<XmlElement>()) {
+      if (!_isBlockBoundary(_name(descendant))) continue;
+      final declared = _declaredTextAlignment(descendant);
+      if (declared != null) return declared;
+    }
+    return null;
   }
 
   static XmlElement? _nearestTableAncestor(XmlElement element) {
@@ -1614,6 +1808,13 @@ class _SectionParser {
     bool listMarkerVisible = true,
     bool stripAuthoredListMarker = false,
   }) {
+    final nestedAlignment = _soleContentBlockAlignment(element);
+    if (nestedAlignment != null) {
+      style = style.copyWith(
+        align: nestedAlignment,
+        authoredAlignment: nestedAlignment,
+      );
+    }
     final textStyle = _textStyleForBlock(
       element,
       kind,
@@ -1637,8 +1838,18 @@ class _SectionParser {
         listMarkerVisible: listMarkerVisible,
       );
     }
-    for (final image in _descendantImages(element)) {
-      _pushImage(image);
+    final images = _descendantImages(element).toList(growable: false);
+    for (var index = 0; index < images.length; index++) {
+      _pushImage(
+        images[index],
+        containerMarginBefore: collector.content.isEmpty && index == 0
+            ? style.marginBefore
+            : null,
+        containerMarginAfter:
+            collector.content.isEmpty && index + 1 == images.length
+            ? style.marginAfter
+            : null,
+      );
     }
   }
 
@@ -1784,8 +1995,16 @@ class _SectionParser {
     return false;
   }
 
-  void _pushImage(XmlElement element) {
-    final image = _imageBlockFor(element);
+  void _pushImage(
+    XmlElement element, {
+    double? containerMarginBefore,
+    double? containerMarginAfter,
+  }) {
+    final image = _imageBlockFor(
+      element,
+      containerMarginBefore: containerMarginBefore,
+      containerMarginAfter: containerMarginAfter,
+    );
     if (image == null) return;
     final alt = image.alt.trim().toLowerCase();
     final genericAlt =
@@ -1810,14 +2029,23 @@ class _SectionParser {
     }
   }
 
-  ImageBlock? _imageBlockFor(XmlElement element, {SourceRange? source}) {
+  ImageBlock? _imageBlockFor(
+    XmlElement element, {
+    SourceRange? source,
+    double? containerMarginBefore,
+    double? containerMarginAfter,
+  }) {
     final src = _attr(element, 'src') ?? _attr(element, 'href');
     if (src == null || src.trim().isEmpty) return null;
     final imageSource = source ?? _sourceFor(_allocateNode(), 0);
     return ImageBlock(
       href: resolvePackageHref(baseDir, src),
       alt: _attr(element, 'alt') ?? '',
-      style: _imageStyleFor(element),
+      style: _imageStyleFor(
+        element,
+        containerMarginBefore: containerMarginBefore,
+        containerMarginAfter: containerMarginAfter,
+      ),
       source: imageSource,
     );
   }
@@ -1913,7 +2141,11 @@ class _SectionParser {
     if (classes.any((value) => value == 'footnote' || value == 'footnote1')) {
       style = _copyTextStyle(style, inlineRole: InlineRole.footnote);
     }
-    style = _applyCssTextProperties(style, styles.cascadedProperties(node));
+    style = _applyCssTextProperties(
+      style,
+      styles.cascadedProperties(node),
+      inheritedSize: inherited.sizeScale,
+    );
 
     if (name == 'span' && classes.any((value) => value == 'math')) {
       final latex = node.descendants
@@ -1958,6 +2190,47 @@ class _SectionParser {
   }
 
   // ---------------------------------------------------------------- styles
+
+  BlockAlign? _declaredTextAlignment(XmlElement element) => _blockAlign(
+    styles.cascadedProperties(element)['text-align'] ?? _attr(element, 'align'),
+  );
+
+  BlockAlign? _inheritedTextAlignment(XmlElement element) {
+    BlockAlign? alignment;
+    for (final ancestor in _chain(element)) {
+      alignment = _declaredTextAlignment(ancestor) ?? alignment;
+    }
+    return alignment;
+  }
+
+  BlockAlign? _soleContentBlockAlignment(XmlElement element) {
+    var container = element;
+    while (true) {
+      XmlElement? soleElement;
+      for (final child in container.children) {
+        if ((child is XmlText && child.value.trim().isNotEmpty) ||
+            (child is XmlCDATA && child.value.trim().isNotEmpty)) {
+          return null;
+        }
+        if (child is XmlElement) {
+          if (soleElement != null) return null;
+          soleElement = child;
+        }
+      }
+      final child = soleElement;
+      if (child == null) return null;
+      final display = styles.cascadedProperties(child)['display'];
+      final establishesBlockBox = const {
+        'block',
+        'inline-block',
+        'flow-root',
+        'list-item',
+        'table-cell',
+      }.contains(display?.split(RegExp(r'\s+')).firstOrNull);
+      if (establishesBlockBox) return _inheritedTextAlignment(child);
+      container = child;
+    }
+  }
 
   /// Element chain from the document root down to (and including) [element].
   static List<XmlElement> _chain(XmlElement element) {
@@ -2044,12 +2317,14 @@ class _SectionParser {
   }) {
     var style = TextStyle.plain;
     for (final ancestor in _chain(element)) {
+      final inheritedSize = style.sizeScale;
       if (identical(ancestor, element)) {
         style = _applySemanticBlockStyle(style, kind, headingLevel);
       }
       style = _applyCssTextProperties(
         style,
         styles.cascadedProperties(ancestor),
+        inheritedSize: inheritedSize,
       );
     }
     return style;
@@ -2082,7 +2357,11 @@ class _SectionParser {
     }
   }
 
-  ImageStyle _imageStyleFor(XmlElement element) {
+  ImageStyle _imageStyleFor(
+    XmlElement element, {
+    double? containerMarginBefore,
+    double? containerMarginAfter,
+  }) {
     ImageLength? width = _imageLength(_attr(element, 'width'));
     ImageLength? height = _imageLength(_attr(element, 'height'));
     ImageLength? maxWidth;
@@ -2092,11 +2371,15 @@ class _SectionParser {
     height = _imageLength(props['height']) ?? height;
     maxWidth = _imageLength(props['max-width']);
     maxHeight = _imageLength(props['max-height']);
+    final authoredMarginBefore = _cssLength(props['margin-top']) ?? 0;
+    final authoredMarginAfter = _cssLength(props['margin-bottom']) ?? 0;
     return ImageStyle(
       width: width,
       height: height,
       maxWidth: maxWidth,
       maxHeight: maxHeight,
+      marginBefore: math.max(authoredMarginBefore, containerMarginBefore ?? 0),
+      marginAfter: math.max(authoredMarginAfter, containerMarginAfter ?? 0),
     );
   }
 
@@ -2135,11 +2418,18 @@ TextStyle _copyTextStyle(
 }
 
 /// Applies the supported inline CSS properties of one element onto [base].
-TextStyle _applyCssTextProperties(TextStyle base, Map<String, String> props) {
+TextStyle _applyCssTextProperties(
+  TextStyle base,
+  Map<String, String> props, {
+  double? inheritedSize,
+}) {
   var style = base;
   final fontSize = _cssScale(props['font-size']);
   if (fontSize != null) {
-    style = _copyTextStyle(style, sizeScale: style.sizeScale * fontSize);
+    style = _copyTextStyle(
+      style,
+      sizeScale: (inheritedSize ?? style.sizeScale) * fontSize,
+    );
   }
   final fontWeight = props['font-weight'];
   if (fontWeight != null) {
@@ -2484,12 +2774,32 @@ void _insertDeclarations(
       final sides = _boxSides(entry.value);
       if (sides != null) {
         props['margin-top'] = sides[0];
+        props['margin-right'] = sides[1];
         props['margin-bottom'] = sides[2];
         props['margin-left'] = sides[3];
       }
     } else if (entry.key == 'padding') {
       final sides = _boxSides(entry.value);
-      if (sides != null) props['padding-left'] = sides[3];
+      if (sides != null) {
+        props['padding-top'] = sides[0];
+        props['padding-right'] = sides[1];
+        props['padding-bottom'] = sides[2];
+        props['padding-left'] = sides[3];
+      }
+    } else if (const {
+      'margin-inline',
+      'padding-inline',
+      'margin-block',
+      'padding-block',
+    }.contains(entry.key)) {
+      final sides = _axisSides(entry.value);
+      if (sides != null) {
+        final separator = entry.key.indexOf('-');
+        final prefix = entry.key.substring(0, separator);
+        final axis = entry.key.substring(separator + 1);
+        props['$prefix-$axis-start'] = sides.$1;
+        props['$prefix-$axis-end'] = sides.$2;
+      }
     } else {
       props[entry.key] = entry.value;
     }
@@ -2507,6 +2817,18 @@ List<String>? _boxSides(String value) {
     2 => [values[0], values[1], values[0], values[1]],
     3 => [values[0], values[1], values[2], values[1]],
     4 => [values[0], values[1], values[2], values[3]],
+    _ => null,
+  };
+}
+
+(String, String)? _axisSides(String value) {
+  final values = value
+      .split(RegExp(r'\s+'))
+      .where((item) => item.isNotEmpty)
+      .toList(growable: false);
+  return switch (values) {
+    [final both] => (both, both),
+    [final start, final end] => (start, end),
     _ => null,
   };
 }

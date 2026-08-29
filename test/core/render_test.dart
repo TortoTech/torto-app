@@ -45,6 +45,11 @@ List<int> _pixel(Uint8List pixels, int width, int x, int y) {
 }
 
 void main() {
+  test('footnote icons use the desktop blue palette', () {
+    expect(footnoteIconColor(const Color(0xFFFAF8F3)), const Color(0xFF2563EB));
+    expect(footnoteIconColor(const Color(0xFF121212)), const Color(0xFF60A5FA));
+  });
+
   test('PagePainter paints a page onto a PictureRecorder without throwing', () {
     final pages = _pages();
     expect(pages, isNotEmpty);

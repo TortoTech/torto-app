@@ -216,6 +216,51 @@ void main() {
     _disposeAll(pages);
   });
 
+  test('book images preserve authored margins above the desktop minimum', () {
+    final pages = engine.paginate(
+      _section([
+        _para('Before', nodeId: 'before'),
+        const ImageBlock(
+          href: 'img/spaced.png',
+          style: ImageStyle(marginBefore: 30, marginAfter: 40),
+        ),
+        _para('After', nodeId: 'after'),
+      ]),
+      _viewport,
+      _style().copyWith(typesettingMode: TypesettingMode.book),
+      imageSizeResolver: (_) => const ui.Size(100, 50),
+    );
+    final items = pages.single.items;
+    final before = items.whereType<TextPlacement>().first;
+    final image = items.whereType<ImagePlacement>().single;
+    final after = items.whereType<TextPlacement>().last;
+
+    expect(image.rect.top - (before.y + before.sliceHeight), closeTo(30, _eps));
+    expect(after.y - image.rect.bottom, closeTo(40, _eps));
+    _disposeAll(pages);
+  });
+
+  test('book images use the desktop 14px minimum gap', () {
+    final pages = engine.paginate(
+      _section([
+        _para('Before', nodeId: 'before'),
+        const ImageBlock(href: 'img/default-gap.png'),
+        _para('After', nodeId: 'after'),
+      ]),
+      _viewport,
+      _style().copyWith(typesettingMode: TypesettingMode.book),
+      imageSizeResolver: (_) => const ui.Size(100, 50),
+    );
+    final items = pages.single.items;
+    final before = items.whereType<TextPlacement>().first;
+    final image = items.whereType<ImagePlacement>().single;
+    final after = items.whereType<TextPlacement>().last;
+
+    expect(image.rect.top - (before.y + before.sliceHeight), closeTo(14, _eps));
+    expect(after.y - image.rect.bottom, closeTo(14, _eps));
+    _disposeAll(pages);
+  });
+
   test('unified figure uses desktop caption scale, gap, and centering', () {
     final style = _style();
     final pages = engine.paginate(
@@ -452,6 +497,52 @@ void main() {
     _disposeAll(pages);
   });
 
+  test('book typesetting preserves alignment for every text block kind', () {
+    final bookStyle = _style().copyWith(typesettingMode: TypesettingMode.book);
+    for (final kind in TextBlockKind.values) {
+      final pages = engine.paginate(
+        _section([
+          _para(
+            'A',
+            kind: kind,
+            headingLevel: kind == TextBlockKind.heading ? 2 : 0,
+            style: const BlockStyle(
+              align: BlockAlign.end,
+              authoredAlignment: BlockAlign.end,
+            ),
+          ),
+        ]),
+        _viewport,
+        bookStyle,
+      );
+      final placement = pages.single.items.whereType<TextPlacement>().single;
+      final box = placement.paragraph.getBoxesForRange(0, 1).first;
+      expect(
+        box.left,
+        greaterThan(placement.width / 2),
+        reason: '$kind should preserve authored end alignment in book mode',
+      );
+      _disposeAll(pages);
+    }
+  });
+
+  test('book typesetting maps opaque black to the reader foreground', () {
+    expect(
+      LayoutEngine.debugResolvedBookTextColor(
+        const TextStyle(color: 0xFF000000),
+        foreground: 0xFFE8E1D5,
+      ),
+      0xFFE8E1D5,
+    );
+    expect(
+      LayoutEngine.debugResolvedBookTextColor(
+        const TextStyle(color: 0xFF123456),
+        foreground: 0xFFE8E1D5,
+      ),
+      0xFF123456,
+    );
+  });
+
   test('explicit run sizeScale suppresses heading default scale', () {
     final bookStyle = _style().copyWith(typesettingMode: TypesettingMode.book);
     final pages = engine.paginate(
@@ -578,7 +669,10 @@ void main() {
         _para(
           'quoted',
           kind: TextBlockKind.blockquote,
-          style: const BlockStyle(align: BlockAlign.end),
+          style: const BlockStyle(
+            align: BlockAlign.end,
+            authoredAlignment: BlockAlign.end,
+          ),
         ),
       ]),
       _viewport,
@@ -676,6 +770,31 @@ void main() {
     _disposeAll(pages);
   });
 
+  test(
+    'unified tables preserve authored alignment and center unspecified cells',
+    () {
+      final table = TableBlock(
+        rows: const [
+          TableRow([
+            TableCell(inlines: [TextRun('Same')]),
+            TableCell(
+              inlines: [TextRun('Same')],
+              authoredAlignment: BlockAlign.start,
+            ),
+          ]),
+        ],
+      );
+      final pages = engine.paginate(_section([table]), _viewport, _style());
+      final cells = pages.single.items.whereType<TableCellPlacement>().toList();
+      final centered = cells[0].paragraph.getBoxesForRange(0, 1).single;
+      final authoredStart = cells[1].paragraph.getBoxesForRange(0, 1).single;
+
+      expect(centered.left, greaterThan(0));
+      expect(authoredStart.left, closeTo(0, _eps));
+      _disposeAll(pages);
+    },
+  );
+
   test('unified typesetting overrides authored body size and line height', () {
     final section = _section([
       TextBlock(
@@ -741,6 +860,121 @@ void main() {
 
     expect(firstLine.width, closeTo(placement.width, _eps));
     _disposeAll(pages);
+  });
+
+  test('unified semantic block alignment matches desktop rules', () {
+    TextBlock block(
+      TextBlockKind kind, {
+      String text = 'Semantic content',
+      BlockAlign? authoredAlignment,
+    }) => _para(
+      text,
+      kind: kind,
+      style: BlockStyle(
+        align: authoredAlignment ?? BlockAlign.end,
+        authoredAlignment: authoredAlignment,
+      ),
+    );
+
+    for (final kind in [
+      TextBlockKind.heading,
+      TextBlockKind.preformatted,
+      TextBlockKind.footnoteDefinition,
+      TextBlockKind.definitionTerm,
+      TextBlockKind.definitionDescription,
+    ]) {
+      expect(
+        LayoutEngine.debugResolvedUnifiedAlignment(block(kind)),
+        BlockAlign.start,
+        reason: '$kind should use neutral start alignment',
+      );
+    }
+    expect(
+      LayoutEngine.debugResolvedUnifiedAlignment(block(TextBlockKind.caption)),
+      BlockAlign.center,
+    );
+    expect(
+      LayoutEngine.debugResolvedUnifiedAlignment(
+        block(TextBlockKind.quoteAttribution),
+      ),
+      BlockAlign.end,
+    );
+    expect(
+      LayoutEngine.debugResolvedUnifiedAlignment(
+        block(TextBlockKind.listItem, text: 'Latin list item'),
+      ),
+      BlockAlign.justify,
+    );
+    expect(
+      LayoutEngine.debugResolvedUnifiedAlignment(
+        block(TextBlockKind.listItem, text: '中文列表项'),
+      ),
+      BlockAlign.start,
+    );
+    expect(
+      LayoutEngine.debugResolvedUnifiedAlignment(
+        block(TextBlockKind.listItem, text: 'Non\u00a0breaking item'),
+      ),
+      BlockAlign.start,
+    );
+  });
+
+  test(
+    'unified prose ignores authored start and preserves special alignment',
+    () {
+      for (final kind in [TextBlockKind.paragraph, TextBlockKind.blockquote]) {
+        for (final (authored, expected) in [
+          (BlockAlign.start, BlockAlign.justify),
+          (BlockAlign.center, BlockAlign.center),
+          (BlockAlign.end, BlockAlign.end),
+          (BlockAlign.justify, BlockAlign.justify),
+        ]) {
+          final block = _para(
+            'Authored prose alignment',
+            kind: kind,
+            style: BlockStyle(align: authored, authoredAlignment: authored),
+          );
+          expect(
+            LayoutEngine.debugResolvedUnifiedAlignment(block),
+            expected,
+            reason: '$kind with $authored',
+          );
+        }
+
+        final parserDefault = _para(
+          'Parser default alignment',
+          kind: kind,
+          style: const BlockStyle(align: BlockAlign.end),
+        );
+        expect(
+          LayoutEngine.debugResolvedUnifiedAlignment(parserDefault),
+          BlockAlign.justify,
+        );
+      }
+    },
+  );
+
+  test('figure caption alignment override wins after multi-line detection', () {
+    final caption = _para(
+      'A caption',
+      kind: TextBlockKind.caption,
+      style: const BlockStyle(
+        align: BlockAlign.end,
+        authoredAlignment: BlockAlign.end,
+      ),
+    );
+
+    expect(
+      LayoutEngine.debugResolvedUnifiedAlignment(caption),
+      BlockAlign.center,
+    );
+    expect(
+      LayoutEngine.debugResolvedUnifiedAlignment(
+        caption,
+        override: BlockAlign.start,
+      ),
+      BlockAlign.start,
+    );
   });
 
   test('unified typesetting keeps headings start-aligned', () {
@@ -835,6 +1069,65 @@ void main() {
     expect(text, hasLength(2));
     expect(text.first.x, greaterThan(quote.x));
     expect(text.last.lineMetrics.first.left, greaterThan(0));
+    _disposeAll(pages);
+  });
+
+  test('unified quote padding follows the publication writing system', () {
+    final pages = engine.paginate(
+      _section([
+        QuoteBlock(
+          body: [_para('A Latin quotation.', kind: TextBlockKind.blockquote)],
+        ),
+      ]),
+      _viewport,
+      _style().copyWith(writingSystem: WritingSystem.latin),
+    );
+
+    final quote = pages.single.items.whereType<QuotePlacement>().single;
+    final text = pages.single.items.whereType<TextPlacement>().single;
+    expect(text.x - quote.x, closeTo(15, _eps));
+    expect(quote.x + quote.width - (text.x + text.width), closeTo(15, _eps));
+    _disposeAll(pages);
+  });
+
+  test('unified quote body preserves authored first-line indentation', () {
+    final pages = engine.paginate(
+      _section([
+        QuoteBlock(
+          body: [
+            _para(
+              _lorem(2),
+              kind: TextBlockKind.blockquote,
+              style: const BlockStyle(indent: 1),
+            ),
+          ],
+        ),
+      ]),
+      _viewport,
+      _style(),
+    );
+
+    final text = pages.single.items.whereType<TextPlacement>().single;
+    final firstTextBox = text.paragraph.getBoxesForRange(1, 2).single;
+    expect(firstTextBox.left, closeTo(20, _eps));
+    _disposeAll(pages);
+  });
+
+  test('unattributed unified quote has one bottom padding', () {
+    final pages = engine.paginate(
+      _section([
+        QuoteBlock(
+          body: [_para('A quotation.', kind: TextBlockKind.blockquote)],
+        ),
+      ]),
+      _viewport,
+      _style(),
+    );
+
+    final quote = pages.single.items.whereType<QuotePlacement>().single;
+    final text = pages.single.items.whereType<TextPlacement>().single;
+    final bottomPadding = quote.y + quote.height - (text.y + text.sliceHeight);
+    expect(bottomPadding, closeTo(12, _eps));
     _disposeAll(pages);
   });
 

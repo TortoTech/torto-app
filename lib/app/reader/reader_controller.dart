@@ -124,6 +124,7 @@ class ReaderController extends ChangeNotifier {
       );
     }
     _source = source;
+    _style = style.copyWith(writingSystem: _book.metadata.writingSystem);
     _derivedToc = const [];
     title = _book.metadata.title.isEmpty
         ? _fileTitle(file.path)
