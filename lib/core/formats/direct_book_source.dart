@@ -13,6 +13,8 @@ import 'dart:typed_data';
 import '../html_ir/html_ir_parser.dart';
 import '../html_ir/package_path.dart';
 import '../ir/ir.dart';
+import 'toc_heading_promoter.dart';
+import 'image_dimensions.dart';
 
 class SourceResource {
   /// Root-relative resource path (`Images/image-1.png`).
@@ -101,10 +103,16 @@ class DirectBookSource implements BookSource {
 
   final List<SourceSectionContent> _sections;
   final Map<String, SourceResource> _resources;
+  final Map<String, List<TocHeadingHint>> _tocHeadingHints;
 
   static const HtmlIrParser _parser = HtmlIrParser();
 
-  DirectBookSource._(this.book, this._sections, this._resources);
+  DirectBookSource._(
+    this.book,
+    this._sections,
+    this._resources,
+    this._tocHeadingHints,
+  );
 
   /// Builds the source. Throws [FormatException] when there is no readable
   /// section at all.
@@ -133,7 +141,7 @@ class DirectBookSource implements BookSource {
       }
     }
 
-    final toc = _promoteSingleTocRoot(
+    final toc = promoteSingleTocRoot(
       source.tableOfContents.isEmpty
           ? fallbackToc
           : [
@@ -156,6 +164,9 @@ class DirectBookSource implements BookSource {
       ),
       contents,
       resources,
+      source.metadata.layout == RenditionLayout.reflowable
+          ? collectTocHeadingHints(toc)
+          : const {},
     );
   }
 
@@ -166,13 +177,20 @@ class DirectBookSource implements BookSource {
     }
     final item = book.spine[index];
     return switch (_sections[index]) {
-      HtmlSectionContent(:final html) => _parser.parse(
-        spineIndex: index,
-        href: item.href,
-        xhtml:
-            '<html xmlns="http://www.w3.org/1999/xhtml">'
-            '<head><title></title></head><body>$html</body></html>',
-        basePath: 'Text',
+      HtmlSectionContent(:final html) => promoteTocHeadings(
+        _parser.parse(
+          spineIndex: index,
+          href: item.href,
+          xhtml:
+              '<html xmlns="http://www.w3.org/1999/xhtml">'
+              '<head><title></title></head><body>$html</body></html>',
+          basePath: 'Text',
+          isDecorativeSeparatorImage: (href) {
+            final bytes = _resources[href]?.bytes;
+            return bytes != null && isDecorativeSeparatorImage(bytes);
+          },
+        ),
+        _tocHeadingHints[item.href] ?? const [],
       ),
       ImageSectionContent(:final resourcePath, :final alt) => Section(
         spineIndex: index,
@@ -188,16 +206,6 @@ class DirectBookSource implements BookSource {
   Future<Uint8List?> resource(String href) async {
     final (path, _) = splitPackageFragment(href);
     return _resources[path]?.bytes;
-  }
-
-  /// Promotes the children of a single top-level TOC entry by one level
-  /// (port of torto's `promote_single_toc_root`): a sole parent adds no
-  /// distinction at the first navigation level.
-  static List<TocEntry> _promoteSingleTocRoot(List<TocEntry> entries) {
-    if (entries.length == 1 && entries.single.children.isNotEmpty) {
-      return entries.single.children;
-    }
-    return entries;
   }
 
   static TocEntry _toTocEntry(SourceTocEntry entry, List<SpineItem> spine) {

@@ -30,6 +30,8 @@ enum TypesettingMode {
   book,
 }
 
+enum LineBreakStrategy { greedy, optimized }
+
 class ReaderStyle {
   /// Base reading font size, logical px.
   final double baseFontSize;
@@ -53,6 +55,10 @@ class ReaderStyle {
   /// Whether semantic reader metrics override the publication's own layout.
   final TypesettingMode typesettingMode;
 
+  /// Paragraph breakpoint selection. Unified typesetting defaults to the
+  /// Unicode-aware whole-paragraph optimizer.
+  final LineBreakStrategy lineBreakStrategy;
+
   const ReaderStyle({
     this.baseFontSize = 20,
     this.lineHeight = 1.5,
@@ -63,6 +69,7 @@ class ReaderStyle {
     this.foreground = 0xFF000000,
     this.background = 0xFFFAF8F3,
     this.typesettingMode = TypesettingMode.unified,
+    this.lineBreakStrategy = LineBreakStrategy.optimized,
   });
 
   ReaderStyle copyWith({
@@ -75,6 +82,7 @@ class ReaderStyle {
     int? foreground,
     int? background,
     TypesettingMode? typesettingMode,
+    LineBreakStrategy? lineBreakStrategy,
   }) => ReaderStyle(
     baseFontSize: baseFontSize ?? this.baseFontSize,
     lineHeight: lineHeight ?? this.lineHeight,
@@ -85,6 +93,7 @@ class ReaderStyle {
     foreground: foreground ?? this.foreground,
     background: background ?? this.background,
     typesettingMode: typesettingMode ?? this.typesettingMode,
+    lineBreakStrategy: lineBreakStrategy ?? this.lineBreakStrategy,
   );
 
   @override
@@ -98,7 +107,8 @@ class ReaderStyle {
       other.marginRight == marginRight &&
       other.foreground == foreground &&
       other.background == background &&
-      other.typesettingMode == typesettingMode;
+      other.typesettingMode == typesettingMode &&
+      other.lineBreakStrategy == lineBreakStrategy;
 
   @override
   int get hashCode => Object.hash(
@@ -111,12 +121,34 @@ class ReaderStyle {
     foreground,
     background,
     typesettingMode,
+    lineBreakStrategy,
   );
 }
 
 /// Positioned page content.
 sealed class PageItem {
   const PageItem();
+}
+
+/// Unified-typesetting decoration for one page slice of a semantic quote.
+class QuotePlacement extends PageItem {
+  final double x;
+  final double y;
+  final double width;
+  double height;
+  final int color;
+  final bool continuedBefore;
+  bool continuedAfter;
+
+  QuotePlacement({
+    required this.x,
+    required this.y,
+    required this.width,
+    required this.height,
+    required this.color,
+    required this.continuedBefore,
+    this.continuedAfter = false,
+  });
 }
 
 /// A line slice of a shaped paragraph placed on a page.

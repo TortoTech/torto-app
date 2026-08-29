@@ -63,6 +63,64 @@ void main() {
     ]);
   });
 
+  test('CSTCloud maps object names and restores logical JSON names', () async {
+    final requests = <http.Request>[];
+    final client = WebDavClient(
+      baseUrl: 'https://data.cstcloud.cn/dav',
+      username: 'u',
+      password: 'p',
+      cstCloudCompatibility: true,
+      client: MockClient((request) async {
+        requests.add(request);
+        if (request.method == 'PROPFIND') {
+          return http.Response('''<d:multistatus xmlns:d="DAV:">
+              <d:response><d:href>/dav/Rebook/v1/library/devices/a.json.prop</d:href></d:response>
+            </d:multistatus>''', 207);
+        }
+        return http.Response('', 204);
+      }),
+    );
+
+    await client.putMutableJson('state/book/progress.json', {'version': 1});
+    expect(await client.listJsonFiles('library/devices/'), ['a.json']);
+    expect(
+      requests.first.url.path,
+      '/dav/Rebook/v1/state/book/progress.json.prop',
+    );
+    expect(requests.first.headers['user-agent'], 'Torto/0.1.0 Zotero/7.0');
+    expect(requests.first.headers, isNot(contains('if-match')));
+  });
+
+  test(
+    'CSTCloud immutable writes check existence then PUT unconditionally',
+    () async {
+      final requests = <http.Request>[];
+      final client = WebDavClient(
+        baseUrl: 'https://data.cstcloud.cn/dav',
+        username: 'u',
+        password: 'p',
+        cstCloudCompatibility: true,
+        client: MockClient((request) async {
+          requests.add(request);
+          return request.method == 'GET'
+              ? http.Response('', 404)
+              : http.Response('', 201);
+        }),
+      );
+
+      expect(
+        await client.putImmutableBytes('books/id/content.epub', [1, 2, 3]),
+        isTrue,
+      );
+      expect(requests.map((request) => request.method), ['GET', 'PUT']);
+      expect(
+        requests.map((request) => request.url.path),
+        everyElement('/dav/Rebook/v1/books/id/content.epub.zip'),
+      );
+      expect(requests.last.headers, isNot(contains('if-none-match')));
+    },
+  );
+
   test('rejects insecure non-local WebDAV endpoints', () {
     expect(
       () => WebDavClient(

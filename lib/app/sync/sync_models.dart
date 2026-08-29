@@ -8,6 +8,7 @@ const String syncProtocolName = 'rebook-webdav';
 enum CloudProvider {
   jianguoyun('Jianguoyun', 'https://dav.jianguoyun.com/dav'),
   infiniCloud('InfiniCloud', 'https://higa.teracloud.jp/dav'),
+  cstCloud('中国科技云', 'https://data.cstcloud.cn/dav'),
   koofr('Koofr', 'https://app.koofr.net/dav/Koofr'),
   hiDrive('HiDrive', 'https://webdav.hidrive.strato.com'),
   yandexDisk('Yandex Disk', 'https://webdav.yandex.com'),
@@ -38,6 +39,14 @@ class CloudSettings {
 
   String get effectiveBaseUrl =>
       provider == CloudProvider.custom ? baseUrl.trim() : provider.defaultUrl;
+
+  /// CSTCloud exposes a Zotero-oriented WebDAV surface: object names and
+  /// conditional-write behavior differ from a conventional WebDAV server.
+  bool get cstCloudCompatibility {
+    if (provider == CloudProvider.cstCloud) return true;
+    final uri = Uri.tryParse(effectiveBaseUrl);
+    return uri?.host.toLowerCase() == 'data.cstcloud.cn';
+  }
 
   CloudSettings copyWith({
     bool? enabled,

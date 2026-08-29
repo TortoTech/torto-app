@@ -19,6 +19,8 @@ import '../../html_ir/html_ir_parser.dart';
 import '../../html_ir/package_path.dart';
 import '../../ir/ir.dart';
 import '../cp1252.dart';
+import '../image_dimensions.dart';
+import '../toc_heading_promoter.dart';
 import 'chm_archive.dart';
 
 const int _maxTotalBytes = 512 * 1024 * 1024;
@@ -62,10 +64,11 @@ class ChmBookSource implements BookSource {
   @override
   final Book book;
   final Map<String, _StoredResource> _resources;
+  final Map<String, List<TocHeadingHint>> _tocHeadingHints;
 
   static const HtmlIrParser _parser = HtmlIrParser();
 
-  ChmBookSource._(this.book, this._resources);
+  ChmBookSource._(this.book, this._resources, this._tocHeadingHints);
 
   @override
   Future<Uint8List?> resource(String href) async {
@@ -82,11 +85,18 @@ class ChmBookSource implements BookSource {
     }
     try {
       final xhtml = htmlToXhtml(decodeChmText(stored.bytes));
-      return _parser.parse(
-        spineIndex: index,
-        href: item.href,
-        xhtml: xhtml,
-        basePath: packageDirname(item.href),
+      return promoteTocHeadings(
+        _parser.parse(
+          spineIndex: index,
+          href: item.href,
+          xhtml: xhtml,
+          basePath: packageDirname(item.href),
+          isDecorativeSeparatorImage: (href) {
+            final bytes = _resources[href.toLowerCase()]?.bytes;
+            return bytes != null && isDecorativeSeparatorImage(bytes);
+          },
+        ),
+        _tocHeadingHints[item.href] ?? const [],
       );
     } catch (_) {
       return Section(spineIndex: index, href: item.href, blocks: const []);
@@ -139,6 +149,13 @@ Future<ChmBookSource> openChm(Uint8List bytes, String fileName) async {
     throw const FormatException('CHM contains no HTML reading sections');
   }
 
+  final toc = navigation.authored
+      ? [
+          for (final entry in navigation.tableOfContents)
+            _toTocEntry(entry, sections),
+        ]
+      : fallbackToc;
+
   return ChmBookSource._(
     Book(
       id: sha256.convert(bytes).toString(),
@@ -148,15 +165,11 @@ Future<ChmBookSource> openChm(Uint8List bytes, String fileName) async {
         languages: const [],
       ),
       spine: sections,
-      toc: navigation.authored
-          ? [
-              for (final entry in navigation.tableOfContents)
-                _toTocEntry(entry, sections),
-            ]
-          : fallbackToc,
+      toc: toc,
       coverHref: metadata.cover?.path,
     ),
     resources,
+    collectTocHeadingHints(toc),
   );
 }
 

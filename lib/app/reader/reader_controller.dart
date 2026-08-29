@@ -767,7 +767,11 @@ SectionAnchor? _anchorByFragment(Section section, String fragment) {
 }
 
 String? _textForSourceNode(Section section, String nodeId) {
-  for (final block in section.blocks) {
+  return _textForSourceNodeInBlocks(section.blocks, nodeId);
+}
+
+String? _textForSourceNodeInBlocks(List<Block> blocks, String nodeId) {
+  for (final block in blocks) {
     switch (block) {
       case TextBlock():
         if (block.nodeId == nodeId) return _readableInlineText(block.inlines);
@@ -783,6 +787,15 @@ String? _textForSourceNode(Section section, String nodeId) {
             return _readableInlineText(caption.inlines);
           }
         }
+      case QuoteBlock(:final body, :final attribution):
+        final text = _textForSourceNodeInBlocks([
+          ...body,
+          ?attribution,
+        ], nodeId);
+        if (text != null) return text;
+      case NoteBlock(:final blocks):
+        final text = _textForSourceNodeInBlocks(blocks, nodeId);
+        if (text != null) return text;
       default:
         continue;
     }
@@ -798,6 +811,8 @@ String _readableInlineText(List<Inline> inlines) {
         if (style.linkRole != LinkRole.footnoteBacklink) buffer.write(text);
       case BreakInline():
         buffer.write('\n');
+      case MathInline(:final latex):
+        buffer.write(latex);
     }
   }
   return buffer.toString();

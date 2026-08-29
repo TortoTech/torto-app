@@ -101,6 +101,10 @@ enum BlockAlign { start, center, end, justify }
 class BlockStyle {
   final BlockAlign align;
 
+  /// Alignment explicitly authored by the publication. Null means [align]
+  /// only contains the parser/default value.
+  final BlockAlign? authoredAlignment;
+
   /// Space before / after the block, logical px.
   final double marginBefore;
   final double marginAfter;
@@ -108,38 +112,62 @@ class BlockStyle {
   /// Start-side (left in LTR) margin, logical px.
   final double marginStart;
 
+  /// Start-side margin represented as a fraction of the content width.
+  final double marginStartFraction;
+
   /// First-line indent, logical px.
   final double indent;
 
   /// Line height as a multiple of the font's natural line height.
   final double lineHeight;
 
+  /// Preserve one authored structural blank line after this block.
+  final bool hardBreakAfter;
+
+  /// Compact gap between semantic subparagraphs kept in one text block.
+  final double? subparagraphGapEm;
+
   const BlockStyle({
     this.align = BlockAlign.start,
+    this.authoredAlignment,
     this.marginBefore = 0,
     this.marginAfter = 0,
     this.marginStart = 0,
+    this.marginStartFraction = 0,
     this.indent = 0,
     this.lineHeight = 1.0,
+    this.hardBreakAfter = false,
+    this.subparagraphGapEm,
   });
 
   static const BlockStyle normal = BlockStyle();
 
   BlockStyle copyWith({
     BlockAlign? align,
+    BlockAlign? authoredAlignment,
+    bool clearAuthoredAlignment = false,
     double? marginBefore,
     double? marginAfter,
     double? marginStart,
+    double? marginStartFraction,
     double? indent,
     double? lineHeight,
+    bool? hardBreakAfter,
+    double? subparagraphGapEm,
   }) {
     return BlockStyle(
       align: align ?? this.align,
+      authoredAlignment: clearAuthoredAlignment
+          ? null
+          : (authoredAlignment ?? this.authoredAlignment),
       marginBefore: marginBefore ?? this.marginBefore,
       marginAfter: marginAfter ?? this.marginAfter,
       marginStart: marginStart ?? this.marginStart,
+      marginStartFraction: marginStartFraction ?? this.marginStartFraction,
       indent: indent ?? this.indent,
       lineHeight: lineHeight ?? this.lineHeight,
+      hardBreakAfter: hardBreakAfter ?? this.hardBreakAfter,
+      subparagraphGapEm: subparagraphGapEm ?? this.subparagraphGapEm,
     );
   }
 }

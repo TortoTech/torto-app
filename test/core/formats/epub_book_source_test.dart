@@ -65,7 +65,13 @@ const _ncx = '''<?xml version="1.0"?>
 
 final _coverBytes = Uint8List.fromList([0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4]);
 
-Uint8List _buildEpub({bool includeNav = true, bool includeContainer = true}) {
+Uint8List _buildEpub({
+  bool includeNav = true,
+  bool includeContainer = true,
+  String navText = _nav,
+  String chapter1Text = _ch1,
+  String chapter2Text = _ch2,
+}) {
   final archive = Archive();
   void add(String name, String content) =>
       archive.addFile(ArchiveFile.string(name, content));
@@ -74,9 +80,12 @@ Uint8List _buildEpub({bool includeNav = true, bool includeContainer = true}) {
   );
   if (includeContainer) add('META-INF/container.xml', _container);
   add('OPS/content.opf', _opf);
-  add('OPS/text/ch1.xhtml', _ch1);
-  add('OPS/text/ch 2.xhtml', _ch2); // decoded name; OPF references ch%202.xhtml
-  if (includeNav) add('OPS/nav.xhtml', _nav);
+  add('OPS/text/ch1.xhtml', chapter1Text);
+  add(
+    'OPS/text/ch 2.xhtml',
+    chapter2Text,
+  ); // decoded name; OPF references ch%202.xhtml
+  if (includeNav) add('OPS/nav.xhtml', navText);
   add('OPS/toc.ncx', _ncx);
   archive.addFile(
     ArchiveFile('OPS/images/cover.png', _coverBytes.length, _coverBytes),
@@ -188,6 +197,76 @@ void main() {
     expect(toc[1].href, 'OPS/text/ch 2.xhtml#frag');
     expect(toc[1].spineIndex, 1);
   });
+
+  test('TOC note labels supply publication-level section semantics', () async {
+    final notesNav = _nav.replaceFirst('Chapter 2', 'Notes');
+    final source = await EpubBookSource.fromBytes(
+      _buildEpub(navText: notesNav),
+    );
+
+    final section = await source.parseSection(1);
+    final note = section.blocks.single as NoteBlock;
+    expect(note.kind, NoteBlockKind.section);
+    expect((note.blocks.single as TextBlock).plainText, 'Second chapter.');
+  });
+
+  test(
+    'TOC targets promote exact paragraphs and preserve native headings',
+    () async {
+      const nav = '''<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body><nav epub:type="toc"><ol>
+  <li><a href="text/ch1.xhtml#alignment"> Alignment </a><ol>
+    <li><a href="text/ch1.xhtml#hierarchy">Hierarchy</a></li>
+  </ol></li>
+  <li><a href="text/ch1.xhtml#native">Native heading</a></li>
+  <li><a href="text/ch%202.xhtml">Chapter 2</a></li>
+</ol></nav></body></html>''';
+      const chapter = '''<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+  <p id="alignment" style="text-align:center">ALIGNMENT</p>
+  <p id="hierarchy">Hierarchy in practice</p>
+  <h3 id="native"><em>Native heading</em></h3>
+</body></html>''';
+      final source = await EpubBookSource.fromBytes(
+        _buildEpub(navText: nav, chapter1Text: chapter),
+      );
+
+      final blocks = (await source.parseSection(
+        0,
+      )).blocks.whereType<TextBlock>().toList();
+      expect(blocks[0].kind, TextBlockKind.heading);
+      expect(blocks[0].headingLevel, 1);
+      expect(blocks[0].style.align, BlockAlign.center);
+      expect(blocks[1].kind, TextBlockKind.paragraph);
+      expect(blocks[2].kind, TextBlockKind.heading);
+      expect(blocks[2].headingLevel, 3);
+      expect((blocks[2].inlines.single as TextRun).style.italic, isTrue);
+    },
+  );
+
+  test(
+    'path-only TOC labels promote matching chapter-opening paragraphs',
+    () async {
+      const nav = '''<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body><nav epub:type="toc"><ol>
+  <li><a href="text/ch1.xhtml">Introduction</a></li>
+  <li><a href="text/ch%202.xhtml">Chapter 2</a></li>
+</ol></nav></body></html>''';
+      const chapter = '''<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+  <p>Introduction</p><p>Opening prose.</p>
+</body></html>''';
+      final source = await EpubBookSource.fromBytes(
+        _buildEpub(navText: nav, chapter1Text: chapter),
+      );
+
+      final heading = (await source.parseSection(0)).blocks.first as TextBlock;
+      expect(heading.kind, TextBlockKind.heading);
+      expect(heading.headingLevel, 1);
+    },
+  );
 
   test('parseSection parses and caches; missing section degrades', () async {
     final source = await EpubBookSource.fromBytes(_buildEpub());

@@ -30,12 +30,16 @@ class WebDavClient {
   final Uri root;
   final String username;
   final String password;
+  final bool cstCloudCompatibility;
+  final String userAgent;
   final http.Client _client;
 
   WebDavClient({
     required String baseUrl,
     required this.username,
     required this.password,
+    this.cstCloudCompatibility = false,
+    this.userAgent = 'Torto/0.1.0 Zotero/7.0',
     http.Client? client,
   }) : root = _protocolRoot(baseUrl),
        _client = client ?? http.Client();
@@ -62,11 +66,22 @@ class WebDavClient {
     return base.replace(pathSegments: [...segments, '']);
   }
 
-  Uri _uri(String path) => root.resolve(path);
+  Uri _uri(String path) => root.resolve(_physicalPath(path));
 
-  Map<String, String> get _authorization => {
+  String _physicalPath(String logicalPath) {
+    if (!cstCloudCompatibility || logicalPath.endsWith('/')) {
+      return logicalPath;
+    }
+    final lower = logicalPath.toLowerCase();
+    if (lower.endsWith('.json')) return '$logicalPath.prop';
+    if (lower.endsWith('.zip') || lower.endsWith('.prop')) return logicalPath;
+    return '$logicalPath.zip';
+  }
+
+  Map<String, String> get _baseHeaders => {
     HttpHeaders.authorizationHeader:
         'Basic ${base64Encode(utf8.encode('$username:$password'))}',
+    if (cstCloudCompatibility) HttpHeaders.userAgentHeader: userAgent,
   };
 
   Future<void> ensureLayout() async {
@@ -144,11 +159,12 @@ class WebDavClient {
     List<int> bytes, {
     String contentType = 'application/octet-stream',
   }) async {
+    if (cstCloudCompatibility && await _exists(path)) return false;
     final response = await _send(
       'PUT',
       path,
       headers: {
-        HttpHeaders.ifNoneMatchHeader: '*',
+        if (!cstCloudCompatibility) HttpHeaders.ifNoneMatchHeader: '*',
         HttpHeaders.contentTypeHeader: contentType,
       },
       body: bytes,
@@ -161,10 +177,11 @@ class WebDavClient {
   }
 
   Future<bool> putImmutableFile(String path, File file) async {
+    if (cstCloudCompatibility && await _exists(path)) return false;
     final request = http.StreamedRequest('PUT', _uri(path));
     request.headers.addAll({
-      ..._authorization,
-      HttpHeaders.ifNoneMatchHeader: '*',
+      ..._baseHeaders,
+      if (!cstCloudCompatibility) HttpHeaders.ifNoneMatchHeader: '*',
       HttpHeaders.contentTypeHeader: 'application/octet-stream',
     });
     request.contentLength = await file.length();
@@ -221,7 +238,12 @@ class WebDavClient {
           .toList();
       if (segments == null || segments.isEmpty) continue;
       final name = Uri.decodeComponent(segments.last);
-      if (name.toLowerCase().endsWith('.json')) names.add(name);
+      final lower = name.toLowerCase();
+      if (lower.endsWith('.json')) {
+        names.add(name);
+      } else if (cstCloudCompatibility && lower.endsWith('.json.prop')) {
+        names.add(name.substring(0, name.length - '.prop'.length));
+      }
     }
     return names.toList()..sort();
   }
@@ -245,7 +267,7 @@ class WebDavClient {
     }
 
     final request = http.Request('GET', _uri(path));
-    request.headers.addAll(_authorization);
+    request.headers.addAll(_baseHeaders);
     if (offset > 0) request.headers[HttpHeaders.rangeHeader] = 'bytes=$offset-';
     request.followRedirects = false;
     final response = await _client.send(request).timeout(_timeout);
@@ -310,7 +332,7 @@ class WebDavClient {
     var uri = initialUri;
     for (var redirects = 0; redirects <= 5; redirects++) {
       final request = http.Request(method, uri)
-        ..headers.addAll(_authorization)
+        ..headers.addAll(_baseHeaders)
         ..headers.addAll(headers)
         ..followRedirects = false;
       if (body != null) request.bodyBytes = body;
@@ -330,6 +352,20 @@ class WebDavClient {
 
   static bool _sameOrigin(Uri a, Uri b) =>
       a.scheme == b.scheme && a.host == b.host && a.port == b.port;
+
+  Future<bool> _exists(String path) async {
+    final response = await _send(
+      'GET',
+      path,
+      headers: {HttpHeaders.rangeHeader: 'bytes=0-0'},
+    );
+    if (response.statusCode == 404) return false;
+    if (response.statusCode >= 200 && response.statusCode < 300) return true;
+    throw WebDavException(
+      'Could not check whether $path already exists.',
+      response.statusCode,
+    );
+  }
 
   static int? _contentRangeStart(String? value) {
     if (value == null || !value.startsWith('bytes ')) return null;

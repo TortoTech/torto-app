@@ -23,6 +23,8 @@ import '../html_ir/html_ir_parser.dart';
 import '../html_ir/package_path.dart';
 import '../html_ir/tolerant_xml.dart';
 import '../ir/ir.dart';
+import 'toc_heading_promoter.dart';
+import 'image_dimensions.dart';
 
 class _ManifestItem {
   final String id;
@@ -53,6 +55,8 @@ class EpubBookSource implements BookSource {
   final HtmlIrParser _parser = const HtmlIrParser();
   final Map<String, Uint8List?> _resourceCache = {};
   final Map<int, Section> _sectionCache = {};
+  Set<int> _noteSectionIndexes = const {};
+  Map<String, List<TocHeadingHint>> _tocHeadingHints = const {};
 
   EpubBookSource._();
 
@@ -107,8 +111,12 @@ class EpubBookSource implements BookSource {
         : sha256.convert(bytes).toString();
     final model = _PackageModel.parse(package, opfDir);
     final spine = model.buildSpine();
-    final toc = source._parseNavigation(model, spine);
+    final toc = promoteSingleTocRoot(source._parseNavigation(model, spine));
     final cover = model.coverHref;
+    source._noteSectionIndexes = _noteSectionsFromToc(toc);
+    if (model.metadata.layout == RenditionLayout.reflowable) {
+      source._tocHeadingHints = collectTocHeadingHints(toc);
+    }
 
     source._book = Book(
       id: id,
@@ -187,14 +195,49 @@ class EpubBookSource implements BookSource {
           href: item.href,
           xhtml: text,
           basePath: packageDirname(item.href),
+          hints: SectionParseHints(
+            noteSection: _noteSectionIndexes.contains(index),
+          ),
+          isDecorativeSeparatorImage: (href) {
+            final bytes = _readEntry(href);
+            return bytes != null && isDecorativeSeparatorImage(bytes);
+          },
         );
       }
+      section = promoteTocHeadings(
+        section,
+        _tocHeadingHints[item.href] ?? const [],
+      );
     } catch (_) {
       // A single bad section must not kill the book.
       section = Section(spineIndex: index, href: item.href, blocks: const []);
     }
     _sectionCache[index] = section;
     return section;
+  }
+
+  static Set<int> _noteSectionsFromToc(List<TocEntry> toc) {
+    final result = <int>{};
+
+    void visit(List<TocEntry> entries) {
+      for (final entry in entries) {
+        final label = entry.label
+            .trim()
+            .toLowerCase()
+            .replaceAll(RegExp(r'[\s\.,:;!?，。！？：；、·—_\-]+'), ' ')
+            .trim();
+        final isNotes = RegExp(
+          r'^(?:footnotes?|endnotes?|notes?|脚注|尾注|注释|注解)(?:\s+\d+)?$',
+        ).hasMatch(label);
+        if (isNotes && entry.spineIndex != null) {
+          result.add(entry.spineIndex!);
+        }
+        visit(entry.children);
+      }
+    }
+
+    visit(toc);
+    return Set.unmodifiable(result);
   }
 
   // ------------------------------------------------------------------- TOC

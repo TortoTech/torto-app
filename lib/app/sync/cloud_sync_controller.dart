@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 import '../library/library_store.dart';
 import '../progress_store.dart';
@@ -85,10 +86,13 @@ class CloudSyncController extends ChangeNotifier {
           password.isEmpty) {
         throw const WebDavException('Complete the cloud sync settings first.');
       }
+      final package = await PackageInfo.fromPlatform();
       client = WebDavClient(
         baseUrl: settings.effectiveBaseUrl,
         username: settings.username.trim(),
         password: password,
+        cstCloudCompatibility: settings.cstCloudCompatibility,
+        userAgent: 'Torto/${package.version} Zotero/7.0',
       );
       final report = await SyncEngine(
         libraryStore: libraryStore,

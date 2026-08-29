@@ -41,6 +41,25 @@ class PagePainter extends CustomPainter {
 
     for (final item in page.items) {
       switch (item) {
+        case QuotePlacement():
+          final color = Color(item.color).withAlpha(112);
+          final rect = ui.Rect.fromLTWH(
+            item.x,
+            item.y,
+            item.width,
+            item.height,
+          );
+          canvas.drawRRect(
+            ui.RRect.fromRectAndRadius(rect, const ui.Radius.circular(3)),
+            Paint()..color = color.withAlpha(8),
+          );
+          canvas.drawRRect(
+            ui.RRect.fromRectAndRadius(
+              ui.Rect.fromLTWH(rect.left, rect.top, 3, rect.height),
+              const ui.Radius.circular(1.5),
+            ),
+            Paint()..color = color,
+          );
         case TextPlacement():
           // Clip to the visible line slice, then draw the whole retained
           // paragraph offset so the slice lands at (x, y).

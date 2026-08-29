@@ -9,6 +9,23 @@ void main() {
     expect(settings.effectiveBaseUrl, 'https://higa.teracloud.jp/dav');
   });
 
+  test('CSTCloud preset and exact custom host enable compatibility', () {
+    const preset = CloudSettings(provider: CloudProvider.cstCloud);
+    const custom = CloudSettings(
+      provider: CloudProvider.custom,
+      baseUrl: 'https://data.cstcloud.cn/dav',
+    );
+    const lookalike = CloudSettings(
+      provider: CloudProvider.custom,
+      baseUrl: 'https://data.cstcloud.cn.example.test/dav',
+    );
+
+    expect(preset.effectiveBaseUrl, 'https://data.cstcloud.cn/dav');
+    expect(preset.cstCloudCompatibility, isTrue);
+    expect(custom.cstCloudCompatibility, isTrue);
+    expect(lookalike.cstCloudCompatibility, isFalse);
+  });
+
   test('cloud locator deliberately omits incompatible source anchors', () {
     const anchor = SourceAnchor(spine: 2, node: 'n4', textOffset: 7);
     const locator = LocatorV1(

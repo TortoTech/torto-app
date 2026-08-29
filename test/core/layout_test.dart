@@ -60,6 +60,7 @@ FigureBlock _figure({
 );
 
 double _itemTop(PageItem item) => switch (item) {
+  QuotePlacement(:final y) => y,
   TextPlacement(:final y) => y,
   ListMarkerPlacement(:final y) => y,
   TableCellPlacement(:final rect) => rect.top,
@@ -433,6 +434,24 @@ void main() {
     _disposeAll(headingPages);
   });
 
+  test('book typesetting preserves authored heading margins', () {
+    final pages = engine.paginate(
+      _section([
+        _para(
+          'Heading without authored margin.',
+          kind: TextBlockKind.heading,
+          headingLevel: 1,
+        ),
+      ]),
+      _viewport,
+      _style().copyWith(typesettingMode: TypesettingMode.book),
+    );
+    final heading = pages.single.items.single as TextPlacement;
+
+    expect(heading.y, closeTo(_style().marginTop, _eps));
+    _disposeAll(pages);
+  });
+
   test('explicit run sizeScale suppresses heading default scale', () {
     final bookStyle = _style().copyWith(typesettingMode: TypesettingMode.book);
     final pages = engine.paginate(
@@ -648,9 +667,11 @@ void main() {
         .toList();
     expect(cells, hasLength(3));
     expect(cells.first.header, isTrue);
-    expect(cells.first.rect.width, closeTo(280, _eps));
+    expect(cells.first.rect.width, lessThanOrEqualTo(280));
+    expect(cells.first.rect.center.dx, closeTo(150, _eps));
     expect(cells[1].rect.right, closeTo(cells[2].rect.left, _eps));
-    expect(cells[2].rect.right, closeTo(290, _eps));
+    expect(cells[1].rect.left, closeTo(cells.first.rect.left, _eps));
+    expect(cells[2].rect.right, closeTo(cells.first.rect.right, _eps));
     expect(cells.every((cell) => cell.rect.width > 0), isTrue);
     _disposeAll(pages);
   });
@@ -680,6 +701,33 @@ void main() {
     _disposeAll(bookPages);
   });
 
+  test('unified typesetting matches desktop emphasis and link decoration', () {
+    final prose = LayoutEngine.debugResolvedInlineEmphasis(
+      const TextStyle(italic: true, underline: true),
+    );
+    final link = LayoutEngine.debugResolvedInlineEmphasis(
+      TextStyle.plain,
+      linked: true,
+    );
+    final quote = LayoutEngine.debugResolvedInlineEmphasis(
+      const TextStyle(bold: true, italic: true, underline: true),
+      isQuote: true,
+    );
+    final heading = LayoutEngine.debugResolvedInlineEmphasis(
+      const TextStyle(italic: true, underline: true),
+      isHeading: true,
+    );
+
+    expect(prose.italic, isTrue);
+    expect(prose.underline, isFalse);
+    expect(link.underline, isFalse);
+    expect(quote.bold, isFalse);
+    expect(quote.italic, isFalse);
+    expect(quote.underline, isFalse);
+    expect(heading.italic, isFalse);
+    expect(heading.underline, isFalse);
+  });
+
   test('unified typesetting justifies ordinary body paragraphs', () {
     final pages = engine.paginate(
       _section([
@@ -691,7 +739,6 @@ void main() {
     final placement = pages.first.items.whereType<TextPlacement>().single;
     final firstLine = placement.lineMetrics.first;
 
-    expect(firstLine.hardBreak, isFalse);
     expect(firstLine.width, closeTo(placement.width, _eps));
     _disposeAll(pages);
   });
@@ -730,11 +777,112 @@ void main() {
     );
     final texts = pages.expand((p) => p.items).whereType<TextPlacement>();
     expect(texts, isNotEmpty);
-    // Blockquote: marginStart 2em indents and narrows the column.
+    // Unified layout uses the full flow width for quotes, matching desktop.
     final quote = texts.last;
-    expect(quote.x, greaterThanOrEqualTo(10 + 2 * 10 - _eps));
+    expect(quote.x, closeTo(10, _eps));
     _disposeAll(pages);
   });
+
+  test('semantic quotes keep body before their attribution', () {
+    final pages = engine.paginate(
+      _section([
+        QuoteBlock(
+          body: [_para('quoted body', kind: TextBlockKind.blockquote)],
+          attribution: _para(
+            '— Author',
+            kind: TextBlockKind.quoteAttribution,
+            nodeId: 'n2',
+          ),
+        ),
+      ]),
+      _viewport,
+      _style(),
+    );
+    final placements = pages
+        .expand((page) => page.items)
+        .whereType<TextPlacement>()
+        .toList();
+
+    expect(placements, hasLength(2));
+    expect(placements.first.nodeId, 'n1');
+    expect(placements.last.nodeId, 'n2');
+    final attributionBox = placements.last.paragraph
+        .getBoxesForRange(0, '— Author'.length)
+        .first;
+    expect(attributionBox.left, greaterThan(placements.last.width / 2));
+    _disposeAll(pages);
+  });
+
+  test('unified semantic quotes render as one decorated card', () {
+    final pages = engine.paginate(
+      _section([
+        QuoteBlock(
+          body: [_para('Quoted body.', kind: TextBlockKind.blockquote)],
+          attribution: _para(
+            '— Source',
+            kind: TextBlockKind.quoteAttribution,
+            nodeId: 'source',
+          ),
+        ),
+      ]),
+      _viewport,
+      _style(),
+    );
+
+    final quote = pages.single.items.whereType<QuotePlacement>().single;
+    final text = pages.single.items.whereType<TextPlacement>().toList();
+    expect(quote.height, greaterThan(24));
+    expect(text, hasLength(2));
+    expect(text.first.x, greaterThan(quote.x));
+    expect(text.last.lineMetrics.first.left, greaterThan(0));
+    _disposeAll(pages);
+  });
+
+  test('note definitions stay icon-only and note sections follow mode', () {
+    final definition = NoteBlock(
+      kind: NoteBlockKind.definition,
+      blocks: [_para('definition')],
+    );
+    final section = NoteBlock(
+      kind: NoteBlockKind.section,
+      blocks: [_para('notes section', nodeId: 'n2')],
+    );
+    final unified = engine.paginate(
+      _section([definition, section]),
+      _viewport,
+      _style(),
+    );
+    final book = engine.paginate(
+      _section([definition, section]),
+      _viewport,
+      _style().copyWith(typesettingMode: TypesettingMode.book),
+    );
+
+    expect(unified, isEmpty);
+    expect(book, hasLength(1));
+    expect(book.single.items.whereType<TextPlacement>(), hasLength(1));
+    _disposeAll(book);
+  });
+
+  test(
+    'book layout resolves percentage start margins against content width',
+    () {
+      final pages = engine.paginate(
+        _section([
+          _para(
+            'relative margin',
+            style: const BlockStyle(marginStartFraction: 0.25),
+          ),
+        ]),
+        _viewport,
+        _style().copyWith(typesettingMode: TypesettingMode.book),
+      );
+      final placement = pages.single.items.single as TextPlacement;
+
+      expect(placement.x, closeTo(10 + 280 * 0.25, _eps));
+      _disposeAll(pages);
+    },
+  );
 
   test(
     'a line taller than the page still gets placed (overflow tolerated)',

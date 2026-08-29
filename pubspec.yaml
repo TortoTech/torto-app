@@ -57,6 +57,9 @@ dependencies:
   html: ^0.15.6
   package_info_plus: ^10.2.1
   url_launcher: ^6.3.2
+  # Unicode extended-grapheme traversal used to batch shape-safe measurement
+  # ranges for the optimized paragraph breaker.
+  characters: ^1.4.1
 
 dev_dependencies:
   flutter_test:

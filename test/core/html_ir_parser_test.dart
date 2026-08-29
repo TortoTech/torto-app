@@ -8,6 +8,8 @@ Section parseSection(
   String href = 'OPS/text/ch1.xhtml',
   String basePath = 'OPS/text',
   String head = '',
+  bool noteSection = false,
+  bool Function(String href)? isDecorativeSeparatorImage,
 }) {
   final xhtml = '''<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head>$head</head><body>$body</body></html>''';
@@ -16,6 +18,8 @@ Section parseSection(
     href: href,
     xhtml: xhtml,
     basePath: basePath,
+    hints: SectionParseHints(noteSection: noteSection),
+    isDecorativeSeparatorImage: isDecorativeSeparatorImage,
   );
 }
 
@@ -23,6 +27,12 @@ TextBlock textBlock(Section section, int index) {
   final block = section.blocks[index];
   expect(block, isA<TextBlock>());
   return block as TextBlock;
+}
+
+QuoteBlock quoteBlock(Section section, int index) {
+  final block = section.blocks[index];
+  expect(block, isA<QuoteBlock>());
+  return block as QuoteBlock;
 }
 
 void main() {
@@ -54,22 +64,23 @@ void main() {
       expect(block.plainText, 'Hello world');
     });
 
-    test('blockquote flattens nested paragraphs and indents', () {
+    test('blockquote retains quoted paragraphs as a semantic unit', () {
       final section = parseSection('<blockquote><p>quoted</p></blockquote>');
-      final block = textBlock(section, 0);
-      expect(block.kind, TextBlockKind.blockquote);
-      expect(block.plainText, 'quoted');
-      expect(block.style.indent, 24);
+      final quote = quoteBlock(section, 0);
+      expect(quote.body, hasLength(1));
+      expect(quote.body.single.kind, TextBlockKind.blockquote);
+      expect(quote.body.single.plainText, 'quoted');
     });
 
     test('blockquote keeps alignment authored on its nested paragraph', () {
       final section = parseSection(
         '<blockquote><p style="text-align: right">quoted</p></blockquote>',
       );
-      final block = textBlock(section, 0);
+      final block = quoteBlock(section, 0).body.single;
 
       expect(block.kind, TextBlockKind.blockquote);
       expect(block.style.align, BlockAlign.end);
+      expect(block.style.authoredAlignment, BlockAlign.end);
     });
 
     test('pre preserves whitespace and newlines', () {
@@ -77,6 +88,139 @@ void main() {
       final block = textBlock(section, 0);
       expect(block.kind, TextBlockKind.preformatted);
       expect(block.plainText, 'line1\n  line2');
+    });
+
+    test('blockquote extracts an authored attribution', () {
+      final section = parseSection(
+        '<blockquote><p>quoted</p><footer>— Author</footer></blockquote>',
+      );
+      final quote = quoteBlock(section, 0);
+
+      expect(quote.body.single.plainText, 'quoted');
+      expect(quote.attribution?.kind, TextBlockKind.quoteAttribution);
+      expect(quote.attribution?.plainText, '— Author');
+    });
+
+    test('blockquote retains stanza spacing between sibling paragraphs', () {
+      final section = parseSection(
+        '<blockquote><p>first</p><br/><p>second</p></blockquote>',
+      );
+      final quote = quoteBlock(section, 0);
+
+      expect(quote.body, hasLength(2));
+      expect(quote.body.first.style.hardBreakAfter, isTrue);
+      expect(quote.body.last.style.hardBreakAfter, isFalse);
+    });
+
+    test('definition lists retain term and description semantics', () {
+      final section = parseSection('<dl><dt>Term</dt><dd>Meaning</dd></dl>');
+
+      expect(textBlock(section, 0).kind, TextBlockKind.definitionTerm);
+      expect(textBlock(section, 0).plainText, 'Term');
+      expect(textBlock(section, 1).kind, TextBlockKind.definitionDescription);
+      expect(textBlock(section, 1).plainText, 'Meaning');
+    });
+
+    test('adjacent inferred captions stay separate semantic siblings', () {
+      final section = parseSection(
+        '<p><img src="chart.png"/></p><p class="caption">Figure 1. Data</p>',
+      );
+      expect(section.blocks, hasLength(2));
+      final image = section.blocks.first as ImageBlock;
+      final caption = section.blocks.last as TextBlock;
+
+      expect(image.href, 'OPS/text/chart.png');
+      expect(caption.kind, TextBlockKind.caption);
+      expect(caption.plainText, 'Figure 1. Data');
+    });
+
+    test('infers adjacent captions inside a block-only container', () {
+      final section = parseSection(
+        '<section><p><img src="chart.png"/></p>'
+        '<p class="figcaption">图 2 系统结构</p></section>',
+      );
+
+      expect(section.blocks, hasLength(2));
+      expect(section.blocks.first, isA<ImageBlock>());
+      expect((section.blocks.last as TextBlock).kind, TextBlockKind.caption);
+    });
+
+    test('publication note-section hints wrap the section semantically', () {
+      final section = parseSection(
+        '<h2>Notes</h2><p>One note.</p>',
+        noteSection: true,
+      );
+
+      expect(section.blocks, hasLength(2));
+      expect(section.blocks.every((block) => block is NoteBlock), isTrue);
+      expect(
+        section.blocks
+            .cast<NoteBlock>()
+            .expand((note) => note.blocks)
+            .whereType<TextBlock>()
+            .map((block) => block.plainText),
+        ['Notes', 'One note.'],
+      );
+    });
+
+    test('recognizes a structural quote and right-aligned attribution', () {
+      final section = parseSection(
+        '<div><p style="margin-left:24px;font-style:italic">Quoted prose.</p>'
+        '<p style="text-align:right">— Author</p></div>',
+      );
+
+      final quote = section.blocks.single as QuoteBlock;
+      expect(quote.body.single.plainText, 'Quoted prose.');
+      expect(quote.attribution?.plainText, '— Author');
+      expect(quote.attribution?.kind, TextBlockKind.quoteAttribution);
+    });
+
+    test('groups multi-block implicit note definitions', () {
+      final section = parseSection(
+        '<div class="footnotes"><p id="n1"><a href="#r1">1</a> First paragraph.</p>'
+        '<p>Continuation.</p>'
+        '<p id="n2"><a href="#r2">2</a> Second note.</p></div>'
+        '<p><a id="r1" href="#n1">1</a><a id="r2" href="#n2">2</a></p>',
+      );
+
+      final notes = section.blocks.whereType<NoteBlock>().toList();
+      expect(notes, hasLength(2));
+      expect(notes.first.blocks.whereType<TextBlock>(), hasLength(2));
+    });
+
+    test('retains TeX math semantics and standalone block breaks', () {
+      final section = parseSection(
+        '<p><span class="math math-display">E=mc^2</span></p><br/>',
+      );
+
+      final paragraph = section.blocks.first as TextBlock;
+      final formula = paragraph.inlines.single as MathInline;
+      expect(formula.latex, 'E=mc^2');
+      expect(formula.display, isTrue);
+      expect(paragraph.style.align, BlockAlign.center);
+      expect(section.blocks.last, isA<LineBreakBlock>());
+    });
+
+    test('does not center display math mixed with ordinary prose', () {
+      final section = parseSection(
+        '<p>Before <span class="math math-display">x^2</span></p>',
+      );
+
+      expect(
+        (section.blocks.single as TextBlock).style.align,
+        BlockAlign.start,
+      );
+    });
+
+    test('classifies only approved thin images as ornaments', () {
+      final section = parseSection(
+        '<p><img src="rule.png" alt="separator"/></p>',
+        isDecorativeSeparatorImage: (href) => href.endsWith('rule.png'),
+      );
+
+      final separator = section.blocks.single as SeparatorBlock;
+      expect(separator.kind, SeparatorKind.ornament);
+      expect(separator.image?.href, 'OPS/text/rule.png');
     });
 
     test('ordered, unordered, and nested lists', () {
@@ -252,10 +396,16 @@ void main() {
       expect(section.blocks[2], isA<PageBreakBlock>());
     });
 
-    test('empty blocks are dropped, image-only blocks keep the image', () {
-      final section = parseSection('<p>   </p><p><img src="only.png"/></p>');
-      expect(section.blocks, hasLength(1));
-      expect(section.blocks.single, isA<ImageBlock>());
+    test('only authored blank-line markers become spacing separators', () {
+      final section = parseSection(
+        '<p>   </p><p>&#160;</p><p><img src="only.png"/></p>',
+      );
+      expect(section.blocks, hasLength(2));
+      expect(
+        (section.blocks.first as SeparatorBlock).kind,
+        SeparatorKind.spacing,
+      );
+      expect(section.blocks.last, isA<ImageBlock>());
     });
   });
 
@@ -305,10 +455,11 @@ void main() {
         section,
         0,
       ).inlines.whereType<TextRun>().firstWhere((run) => run.link != null);
-      final backlink = textBlock(
-        section,
-        1,
-      ).inlines.whereType<TextRun>().firstWhere((run) => run.link != null);
+      final note = section.blocks[1] as NoteBlock;
+      final definition = note.blocks.single as TextBlock;
+      final backlink = definition.inlines.whereType<TextRun>().firstWhere(
+        (run) => run.link != null,
+      );
       expect(reference.style.linkRole, LinkRole.footnoteReference);
       expect(backlink.style.linkRole, LinkRole.footnoteBacklink);
       expect(
@@ -320,8 +471,44 @@ void main() {
             .firstWhere((anchor) => anchor.fragment == 'note-1')
             .source
             .node,
-        textBlock(section, 1).nodeId,
+        definition.nodeId,
       );
+    });
+
+    test('turns an image-backed EPUB noteref into a footnote marker', () {
+      final section = parseSection('''
+        <aside epub:type="footnote" id="footnote-18-20">
+          <ol class="duokan-footnote-content">
+            <li class="duokan-footnote-item">国际知名的演说家、作家。——译者注</li>
+          </ol>
+        </aside>
+        <p>网站&#160;<sup><a epub:type="noteref" href="#footnote-18-20"> <img
+          src="../images/image_010.png"
+          alt="国际知名的演说家、作家。——译者注"
+          zy-footnote="国际知名的演说家、作家。——译者注"
+          class="epub-footnote"/></a></sup>以及其他网站</p>
+      ''');
+
+      expect(section.blocks.whereType<ImageBlock>(), isEmpty);
+      final definition = section.blocks
+          .whereType<NoteBlock>()
+          .single
+          .blocks
+          .whereType<TextBlock>()
+          .single;
+      expect(definition.kind, TextBlockKind.footnoteDefinition);
+      expect(definition.plainText, contains('国际知名的演说家'));
+
+      final paragraph = section.blocks.whereType<TextBlock>().firstWhere(
+        (block) => block.kind == TextBlockKind.paragraph,
+      );
+      final reference = paragraph.inlines.whereType<TextRun>().firstWhere(
+        (run) => run.style.linkRole == LinkRole.footnoteReference,
+      );
+      expect(reference.text, '译');
+      expect(reference.style.baseline, TextBaselineShift.superscript);
+      expect(reference.link, 'OPS/text/ch1.xhtml#footnote-18-20');
+      expect(paragraph.plainText, contains('网站译以及'));
     });
 
     test('classifies legacy reciprocal footnote links', () {
@@ -333,10 +520,11 @@ void main() {
         section,
         0,
       ).inlines.whereType<TextRun>().firstWhere((run) => run.link != null);
-      final backlink = textBlock(
-        section,
-        1,
-      ).inlines.whereType<TextRun>().firstWhere((run) => run.link != null);
+      final note = section.blocks[1] as NoteBlock;
+      final definition = note.blocks.single as TextBlock;
+      final backlink = definition.inlines.whereType<TextRun>().firstWhere(
+        (run) => run.link != null,
+      );
       expect(reference.style.linkRole, LinkRole.footnoteReference);
       expect(backlink.style.linkRole, LinkRole.footnoteBacklink);
     });
@@ -388,6 +576,16 @@ void main() {
       expect(style.marginAfter, closeTo(16, 1e-9));
       expect(style.indent, closeTo(24, 1e-9));
       expect(style.lineHeight, closeTo(1.8, 1e-9));
+    });
+
+    test('percentage start margins remain relative to the viewport', () {
+      final section = parseSection(
+        '<div style="margin-left: 10%"><p style="padding-left: 5%">t</p></div>',
+      );
+      final style = textBlock(section, 0).style;
+
+      expect(style.marginStartFraction, closeTo(0.15, 1e-9));
+      expect(style.marginStart, 0);
     });
 
     test('font-size: px absolute vs 16px base; em multiplies', () {

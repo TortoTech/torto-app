@@ -192,14 +192,6 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (note.marker.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: Text(
-                      '脚注 ${note.marker}',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
-                  ),
                 SelectableText(
                   note.text,
                   style: const TextStyle(fontSize: 17, height: 1.55),

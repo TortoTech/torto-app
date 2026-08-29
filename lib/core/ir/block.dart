@@ -85,13 +85,28 @@ class BreakInline extends Inline {
   const BreakInline();
 }
 
+/// TeX source retained as semantic inline content. The current Flutter
+/// renderer keeps a readable text fallback while preserving enough metadata
+/// for a dedicated formula rasterizer.
+class MathInline extends Inline {
+  final String latex;
+  final bool display;
+  final double sizeScale;
+
+  const MathInline(this.latex, {this.display = false, this.sizeScale = 1.0});
+}
+
 enum TextBlockKind {
   paragraph,
   heading,
   blockquote,
+  quoteAttribution,
   preformatted,
   caption,
+  footnoteDefinition,
   listItem,
+  definitionTerm,
+  definitionDescription,
 }
 
 /// Top-level content blocks of a section. Mirrors torto's `enum Block`.
@@ -146,10 +161,48 @@ class TextBlock extends Block {
           buf.write(text);
         case BreakInline():
           buf.write('\n');
+        case MathInline(:final latex):
+          buf.write(latex);
       }
     }
     return buf.toString();
   }
+}
+
+/// Quoted prose and its optional attribution, retained as one semantic unit.
+class QuoteBlock extends Block {
+  final List<TextBlock> body;
+  final TextBlock? attribution;
+  final SourceRange? source;
+
+  const QuoteBlock({required this.body, this.attribution, this.source});
+
+  int get textLength =>
+      body.fold(0, (total, block) => total + block.plainText.length) +
+      (attribution?.plainText.length ?? 0);
+}
+
+enum NoteBlockKind { definition, section }
+
+/// One footnote/endnote definition or an authored notes section.
+class NoteBlock extends Block {
+  final NoteBlockKind kind;
+  final List<Block> blocks;
+  final SourceRange? source;
+
+  const NoteBlock({required this.kind, required this.blocks, this.source});
+
+  int get textLength => blocks.fold(0, (total, block) {
+    return total +
+        switch (block) {
+          TextBlock(:final plainText) => plainText.length,
+          QuoteBlock(:final textLength) => textLength,
+          NoteBlock(:final textLength) => textLength,
+          TableBlock(:final textLength) => textLength,
+          FigureBlock(:final textLength) => textLength,
+          _ => 0,
+        };
+  });
 }
 
 /// A semantic table retained as a grid instead of being flattened into
@@ -158,8 +211,13 @@ class TextBlock extends Block {
 class TableBlock extends Block {
   final List<TableRow> rows;
   final BlockStyle style;
+  final SourceRange? source;
 
-  const TableBlock({required this.rows, this.style = BlockStyle.normal});
+  const TableBlock({
+    required this.rows,
+    this.style = BlockStyle.normal,
+    this.source,
+  });
 
   int get textLength => rows.fold(
     0,
@@ -203,6 +261,8 @@ class TableCell {
           buffer.write(text);
         case BreakInline():
           buffer.write('\n');
+        case MathInline(:final latex):
+          buffer.write(latex);
       }
     }
     return buffer.toString();
@@ -252,12 +312,29 @@ class FigureBlock extends Block {
       captions.fold(0, (total, caption) => total + caption.plainText.length);
 }
 
-/// Horizontal rule (<hr>).
+enum SeparatorKind { spacing, rule, ornament }
+
+/// A semantic, non-prose boundary retained for the active typesetting mode.
 class SeparatorBlock extends Block {
-  const SeparatorBlock();
+  final SeparatorKind kind;
+  final bool inQuote;
+  final ImageBlock? image;
+  final BlockStyle style;
+
+  const SeparatorBlock({
+    this.kind = SeparatorKind.rule,
+    this.inQuote = false,
+    this.image,
+    this.style = BlockStyle.normal,
+  });
 }
 
 /// Explicit page break marker.
 class PageBreakBlock extends Block {
   const PageBreakBlock();
+}
+
+/// Authored standalone line break between block elements.
+class LineBreakBlock extends Block {
+  const LineBreakBlock();
 }

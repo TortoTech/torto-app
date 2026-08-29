@@ -11,7 +11,11 @@ library;
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:characters/characters.dart';
+import 'package:flutter/foundation.dart';
+
 import '../ir/ir.dart';
+import '../linebreak/paragraph_optimizer.dart';
 import 'layout_types.dart';
 
 /// Default heading size scales by level, applied only when the IR left every
@@ -31,6 +35,24 @@ const double _eps = 0.01;
 class LayoutEngine {
   const LayoutEngine();
 
+  @visibleForTesting
+  static ({bool bold, bool italic, bool underline, bool strikethrough})
+  debugResolvedInlineEmphasis(
+    TextStyle runStyle, {
+    bool unified = true,
+    bool linked = false,
+    bool isHeading = false,
+    bool isQuote = false,
+    bool isDefinitionTerm = false,
+  }) => _resolvedInlineEmphasis(
+    runStyle: runStyle,
+    linked: linked,
+    unified: unified,
+    isHeading: isHeading,
+    isQuote: isQuote,
+    isDefinitionTerm: isDefinitionTerm,
+  );
+
   /// Paginates [section] for [viewport] with [style]. Returns zero pages for
   /// a section with no placeable content (the caller handles that case).
   ///
@@ -47,6 +69,8 @@ class LayoutEngine {
     RenditionLayout renditionLayout = RenditionLayout.reflowable,
   }) {
     if (section.blocks.isEmpty) return const [];
+    final flowBlocks = _collectFlowBlocks(section.blocks, style);
+    if (flowBlocks.isEmpty) return const [];
 
     final contentLeft = style.marginLeft;
     final contentTop = style.marginTop;
@@ -63,11 +87,13 @@ class LayoutEngine {
     // Cumulative UTF-16 text offsets, for progression computation.
     final textStartOf = <Block, double>{};
     var totalText = 0.0;
-    for (final block in section.blocks) {
+    for (final block in flowBlocks) {
       final length = switch (block) {
         TextBlock(:final plainText) => plainText.length,
         TableBlock(:final textLength) => textLength,
         FigureBlock(:final textLength) => textLength,
+        QuoteBlock(:final textLength) => textLength,
+        NoteBlock(:final textLength) => textLength,
         _ => 0,
       };
       if (length == 0) continue;
@@ -85,7 +111,31 @@ class LayoutEngine {
           _isStandaloneCover(section, coverHref),
     );
 
-    for (final block in section.blocks) {
+    var blockIndex = 0;
+    while (blockIndex < flowBlocks.length) {
+      final block = flowBlocks[blockIndex];
+      if (style.typesettingMode == TypesettingMode.unified &&
+          block is ImageBlock &&
+          blockIndex + 1 < flowBlocks.length &&
+          flowBlocks[blockIndex + 1] is TextBlock &&
+          (flowBlocks[blockIndex + 1] as TextBlock).kind ==
+              TextBlockKind.caption) {
+        final caption = flowBlocks[blockIndex + 1] as TextBlock;
+        _pushFigure(
+          paginator,
+          FigureBlock(images: [block], captions: [caption]),
+          style,
+          imageSizeResolver,
+          contentLeft,
+          contentWidth,
+          contentHeight,
+          viewport.width,
+          section.spineIndex,
+          textStartOf[caption] ?? 0,
+        );
+        blockIndex += 2;
+        continue;
+      }
       switch (block) {
         case TextBlock():
           final prepared = _prepareText(
@@ -122,9 +172,27 @@ class LayoutEngine {
             textStartOf[block] ?? 0,
           );
         case SeparatorBlock():
-          paginator.pushSeparator(vMargin: style.baseFontSize * 0.75);
+          if (block.kind == SeparatorKind.ornament && block.image != null) {
+            _pushImage(
+              paginator,
+              block.image!,
+              style,
+              imageSizeResolver,
+              contentWidth,
+              contentHeight,
+              viewport.width,
+            );
+          } else if (block.kind == SeparatorKind.spacing) {
+            paginator.addSemanticSpacing(
+              math.max(style.baseFontSize, block.style.marginAfter),
+            );
+          } else {
+            paginator.pushSeparator(vMargin: style.baseFontSize * 0.75);
+          }
         case PageBreakBlock():
           paginator.forcePage();
+        case LineBreakBlock():
+          paginator.addSemanticSpacing(style.baseFontSize * style.lineHeight);
         case TableBlock():
           final prepared = _prepareTable(
             block,
@@ -134,7 +202,21 @@ class LayoutEngine {
             textStartOf[block] ?? 0,
           );
           if (prepared != null) paginator.pushTable(prepared);
+        case QuoteBlock():
+          _pushQuote(
+            paginator,
+            block,
+            style,
+            contentLeft,
+            contentWidth,
+            section.spineIndex,
+            textStartOf[block] ?? 0,
+          );
+        case NoteBlock():
+          // Note blocks are filtered or flattened by [_collectFlowBlocks].
+          throw StateError('Unexpected note block in the layout flow.');
       }
+      blockIndex++;
     }
 
     final rawPages = paginator.finish();
@@ -196,13 +278,37 @@ class LayoutEngine {
     return pages;
   }
 
+  static List<Block> _collectFlowBlocks(List<Block> blocks, ReaderStyle style) {
+    final output = <Block>[];
+    for (final block in blocks) {
+      switch (block) {
+        case QuoteBlock():
+          output.add(block);
+        case NoteBlock(:final kind, :final blocks):
+          if (kind == NoteBlockKind.section &&
+              style.typesettingMode == TypesettingMode.book) {
+            output.addAll(_collectFlowBlocks(blocks, style));
+          }
+        case SeparatorBlock(:final kind, :final inQuote):
+          if (style.typesettingMode == TypesettingMode.book ||
+              inQuote ||
+              kind != SeparatorKind.spacing) {
+            output.add(block);
+          }
+        default:
+          output.add(block);
+      }
+    }
+    return output;
+  }
+
   /// Matches torto desktop's cover-alignment boundary: page breaks are not
   /// visible content, and an ordinary standalone illustration must remain in
   /// normal document flow rather than being mistaken for a cover.
   static bool _isStandaloneCover(Section section, String? coverHref) {
     if (coverHref == null) return false;
     final visibleBlocks = section.blocks
-        .where((block) => block is! PageBreakBlock)
+        .where((block) => block is! PageBreakBlock && block is! LineBreakBlock)
         .iterator;
     if (!visibleBlocks.moveNext()) return false;
     final first = visibleBlocks.current;
@@ -227,12 +333,19 @@ class LayoutEngine {
     final isHeading = block.kind == TextBlockKind.heading;
     final isPre = block.kind == TextBlockKind.preformatted;
     final isList = block.kind == TextBlockKind.listItem;
-    final isQuote = block.kind == TextBlockKind.blockquote;
+    final isQuote =
+        block.kind == TextBlockKind.blockquote ||
+        block.kind == TextBlockKind.quoteAttribution;
     final isCaption = block.kind == TextBlockKind.caption;
+    final isDefinitionTerm = block.kind == TextBlockKind.definitionTerm;
+    final isDefinitionDescription =
+        block.kind == TextBlockKind.definitionDescription;
 
     var marginBefore = block.style.marginBefore;
     var marginAfter = block.style.marginAfter;
-    var marginStart = block.style.marginStart;
+    var marginStart =
+        block.style.marginStart +
+        contentWidth * block.style.marginStartFraction;
 
     var blockScale = 1.0;
     var paragraphLineHeight = style.lineHeight * block.style.lineHeight;
@@ -246,8 +359,15 @@ class LayoutEngine {
           unifiedAlignmentOverride ??
           switch (block.kind) {
             TextBlockKind.paragraph => BlockAlign.justify,
-            TextBlockKind.blockquote => block.style.align,
+            TextBlockKind.blockquote =>
+              block.style.authoredAlignment ??
+                  (block.style.align == BlockAlign.start
+                      ? BlockAlign.justify
+                      : block.style.align),
+            TextBlockKind.quoteAttribution => BlockAlign.end,
             TextBlockKind.caption => BlockAlign.center,
+            TextBlockKind.listItem when _supportsSpaceJustification(block) =>
+              BlockAlign.justify,
             _ => BlockAlign.start,
           };
       paragraphLineHeight = style.lineHeight;
@@ -262,9 +382,19 @@ class LayoutEngine {
         blockScale = 0.88;
         paragraphLineHeight = 1.4;
         marginAfter = 0;
-      } else if (isQuote) {
+      } else if (block.kind == TextBlockKind.blockquote) {
         blockScale = 0.95;
-        marginStart = baseSize * 2;
+        marginStart = 0;
+      } else if (block.kind == TextBlockKind.quoteAttribution) {
+        blockScale = 0.88;
+        paragraphLineHeight = 1.4;
+        marginStart = 0;
+        marginAfter = 0;
+      } else if (isDefinitionTerm) {
+        marginAfter = baseSize * 0.2;
+        marginStart = baseSize * 1.5 * block.listDepth;
+      } else if (isDefinitionDescription) {
+        marginStart = baseSize * 1.5 * (block.listDepth + 1);
       }
     } else if (isHeading) {
       final allPlain = block.inlines.every(
@@ -273,11 +403,9 @@ class LayoutEngine {
       if (allPlain) {
         blockScale = _headingScales[block.headingLevel.clamp(1, 6)] ?? 1.0;
       }
-      marginBefore = math.max(marginBefore, baseSize * 0.8);
-      marginAfter = math.max(marginAfter, baseSize * 0.4);
     }
-    if (!unified && isQuote) {
-      marginStart += baseSize * 2;
+    if (block.style.hardBreakAfter) {
+      marginAfter += baseSize * paragraphLineHeight;
     }
 
     var marker = '';
@@ -295,7 +423,10 @@ class LayoutEngine {
     }
 
     final hasText = block.inlines.any(
-      (i) => i is TextRun && i.text.isNotEmpty || i is BreakInline,
+      (i) =>
+          i is TextRun && i.text.isNotEmpty ||
+          i is BreakInline ||
+          i is MathInline && i.latex.isNotEmpty,
     );
     if (!hasText) return null;
 
@@ -320,9 +451,12 @@ class LayoutEngine {
 
     final indentWidth = isList
         ? 0.0
-        : (unified && block.kind == TextBlockKind.paragraph
-              ? baseSize * 2
-              : block.style.indent);
+        : switch ((unified, block.kind)) {
+            (true, TextBlockKind.paragraph) => baseSize * 2,
+            (true, TextBlockKind.blockquote) when block.style.indent > _eps =>
+              baseSize * 2,
+            _ => block.style.indent,
+          };
     var syntheticPrefixLength = 0;
     if (indentWidth > 0) {
       builder.addPlaceholder(
@@ -368,26 +502,18 @@ class LayoutEngine {
             paragraphOffset += text.length;
             continue;
           }
-          var scale = unified ? blockScale : runStyle.sizeScale * blockScale;
-          // Super/subscript: size reduced, baseline shift not approximated.
-          if (runStyle.baseline != TextBaselineShift.none) scale *= 0.7;
-          final clearEmphasis = unified && (isHeading || isQuote);
           builder.pushStyle(
-            ui.TextStyle(
-              color: !unified && runStyle.color != null
-                  ? ui.Color(runStyle.color!)
-                  : foreground,
-              fontWeight: ((runStyle.bold && !clearEmphasis) || isHeading)
-                  ? ui.FontWeight.bold
-                  : null,
-              fontStyle: runStyle.italic && !clearEmphasis
-                  ? ui.FontStyle.italic
-                  : null,
-              decoration: link != null
-                  ? ui.TextDecoration.underline
-                  : _decorationFor(runStyle, includeUnderline: !unified),
-              fontSize: baseSize * scale,
+            _resolvedUiTextStyle(
+              runStyle: runStyle,
+              linked: link != null,
+              unified: unified,
+              blockScale: blockScale,
+              baseSize: baseSize,
+              foreground: foreground,
               fontFamily: fontFamily,
+              isHeading: isHeading,
+              isQuote: isQuote,
+              isDefinitionTerm: isDefinitionTerm,
             ),
           );
           builder.addText(text);
@@ -404,6 +530,20 @@ class LayoutEngine {
             );
           }
           paragraphOffset += text.length;
+        case MathInline(:final latex, :final sizeScale):
+          if (latex.isEmpty) continue;
+          final scale = unified ? blockScale : sizeScale * blockScale;
+          builder.pushStyle(
+            ui.TextStyle(
+              color: foreground,
+              fontSize: baseSize * scale,
+              fontFamily: 'monospace',
+              fontStyle: ui.FontStyle.italic,
+            ),
+          );
+          builder.addText(latex);
+          builder.pop();
+          paragraphOffset += latex.length;
         case BreakInline():
           builder.addText('\n');
           paragraphOffset++;
@@ -428,11 +568,41 @@ class LayoutEngine {
       markerParagraph.layout(ui.ParagraphConstraints(width: markerWidth));
     }
 
-    final paragraph = builder.build();
+    var paragraph = builder.build();
     final textStart = marginStart + markerWidth;
     final width = math.max(1.0, contentWidth - textStart);
     paragraph.layout(ui.ParagraphConstraints(width: width));
-    final metrics = paragraph.computeLineMetrics();
+    var metrics = paragraph.computeLineMetrics();
+    List<int>? displayToSource;
+    if (style.lineBreakStrategy == LineBreakStrategy.optimized &&
+        metrics.length > 1 &&
+        ((block.kind == TextBlockKind.paragraph &&
+                resolvedAlign == BlockAlign.justify) ||
+            (block.kind == TextBlockKind.caption &&
+                resolvedAlign == BlockAlign.start))) {
+      final optimized = _tryBuildOptimizedParagraph(
+        block: block,
+        unified: unified,
+        blockScale: blockScale,
+        baseSize: baseSize,
+        lineHeight: paragraphLineHeight,
+        foreground: foreground,
+        fontFamily: fontFamily,
+        isHeading: isHeading,
+        isQuote: isQuote,
+        firstLineIndent: indentWidth,
+        width: width,
+      );
+      if (optimized != null) {
+        paragraph.dispose();
+        paragraph = optimized.paragraph;
+        metrics = optimized.metrics;
+        links
+          ..clear()
+          ..addAll(optimized.links);
+        displayToSource = optimized.displayToSource;
+      }
+    }
     if (metrics.isEmpty) {
       paragraph.dispose();
       markerParagraph?.dispose();
@@ -464,8 +634,461 @@ class LayoutEngine {
       spineIndex: spineIndex,
       sectionTextOffset: sectionTextOffset,
       links: links,
+      displayToSource: displayToSource,
     );
   }
+
+  static ui.TextStyle _resolvedUiTextStyle({
+    required TextStyle runStyle,
+    required bool linked,
+    required bool unified,
+    required double blockScale,
+    required double baseSize,
+    required ui.Color foreground,
+    required String? fontFamily,
+    required bool isHeading,
+    required bool isQuote,
+    required bool isDefinitionTerm,
+    double? letterSpacing,
+  }) {
+    var scale = unified ? blockScale : runStyle.sizeScale * blockScale;
+    if (runStyle.baseline != TextBaselineShift.none) scale *= 0.7;
+    final emphasis = _resolvedInlineEmphasis(
+      runStyle: runStyle,
+      linked: linked,
+      unified: unified,
+      isHeading: isHeading,
+      isQuote: isQuote,
+      isDefinitionTerm: isDefinitionTerm,
+    );
+    return ui.TextStyle(
+      color: !unified && runStyle.color != null
+          ? ui.Color(runStyle.color!)
+          : foreground,
+      fontWeight: emphasis.bold ? ui.FontWeight.bold : null,
+      fontStyle: emphasis.italic ? ui.FontStyle.italic : null,
+      decoration: _resolvedDecoration(
+        underline: emphasis.underline,
+        strikethrough: emphasis.strikethrough,
+      ),
+      fontSize: baseSize * scale,
+      fontFamily: fontFamily,
+      letterSpacing: letterSpacing,
+    );
+  }
+
+  static ({bool bold, bool italic, bool underline, bool strikethrough})
+  _resolvedInlineEmphasis({
+    required TextStyle runStyle,
+    required bool linked,
+    required bool unified,
+    required bool isHeading,
+    required bool isQuote,
+    required bool isDefinitionTerm,
+  }) {
+    final clearBold = unified && (isHeading || isQuote);
+    final clearItalic = unified && (isHeading || isQuote);
+    return (
+      bold: (runStyle.bold && !clearBold) || isHeading || isDefinitionTerm,
+      italic: runStyle.italic && !clearItalic,
+      underline: !unified && runStyle.underline,
+      strikethrough: runStyle.strikethrough,
+    );
+  }
+
+  _OptimizedParagraphBuild? _tryBuildOptimizedParagraph({
+    required TextBlock block,
+    required bool unified,
+    required double blockScale,
+    required double baseSize,
+    required double lineHeight,
+    required ui.Color foreground,
+    required String? fontFamily,
+    required bool isHeading,
+    required bool isQuote,
+    required double firstLineIndent,
+    required double width,
+  }) {
+    final slices = <_SourceRunSlice>[];
+    final text = StringBuffer();
+    var sourceOffset = 0;
+    for (final inline in block.inlines) {
+      switch (inline) {
+        case BreakInline():
+          return null;
+        case MathInline():
+          return null;
+        case TextRun(text: final value, style: final runStyle, :final link):
+          if (value.isEmpty) continue;
+          if (_usesFootnoteIcon(runStyle, link)) return null;
+          final start = sourceOffset;
+          sourceOffset += value.length;
+          text.write(value);
+          slices.add(
+            _SourceRunSlice(
+              start: start,
+              end: sourceOffset,
+              style: runStyle,
+              link: link,
+              fontSize: _resolvedFontSize(
+                runStyle,
+                unified: unified,
+                blockScale: blockScale,
+                baseSize: baseSize,
+              ),
+            ),
+          );
+      }
+    }
+    final sourceText = text.toString();
+    if (sourceText.isEmpty || slices.isEmpty) return null;
+
+    final measureBuilder = ui.ParagraphBuilder(
+      ui.ParagraphStyle(
+        textAlign: ui.TextAlign.left,
+        textDirection: ui.TextDirection.ltr,
+        fontSize: baseSize * blockScale,
+        height: lineHeight,
+        fontFamily: fontFamily,
+      ),
+    );
+    for (final slice in slices) {
+      measureBuilder.pushStyle(
+        _resolvedUiTextStyle(
+          runStyle: slice.style,
+          linked: slice.link != null,
+          unified: unified,
+          blockScale: blockScale,
+          baseSize: baseSize,
+          foreground: foreground,
+          fontFamily: fontFamily,
+          isHeading: isHeading,
+          isQuote: isQuote,
+          isDefinitionTerm: block.kind == TextBlockKind.definitionTerm,
+        ),
+      );
+      measureBuilder.addText(sourceText.substring(slice.start, slice.end));
+      measureBuilder.pop();
+    }
+    final measurement = measureBuilder.build()
+      ..layout(const ui.ParagraphConstraints(width: 1000000));
+    final ranges = _measurementRanges(sourceText, slices);
+    if (ranges == null) {
+      measurement.dispose();
+      return null;
+    }
+    final measured = <MeasuredCluster>[];
+    var sliceIndex = 0;
+    for (final range in ranges) {
+      while (sliceIndex + 1 < slices.length &&
+          slices[sliceIndex].end <= range.start) {
+        sliceIndex++;
+      }
+      final slice = slices[sliceIndex];
+      if (range.end > slice.end) {
+        measurement.dispose();
+        return null;
+      }
+      final boxes = measurement.getBoxesForRange(range.start, range.end);
+      var advance = boxes.fold<double>(
+        0,
+        (total, box) => total + box.right - box.left,
+      );
+      if (boxes.isEmpty || !advance.isFinite || advance < 0) {
+        final glyph = measurement.getGlyphInfoAt(range.start);
+        if (glyph == null ||
+            glyph.graphemeClusterCodeUnitRange.start != range.start ||
+            glyph.graphemeClusterCodeUnitRange.end != range.end) {
+          measurement.dispose();
+          return null;
+        }
+        advance = glyph.graphemeClusterLayoutBounds.width;
+      }
+      measured.add(
+        MeasuredCluster(
+          start: range.start,
+          end: range.end,
+          advance: advance,
+          em: slice.fontSize,
+          ordinaryBaseline: slice.style.baseline == TextBaselineShift.none,
+          footnoteReference: slice.style.linkRole == LinkRole.footnoteReference,
+        ),
+      );
+    }
+    measurement.dispose();
+    final plan = const ParagraphOptimizer().plan(
+      text: sourceText,
+      clusters: measured,
+      lineWidth: width,
+      firstLineIndent: firstLineIndent,
+      defaultEm: baseSize,
+    );
+    if (plan == null || plan.lines.length < 2) return null;
+
+    final builder = ui.ParagraphBuilder(
+      ui.ParagraphStyle(
+        textAlign: ui.TextAlign.left,
+        textDirection: ui.TextDirection.ltr,
+        fontSize: baseSize * blockScale,
+        height: lineHeight,
+        fontFamily: fontFamily,
+      ),
+    );
+    final hasIndent = firstLineIndent > 0;
+    final displayToSource = <int>[0];
+    var displayOffset = 0;
+    if (hasIndent) {
+      builder.addPlaceholder(
+        firstLineIndent,
+        baseSize,
+        ui.PlaceholderAlignment.baseline,
+        baseline: ui.TextBaseline.alphabetic,
+        baselineOffset: baseSize * 0.8,
+      );
+      displayOffset++;
+      displayToSource.add(0);
+    }
+    final sourceToDisplayStart = List<int>.filled(sourceText.length + 1, -1);
+    final sourceToDisplayEnd = List<int>.filled(sourceText.length + 1, -1);
+    sourceToDisplayStart[0] = displayOffset;
+    sourceToDisplayEnd[0] = displayOffset;
+    var activeSlice = 0;
+    for (var lineIndex = 0; lineIndex < plan.lines.length; lineIndex++) {
+      final line = plan.lines[lineIndex];
+      var clusterIndex = line.startCluster;
+      while (clusterIndex < line.endCluster) {
+        final cluster = measured[clusterIndex];
+        while (activeSlice + 1 < slices.length &&
+            slices[activeSlice].end <= cluster.start) {
+          activeSlice++;
+        }
+        final slice = slices[activeSlice];
+        final adjustment = plan.adjustments[clusterIndex];
+        final groupedAdjustment =
+            adjustment.abs() > 0.0001 &&
+            sourceText.substring(cluster.start, cluster.end).characters.length >
+                1;
+        var segmentEnd = clusterIndex + 1;
+        while (!groupedAdjustment && segmentEnd < line.endCluster) {
+          final next = measured[segmentEnd];
+          if (next.end > slice.end ||
+              (plan.adjustments[segmentEnd] - adjustment).abs() > 0.0001 ||
+              (adjustment.abs() > 0.0001 &&
+                  sourceText.substring(next.start, next.end).characters.length >
+                      1)) {
+            break;
+          }
+          segmentEnd++;
+        }
+        final sourceStart = cluster.start;
+        final sourceEnd = measured[segmentEnd - 1].end;
+
+        void addSegment(int start, int end, double? letterSpacing) {
+          if (end <= start) return;
+          builder.pushStyle(
+            _resolvedUiTextStyle(
+              runStyle: slice.style,
+              linked: slice.link != null,
+              unified: unified,
+              blockScale: blockScale,
+              baseSize: baseSize,
+              foreground: foreground,
+              fontFamily: fontFamily,
+              isHeading: isHeading,
+              isQuote: isQuote,
+              isDefinitionTerm: block.kind == TextBlockKind.definitionTerm,
+              letterSpacing: letterSpacing,
+            ),
+          );
+          builder.addText(sourceText.substring(start, end));
+          builder.pop();
+        }
+
+        if (groupedAdjustment) {
+          final last = sourceText
+              .substring(sourceStart, sourceEnd)
+              .characters
+              .last;
+          final lastStart = sourceEnd - last.length;
+          addSegment(sourceStart, lastStart, null);
+          addSegment(lastStart, sourceEnd, adjustment);
+        } else {
+          addSegment(
+            sourceStart,
+            sourceEnd,
+            adjustment.abs() <= 0.0001 ? null : adjustment,
+          );
+        }
+        for (var unit = sourceStart; unit < sourceEnd; unit++) {
+          sourceToDisplayStart[unit] = displayOffset;
+          sourceToDisplayEnd[unit] = displayOffset;
+          displayOffset++;
+          displayToSource.add(unit + 1);
+        }
+        sourceToDisplayStart[sourceEnd] = displayOffset;
+        sourceToDisplayEnd[sourceEnd] = displayOffset;
+        clusterIndex = segmentEnd;
+      }
+      if (lineIndex + 1 < plan.lines.length) {
+        final boundary = measured[line.endCluster - 1].end;
+        sourceToDisplayEnd[boundary] = displayOffset;
+        builder.addText('\n');
+        displayOffset++;
+        displayToSource.add(boundary);
+        sourceToDisplayStart[boundary] = displayOffset;
+      }
+    }
+    final paragraph = builder.build()
+      ..layout(ui.ParagraphConstraints(width: width));
+    final metrics = paragraph.computeLineMetrics();
+    if (metrics.length != plan.lines.length) {
+      paragraph.dispose();
+      return null;
+    }
+    final tolerance = math.max(1.0, width * 0.01);
+    for (var index = 0; index + 1 < metrics.length; index++) {
+      if ((metrics[index].width - width).abs() > tolerance) {
+        paragraph.dispose();
+        return null;
+      }
+    }
+    final links = <TextLinkRange>[];
+    for (final slice in slices) {
+      final link = slice.link;
+      if (link == null) continue;
+      final start = sourceToDisplayStart[slice.start];
+      final end = sourceToDisplayEnd[slice.end];
+      if (start < 0 || end <= start) continue;
+      links.add(
+        TextLinkRange(
+          start: start,
+          end: end,
+          href: link,
+          marker: sourceText.substring(slice.start, slice.end).trim(),
+          role: slice.style.linkRole,
+        ),
+      );
+    }
+    return _OptimizedParagraphBuild(
+      paragraph: paragraph,
+      metrics: metrics,
+      links: links,
+      displayToSource: displayToSource,
+    );
+  }
+
+  static double _resolvedFontSize(
+    TextStyle style, {
+    required bool unified,
+    required double blockScale,
+    required double baseSize,
+  }) {
+    var scale = unified ? blockScale : style.sizeScale * blockScale;
+    if (style.baseline != TextBaselineShift.none) scale *= 0.7;
+    return baseSize * scale;
+  }
+
+  static List<_MeasurementRange>? _measurementRanges(
+    String text,
+    List<_SourceRunSlice> slices,
+  ) {
+    final ranges = <_MeasurementRange>[];
+    var offset = 0;
+    var sliceIndex = 0;
+    int? groupedStart;
+
+    void flushGroup() {
+      final start = groupedStart;
+      if (start != null && start < offset) {
+        ranges.add(_MeasurementRange(start, offset));
+      }
+      groupedStart = null;
+    }
+
+    for (final grapheme in text.characters) {
+      final end = offset + grapheme.length;
+      while (sliceIndex + 1 < slices.length &&
+          slices[sliceIndex].end <= offset) {
+        flushGroup();
+        sliceIndex++;
+      }
+      if (end > slices[sliceIndex].end) return null;
+      if (_requiresStandaloneMeasurement(grapheme)) {
+        flushGroup();
+        ranges.add(_MeasurementRange(offset, end));
+      } else {
+        groupedStart ??= offset;
+      }
+      offset = end;
+      if (offset == slices[sliceIndex].end) flushGroup();
+    }
+    flushGroup();
+    return offset == text.length ? ranges : null;
+  }
+
+  static bool _requiresStandaloneMeasurement(String grapheme) {
+    for (final rune in grapheme.runes) {
+      if (_isLayoutWhitespace(rune) ||
+          _isLayoutCjk(rune) ||
+          const {
+            0x2d,
+            0x2010,
+            0x2013,
+            0x2014,
+            0x200b,
+            0x2060,
+            0x00b7,
+            0x30fb,
+            0x300a,
+            0x3008,
+            0xff08,
+            0x300e,
+            0x300c,
+            0x3010,
+            0x3016,
+            0x3014,
+            0xff3b,
+            0xff5b,
+            0xff0c,
+            0xff0e,
+            0x3002,
+            0x3001,
+            0xff1a,
+            0xff1b,
+            0x300b,
+            0x3009,
+            0xff09,
+            0x300f,
+            0x300d,
+            0x3011,
+            0x3017,
+            0x3015,
+            0xff3d,
+            0xff5d,
+            0xff1f,
+            0xff01,
+            0x201c,
+            0x2018,
+            0x201d,
+            0x2019,
+          }.contains(rune)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool _isLayoutWhitespace(int rune) =>
+      String.fromCharCode(rune).trim().isEmpty;
+
+  static bool _isLayoutCjk(int rune) =>
+      rune == 0x30fc ||
+      (rune >= 0x3040 && rune <= 0x30ff) ||
+      (rune >= 0x3400 && rune <= 0x4dbf) ||
+      (rune >= 0x4e00 && rune <= 0x9fff) ||
+      (rune >= 0x20000 && rune <= 0x323af) ||
+      (rune >= 0xac00 && rune <= 0xd7af) ||
+      (rune >= 0xf900 && rune <= 0xfaff);
 
   static bool _usesFootnoteIcon(TextStyle style, String? link) {
     if (style.inlineRole == InlineRole.footnote) return true;
@@ -547,6 +1170,10 @@ class LayoutEngine {
       columnCount,
       contentWidth,
       unified,
+      style,
+      fontScale,
+      lineHeight,
+      padding,
     );
     final minimumRowHeight =
         style.baseFontSize * fontScale * lineHeight + padding * 2;
@@ -606,6 +1233,17 @@ class LayoutEngine {
     final normalizedGap = style.baseFontSize * 0.7;
     return _PreparedTable(
       columnWidths: columnWidths,
+      horizontalOffset: unified
+          ? math.max(
+              0,
+              (contentWidth -
+                      columnWidths.fold<double>(
+                        0,
+                        (sum, width) => sum + width,
+                      )) /
+                  2,
+            )
+          : 0,
       rowHeights: rowHeights,
       cells: cells,
       padding: padding,
@@ -624,20 +1262,71 @@ class LayoutEngine {
     int columnCount,
     double contentWidth,
     bool adaptive,
+    ReaderStyle style,
+    double fontScale,
+    double lineHeight,
+    double padding,
   ) {
     if (!adaptive) {
       return List.filled(columnCount, contentWidth / columnCount);
     }
-    final weights = List.filled(columnCount, 1.0);
-    for (final entry in cells.where((cell) => cell.columnSpan == 1)) {
-      final length = entry.cell.plainText.runes.length.clamp(1, 120);
-      weights[entry.column] = math.max(
-        weights[entry.column],
-        math.sqrt(length / 8).clamp(1.0, 3.0),
-      );
+    final equalWidth = contentWidth / columnCount;
+    final minimumWidth = math.max(
+      1.0,
+      math.min(style.baseFontSize * 3, equalWidth),
+    );
+    final preferred = List.filled(columnCount, minimumWidth);
+    for (final entry in cells) {
+      final measured = _buildTableCellParagraph(
+        entry.cell,
+        style,
+        16384,
+        fontScale,
+        lineHeight,
+      ).paragraph;
+      final desired =
+          (measured.maxIntrinsicWidth +
+                  padding * 2 +
+                  style.baseFontSize * fontScale * 0.5)
+              .clamp(minimumWidth, contentWidth);
+      measured.dispose();
+      final current = preferred
+          .skip(entry.column)
+          .take(entry.columnSpan)
+          .fold<double>(0, (sum, width) => sum + width);
+      if (desired <= current) continue;
+      final addition = (desired - current) / entry.columnSpan;
+      for (
+        var column = entry.column;
+        column < entry.column + entry.columnSpan;
+        column++
+      ) {
+        preferred[column] += addition;
+      }
     }
-    final total = weights.fold(0.0, (sum, weight) => sum + weight);
-    return [for (final weight in weights) contentWidth * weight / total];
+    final preferredTotal = preferred.fold<double>(
+      0,
+      (sum, width) => sum + width,
+    );
+    if (preferredTotal <= contentWidth) return preferred;
+    final minimumTotal = minimumWidth * columnCount;
+    if (minimumTotal >= contentWidth) {
+      return List.filled(columnCount, equalWidth);
+    }
+    final availableFlex = contentWidth - minimumTotal;
+    final preferredFlex = preferred.fold<double>(
+      0,
+      (sum, width) => sum + width - minimumWidth,
+    );
+    final fitted = [
+      for (final width in preferred)
+        minimumWidth +
+            availableFlex *
+                ((width - minimumWidth) / math.max(1, preferredFlex)),
+    ];
+    final fittedTotal = fitted.fold<double>(0, (sum, width) => sum + width);
+    fitted[fitted.length - 1] += contentWidth - fittedTotal;
+    return fitted;
   }
 
   _BuiltTableCellParagraph _buildTableCellParagraph(
@@ -706,9 +1395,7 @@ class LayoutEngine {
                   ? ui.FontWeight.bold
                   : null,
               fontStyle: runStyle.italic ? ui.FontStyle.italic : null,
-              decoration: link != null
-                  ? ui.TextDecoration.underline
-                  : _decorationFor(runStyle, includeUnderline: !unified),
+              decoration: _decorationFor(runStyle, includeUnderline: !unified),
               fontSize: style.baseFontSize * scale,
             ),
           );
@@ -729,11 +1416,89 @@ class LayoutEngine {
         case BreakInline():
           builder.addText('\n');
           paragraphOffset++;
+        case MathInline(:final latex, :final sizeScale):
+          if (latex.isEmpty) continue;
+          builder.pushStyle(
+            ui.TextStyle(
+              color: foreground,
+              fontSize: style.baseFontSize * fontScale * sizeScale,
+              fontFamily: 'monospace',
+              fontStyle: ui.FontStyle.italic,
+            ),
+          );
+          builder.addText(latex);
+          builder.pop();
+          paragraphOffset += latex.length;
       }
     }
     final paragraph = builder.build()
       ..layout(ui.ParagraphConstraints(width: width));
     return _BuiltTableCellParagraph(paragraph, links);
+  }
+
+  void _pushQuote(
+    _Paginator paginator,
+    QuoteBlock quote,
+    ReaderStyle style,
+    double contentLeft,
+    double contentWidth,
+    int spineIndex,
+    double sectionTextOffset,
+  ) {
+    final unified = style.typesettingMode == TypesettingMode.unified;
+    final horizontalPadding = unified ? style.baseFontSize * 2 : 0.0;
+    final quoteLeft = contentLeft + horizontalPadding;
+    final quoteWidth = math.max(40.0, contentWidth - horizontalPadding * 2);
+    final prepared = <_PreparedText>[];
+    var offset = sectionTextOffset;
+    for (final body in quote.body) {
+      final value = _prepareText(
+        body,
+        style,
+        spineIndex,
+        quoteLeft,
+        quoteWidth,
+        offset,
+      );
+      if (value != null) prepared.add(value);
+      offset += body.plainText.length;
+    }
+    final attribution = quote.attribution;
+    if (attribution != null) {
+      final value = _prepareText(
+        attribution,
+        style,
+        spineIndex,
+        quoteLeft,
+        quoteWidth,
+        offset,
+      );
+      if (value != null) prepared.add(value);
+    }
+    if (prepared.isEmpty) return;
+
+    if (unified) {
+      const verticalPadding = 12.0;
+      final outerGap = math.max(style.baseFontSize * 0.5, verticalPadding);
+      final contentHeight = prepared.fold<double>(
+        0,
+        (height, item) =>
+            height +
+            _preparedTextHeight(item) +
+            math.max(0, item.marginBefore) +
+            math.max(0, item.marginAfter),
+      );
+      paginator.prepareGroup(contentHeight + verticalPadding * 3, outerGap);
+      paginator.beginQuote(style.foreground, outerGap);
+      for (final item in prepared) {
+        paginator.pushText(item);
+      }
+      paginator.endQuote();
+    } else {
+      for (final item in prepared) {
+        paginator.pushText(item);
+      }
+    }
   }
 
   void _pushImage(
@@ -995,6 +1760,16 @@ class LayoutEngine {
     _ => '▪',
   };
 
+  static bool _supportsSpaceJustification(TextBlock block) {
+    for (final inline in block.inlines) {
+      if (inline is! TextRun) continue;
+      for (final rune in inline.text.runes) {
+        if (rune == 0x00a0 || _isLayoutCjk(rune)) return false;
+      }
+    }
+    return true;
+  }
+
   static ui.TextDecoration? _decorationFor(
     TextStyle style, {
     bool includeUnderline = true,
@@ -1002,6 +1777,18 @@ class LayoutEngine {
     final decorations = <ui.TextDecoration>[
       if (includeUnderline && style.underline) ui.TextDecoration.underline,
       if (style.strikethrough) ui.TextDecoration.lineThrough,
+    ];
+    if (decorations.isEmpty) return null;
+    return ui.TextDecoration.combine(decorations);
+  }
+
+  static ui.TextDecoration? _resolvedDecoration({
+    required bool underline,
+    required bool strikethrough,
+  }) {
+    final decorations = <ui.TextDecoration>[
+      if (underline) ui.TextDecoration.underline,
+      if (strikethrough) ui.TextDecoration.lineThrough,
     ];
     if (decorations.isEmpty) return null;
     return ui.TextDecoration.combine(decorations);
@@ -1031,6 +1818,43 @@ class _BuiltTableCellParagraph {
   const _BuiltTableCellParagraph(this.paragraph, this.links);
 }
 
+class _SourceRunSlice {
+  final int start;
+  final int end;
+  final TextStyle style;
+  final String? link;
+  final double fontSize;
+
+  const _SourceRunSlice({
+    required this.start,
+    required this.end,
+    required this.style,
+    required this.link,
+    required this.fontSize,
+  });
+}
+
+class _MeasurementRange {
+  final int start;
+  final int end;
+
+  const _MeasurementRange(this.start, this.end);
+}
+
+class _OptimizedParagraphBuild {
+  final ui.Paragraph paragraph;
+  final List<ui.LineMetrics> metrics;
+  final List<TextLinkRange> links;
+  final List<int> displayToSource;
+
+  const _OptimizedParagraphBuild({
+    required this.paragraph,
+    required this.metrics,
+    required this.links,
+    required this.displayToSource,
+  });
+}
+
 class _PreparedTableCell {
   final _GridTableCell grid;
   final ui.Paragraph paragraph;
@@ -1049,6 +1873,7 @@ class _PreparedTableCell {
 
 class _PreparedTable {
   final List<double> columnWidths;
+  final double horizontalOffset;
   final List<double> rowHeights;
   final List<_PreparedTableCell> cells;
   final double padding;
@@ -1058,6 +1883,7 @@ class _PreparedTable {
 
   const _PreparedTable({
     required this.columnWidths,
+    required this.horizontalOffset,
     required this.rowHeights,
     required this.cells,
     required this.padding,
@@ -1092,6 +1918,10 @@ class _PreparedText {
   final double sectionTextOffset;
   final List<TextLinkRange> links;
 
+  /// Maps UTF-16 offsets in a paragraph containing optimizer-inserted line
+  /// breaks back to offsets in the source text.
+  final List<int>? displayToSource;
+
   const _PreparedText({
     required this.paragraph,
     required this.metrics,
@@ -1111,6 +1941,7 @@ class _PreparedText {
     required this.spineIndex,
     required this.sectionTextOffset,
     required this.links,
+    required this.displayToSource,
   });
 }
 
@@ -1130,6 +1961,15 @@ class _PreparedImage {
   });
 }
 
+class _ActiveQuote {
+  final int color;
+  final double outerGap;
+  int? decorationIndex;
+  bool hasStarted = false;
+
+  _ActiveQuote({required this.color, required this.outerGap});
+}
+
 /// Port of torto's Paginator: a single-column cursor over the content area.
 class _Paginator {
   final double top;
@@ -1147,6 +1987,7 @@ class _Paginator {
 
   List<PageItem> items = [];
   final List<List<PageItem>> pages = [];
+  _ActiveQuote? activeQuote;
 
   _Paginator({
     required this.top,
@@ -1160,6 +2001,7 @@ class _Paginator {
 
   void pushText(_PreparedText prepared) {
     _collapseMargin(prepared.marginBefore);
+    _ensureQuoteDecoration();
     final metrics = prepared.metrics;
     final tops = prepared.lineTops;
     var lineStart = 0;
@@ -1224,6 +2066,7 @@ class _Paginator {
       );
       hasContent = true;
       cursorY += sliceBottom - sliceTop;
+      _updateQuoteDecoration();
       lineStart = lineEnd;
       if (lineStart < metrics.length) advance();
     }
@@ -1260,6 +2103,7 @@ class _Paginator {
         if (grid.row < row || grid.row >= groupEnd) continue;
         final x =
             left +
+            table.horizontalOffset +
             table.columnWidths
                 .take(grid.column)
                 .fold(0.0, (sum, width) => sum + width);
@@ -1332,6 +2176,52 @@ class _Paginator {
     }
   }
 
+  void beginQuote(int color, double outerGap) {
+    _collapseMargin(outerGap);
+    activeQuote = _ActiveQuote(color: color, outerGap: outerGap);
+  }
+
+  void _ensureQuoteDecoration() {
+    final active = activeQuote;
+    if (active == null || active.decorationIndex != null) return;
+    final index = items.length;
+    items.add(
+      QuotePlacement(
+        x: left,
+        y: cursorY,
+        width: width,
+        height: 12,
+        color: active.color,
+        continuedBefore: active.hasStarted,
+      ),
+    );
+    active
+      ..decorationIndex = index
+      ..hasStarted = true;
+    cursorY = math.min(bottom, cursorY + 12);
+    hasContent = true;
+  }
+
+  void _updateQuoteDecoration() {
+    final index = activeQuote?.decorationIndex;
+    if (index == null || index >= items.length) return;
+    final placement = items[index];
+    if (placement is QuotePlacement) {
+      placement.height = math.max(12, cursorY - placement.y);
+    }
+  }
+
+  void endQuote() {
+    final active = activeQuote;
+    if (active == null) return;
+    if (active.decorationIndex != null) {
+      cursorY = math.min(bottom, cursorY + 12);
+      _updateQuoteDecoration();
+    }
+    activeQuote = null;
+    _setMarginAfter(active.outerGap);
+  }
+
   void addSemanticSpacing(double amount) => _collapseMargin(amount);
 
   void finishGroup(double outerGap) => _setMarginAfter(outerGap);
@@ -1354,6 +2244,17 @@ class _Paginator {
   /// Commits the current page. Never emits an empty page.
   void advance() {
     if (items.isNotEmpty) {
+      final active = activeQuote;
+      final quoteIndex = active?.decorationIndex;
+      if (quoteIndex != null && quoteIndex < items.length) {
+        final placement = items[quoteIndex];
+        if (placement is QuotePlacement) {
+          placement
+            ..height = math.max(placement.height, bottom - placement.y)
+            ..continuedAfter = true;
+        }
+        active!.decorationIndex = null;
+      }
       if (centerStandaloneImage &&
           items.length == 1 &&
           items.single is ImagePlacement) {
@@ -1411,6 +2312,13 @@ class _Paginator {
     final position = prepared.paragraph.getPositionForOffset(
       ui.Offset(metric.left + 0.1, prepared.lineTops[line] + metric.height / 2),
     );
+    final mapping = prepared.displayToSource;
+    if (mapping != null) {
+      return mapping[position.offset.clamp(0, mapping.length - 1)].clamp(
+        0,
+        prepared.textLength,
+      );
+    }
     return (position.offset - prepared.syntheticPrefixLength).clamp(
       0,
       prepared.textLength,
