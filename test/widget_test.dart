@@ -62,7 +62,7 @@ void main() {
     await tester.runAsync(() => Future<void>.delayed(Duration.zero));
     await tester.pump();
 
-    expect(find.textContaining('No books yet'), findsOneWidget);
-    expect(find.byTooltip('Import book'), findsOneWidget);
+    expect(find.textContaining('书架还是空的'), findsOneWidget);
+    expect(find.byTooltip('导入书籍'), findsOneWidget);
   });
 }

@@ -5,8 +5,8 @@ import 'package:flutter/material.dart';
 import '../progress_store.dart';
 import '../reader/reader_page.dart';
 import '../reader/reader_controller.dart';
-import '../sync/cloud_settings_page.dart';
 import '../sync/cloud_sync_controller.dart';
+import '../../l10n/app_localizations.dart';
 import 'library_store.dart';
 
 /// Home screen: the imported EPUB library.
@@ -14,8 +14,16 @@ class LibraryPage extends StatefulWidget {
   /// Injectable for tests; defaults to the on-disk store.
   final LibraryStore? store;
   final ProgressStore? progressStore;
+  final CloudSyncController? cloudSyncController;
+  final bool initializeCloudSync;
 
-  const LibraryPage({super.key, this.store, this.progressStore});
+  const LibraryPage({
+    super.key,
+    this.store,
+    this.progressStore,
+    this.cloudSyncController,
+    this.initializeCloudSync = true,
+  });
 
   @override
   State<LibraryPage> createState() => _LibraryPageState();
@@ -26,6 +34,8 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   late final ProgressStore _progressStore =
       widget.progressStore ?? ProgressStore();
   CloudSyncController? _cloudSync;
+  bool _ownsCloudSync = false;
+  CloudSyncStatus? _lastCloudStatus;
   ReaderController? _activeReader;
 
   /// Null while the first load is in flight.
@@ -36,9 +46,18 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _refresh();
+    _cloudSync = widget.cloudSyncController;
+    _cloudSync?.addListener(_onCloudSyncChanged);
+    if (_cloudSync?.settings.enabled == true) {
+      unawaited(_sync(silent: true));
+    }
     // Injected stores are used by widget tests and deliberately stay isolated
     // from device plugins and the real cloud account.
-    if (widget.store == null) unawaited(_initializeCloudSync());
+    if (_cloudSync == null &&
+        widget.store == null &&
+        widget.initializeCloudSync) {
+      unawaited(_initializeCloudSync());
+    }
   }
 
   Future<void> _initializeCloudSync() async {
@@ -52,6 +71,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         return;
       }
       controller.addListener(_onCloudSyncChanged);
+      _ownsCloudSync = true;
       setState(() => _cloudSync = controller);
       if (controller.settings.enabled) unawaited(_sync(silent: true));
     } catch (_) {
@@ -61,6 +81,12 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   }
 
   void _onCloudSyncChanged() {
+    final status = _cloudSync?.status;
+    final completed =
+        status == CloudSyncStatus.success &&
+        _lastCloudStatus != CloudSyncStatus.success;
+    _lastCloudStatus = status;
+    if (completed) unawaited(_refresh());
     if (mounted) setState(() {});
   }
 
@@ -93,13 +119,22 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Imported "${LibraryStore.titleOf(file.path)}"'),
+          content: Text(
+            context.l10n.text(
+              '已导入“${LibraryStore.titleOf(file.path)}”',
+              'Imported "${LibraryStore.titleOf(file.path)}"',
+            ),
+          ),
         ),
       );
     } catch (_) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Could not import that file.')),
+        SnackBar(
+          content: Text(
+            context.l10n.text('无法导入该文件。', 'Could not import that file.'),
+          ),
+        ),
       );
     }
   }
@@ -108,16 +143,21 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Delete book?'),
-        content: Text('"${book.title}" will be removed from the library.'),
+        title: Text(context.l10n.text('删除书籍？', 'Delete book?')),
+        content: Text(
+          context.l10n.text(
+            '“${book.title}”将从书架中移除。',
+            '"${book.title}" will be removed from the library.',
+          ),
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('Cancel'),
+            child: Text(context.l10n.text('取消', 'Cancel')),
           ),
           FilledButton(
             onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('Delete'),
+            child: Text(context.l10n.text('删除', 'Delete')),
           ),
         ],
       ),
@@ -154,19 +194,6 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     if (_cloudSync?.settings.enabled == true) unawaited(_sync(silent: true));
   }
 
-  Future<void> _openCloudSettings() async {
-    final controller = _cloudSync;
-    if (controller == null) return;
-    final saved = await Navigator.of(context).push<bool>(
-      MaterialPageRoute<bool>(
-        builder: (_) => CloudSettingsPage(controller: controller),
-      ),
-    );
-    if (saved == true && controller.settings.enabled) {
-      await _sync();
-    }
-  }
-
   Future<void> _sync({bool silent = false}) async {
     final controller = _cloudSync;
     if (controller == null) return;
@@ -175,10 +202,13 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       await _refresh();
       if (!mounted || silent) return;
       final message = report.changed
-          ? 'Sync complete: ${report.uploadedBooks} uploaded, '
-                '${report.downloadedBooks} downloaded, '
-                '${report.mergedProgress + report.mergedAnnotations} reading updates.'
-          : 'Everything is up to date.';
+          ? context.l10n.text(
+              '同步完成：上传 ${report.uploadedBooks} 本，下载 ${report.downloadedBooks} 本，合并 ${report.mergedProgress + report.mergedAnnotations} 项阅读数据。',
+              'Sync complete: ${report.uploadedBooks} uploaded, '
+                  '${report.downloadedBooks} downloaded, '
+                  '${report.mergedProgress + report.mergedAnnotations} reading updates.',
+            )
+          : context.l10n.text('已是最新状态。', 'Everything is up to date.');
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text(message)));
@@ -190,9 +220,13 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
         // be refreshed.
       }
       if (!mounted || silent) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Cloud sync failed: $error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            context.l10n.text('云同步失败：$error', 'Cloud sync failed: $error'),
+          ),
+        ),
+      );
     }
   }
 
@@ -201,23 +235,18 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     final cloud = _cloudSync;
     cloud?.removeListener(_onCloudSyncChanged);
-    cloud?.dispose();
+    if (_ownsCloudSync) cloud?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final l10n = context.l10n;
     final books = _books;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('书架'),
+        title: Text(l10n.text('书架', 'Library')),
         actions: [
-          if (_cloudSync != null)
-            IconButton(
-              icon: const Icon(Icons.cloud_outlined),
-              tooltip: 'Cloud sync settings',
-              onPressed: _openCloudSettings,
-            ),
           if (_cloudSync?.settings.enabled == true)
             _cloudSync?.status == CloudSyncStatus.syncing
                 ? const Padding(
@@ -231,21 +260,24 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
                   )
                 : IconButton(
                     icon: const Icon(Icons.sync),
-                    tooltip: 'Sync now',
+                    tooltip: l10n.text('立即同步', 'Sync now'),
                     onPressed: _sync,
                   ),
           IconButton(
             icon: const Icon(Icons.add),
-            tooltip: 'Import book',
+            tooltip: l10n.text('导入书籍', 'Import book'),
             onPressed: _import,
           ),
         ],
       ),
       body: switch (books) {
         null => const Center(child: CircularProgressIndicator()),
-        [] => const Center(
+        [] => Center(
           child: Text(
-            'No books yet.\nTap + to import an EPUB, FB2, CBZ,\nMOBI, CHM or PDF.',
+            l10n.text(
+              '书架还是空的。\n点击 + 导入 EPUB、FB2、CBZ、\nMOBI、CHM 或 PDF。',
+              'No books yet.\nTap + to import an EPUB, FB2, CBZ,\nMOBI, CHM or PDF.',
+            ),
             textAlign: TextAlign.center,
           ),
         ),

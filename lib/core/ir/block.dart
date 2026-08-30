@@ -77,7 +77,19 @@ class TextRun extends Inline {
   /// this run is inside an <a>.
   final String? link;
 
-  const TextRun(this.text, {this.style = TextStyle.plain, this.link});
+  /// Nearest authored HTML `lang`/`xml:lang` value for this run.
+  ///
+  /// Language affects shaping and line breaking, so it is intentionally not
+  /// folded into the visual [style]. Null allows publication metadata to be
+  /// used as a fallback by the layout stage.
+  final String? language;
+
+  const TextRun(
+    this.text, {
+    this.style = TextStyle.plain,
+    this.link,
+    this.language,
+  });
 }
 
 /// Explicit line break (<br>).

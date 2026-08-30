@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.1.0+1
+version: 0.2.0+2008
 
 environment:
   sdk: ^3.11.3
@@ -29,6 +29,8 @@ environment:
 # versions available, run `flutter pub outdated`.
 dependencies:
   flutter:
+    sdk: flutter
+  flutter_localizations:
     sdk: flutter
 
   # The following adds the Cupertino Icons font to your application.
@@ -64,6 +66,9 @@ dependencies:
   # segmenter family used by the desktop renderer; Knuth-Plass selection
   # remains implemented in Dart.
   icu4x: ^2.3.1
+  # Dictionary-backed discretionary English hyphenation. Only en-US/en-GB
+  # dictionaries are bundled; paragraph layout and source mapping stay Dart.
+  hyphen: ^0.3.1
 
 dev_dependencies:
   flutter_test:
@@ -96,6 +101,10 @@ flutter:
 
   assets:
     - android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+    - assets/hyphenation/hyph_en_US.dic
+    - assets/hyphenation/hyph_en_GB.dic
+    - assets/hyphenation/README_hyph_en_US.txt
+    - assets/hyphenation/README_hyph_en_GB.txt
 
   # To add assets to your application, add an assets section, like this:
   # assets:

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../l10n/app_localizations.dart';
 import 'toc_items.dart';
 
 /// Table-of-contents drawer for the reader, modeled on torto's desktop
@@ -97,7 +98,9 @@ class _TocDrawerState extends State<TocDrawer> {
     return Drawer(
       child: SafeArea(
         child: visible.isEmpty
-            ? const Center(child: Text('No table of contents'))
+            ? Center(
+                child: Text(context.l10n.text('没有目录', 'No table of contents')),
+              )
             : ListView.builder(
                 controller: _scroll,
                 itemCount: visible.length,
@@ -130,7 +133,9 @@ class _TocDrawerState extends State<TocDrawer> {
                     ? IconButton(
                         padding: EdgeInsets.zero,
                         iconSize: 20,
-                        tooltip: expanded ? 'Collapse' : 'Expand',
+                        tooltip: expanded
+                            ? context.l10n.text('收起', 'Collapse')
+                            : context.l10n.text('展开', 'Expand'),
                         icon: Icon(
                           expanded ? Icons.expand_more : Icons.chevron_right,
                         ),

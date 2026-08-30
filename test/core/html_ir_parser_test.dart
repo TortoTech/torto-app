@@ -64,6 +64,20 @@ void main() {
       expect(block.plainText, 'Hello world');
     });
 
+    test('retains nearest lang and xml:lang on individual text runs', () {
+      final section = parseSection(
+        '<div lang="en-US"><p>American '
+        '<span xml:lang="en-GB">British</span> again</p>'
+        '<p lang="fr">Français</p></div>',
+      );
+      final first = textBlock(section, 0).inlines.whereType<TextRun>().toList();
+      final second = textBlock(section, 1).inlines.single as TextRun;
+
+      expect(first.map((run) => run.text), ['American ', 'British', ' again']);
+      expect(first.map((run) => run.language), ['en-US', 'en-GB', 'en-US']);
+      expect(second.language, 'fr');
+    });
+
     test('blockquote retains quoted paragraphs as a semantic unit', () {
       final section = parseSection('<blockquote><p>quoted</p></blockquote>');
       final quote = quoteBlock(section, 0);

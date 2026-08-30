@@ -62,6 +62,10 @@ class ReaderStyle {
   /// Publication-wide script hint used by automatic unified indentation.
   final WritingSystem writingSystem;
 
+  /// Canonical publication language used only when a paragraph/run does not
+  /// carry a nearer authored language. Empty disables language fallback.
+  final String publicationLanguage;
+
   const ReaderStyle({
     this.baseFontSize = 20,
     this.lineHeight = 1.5,
@@ -74,6 +78,7 @@ class ReaderStyle {
     this.typesettingMode = TypesettingMode.unified,
     this.lineBreakStrategy = LineBreakStrategy.optimized,
     this.writingSystem = WritingSystem.unknown,
+    this.publicationLanguage = '',
   });
 
   /// Matches torto desktop's automatic paragraph/quote indentation profile.
@@ -95,6 +100,7 @@ class ReaderStyle {
     TypesettingMode? typesettingMode,
     LineBreakStrategy? lineBreakStrategy,
     WritingSystem? writingSystem,
+    String? publicationLanguage,
   }) => ReaderStyle(
     baseFontSize: baseFontSize ?? this.baseFontSize,
     lineHeight: lineHeight ?? this.lineHeight,
@@ -107,6 +113,7 @@ class ReaderStyle {
     typesettingMode: typesettingMode ?? this.typesettingMode,
     lineBreakStrategy: lineBreakStrategy ?? this.lineBreakStrategy,
     writingSystem: writingSystem ?? this.writingSystem,
+    publicationLanguage: publicationLanguage ?? this.publicationLanguage,
   );
 
   @override
@@ -122,7 +129,8 @@ class ReaderStyle {
       other.background == background &&
       other.typesettingMode == typesettingMode &&
       other.lineBreakStrategy == lineBreakStrategy &&
-      other.writingSystem == writingSystem;
+      other.writingSystem == writingSystem &&
+      other.publicationLanguage == publicationLanguage;
 
   @override
   int get hashCode => Object.hash(
@@ -137,6 +145,7 @@ class ReaderStyle {
     typesettingMode,
     lineBreakStrategy,
     writingSystem,
+    publicationLanguage,
   );
 }
 

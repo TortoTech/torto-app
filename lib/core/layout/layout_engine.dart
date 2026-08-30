@@ -15,6 +15,7 @@ import 'package:characters/characters.dart';
 import 'package:flutter/foundation.dart';
 
 import '../ir/ir.dart';
+import '../linebreak/english_hyphenator.dart';
 import '../linebreak/paragraph_optimizer.dart';
 import '../linebreak/unicode_line_breaker.dart';
 import 'layout_types.dart';
@@ -36,8 +37,14 @@ const double _eps = 0.01;
 /// Desktop torto's minimum spacing around authored images in book mode.
 const double _imageBlockGap = 14.0;
 
+/// Opt-in release diagnostics for device-side hyphenation investigations.
+const bool _debugHyphenation = bool.fromEnvironment('TORTO_DEBUG_HYPHENATION');
+const String _readerFontFamily = 'sans-serif';
+
 class LayoutEngine {
-  const LayoutEngine();
+  final ParagraphHyphenator? hyphenator;
+
+  const LayoutEngine({this.hyphenator});
 
   @visibleForTesting
   static ({bool bold, bool italic, bool underline, bool strikethrough})
@@ -440,7 +447,7 @@ class LayoutEngine {
     if (!hasText) return null;
 
     final foreground = ui.Color(style.foreground);
-    final fontFamily = isPre ? 'monospace' : null;
+    final fontFamily = isPre ? 'monospace' : _readerFontFamily;
     final align = switch (resolvedAlign) {
       BlockAlign.start => ui.TextAlign.left,
       BlockAlign.center => ui.TextAlign.center,
@@ -562,14 +569,22 @@ class LayoutEngine {
 
     ui.Paragraph? markerParagraph;
     if (marker.isNotEmpty) {
-      final markerBuilder = ui.ParagraphBuilder(
-        ui.ParagraphStyle(
-          textAlign: ui.TextAlign.left,
-          textDirection: ui.TextDirection.ltr,
-          fontSize: baseSize,
-          height: paragraphLineHeight,
-        ),
-      )..pushStyle(ui.TextStyle(color: foreground, fontSize: baseSize));
+      final markerBuilder =
+          ui.ParagraphBuilder(
+            ui.ParagraphStyle(
+              textAlign: ui.TextAlign.left,
+              textDirection: ui.TextDirection.ltr,
+              fontSize: baseSize,
+              height: paragraphLineHeight,
+              fontFamily: _readerFontFamily,
+            ),
+          )..pushStyle(
+            ui.TextStyle(
+              color: foreground,
+              fontSize: baseSize,
+              fontFamily: _readerFontFamily,
+            ),
+          );
       markerBuilder.addText('$marker\u00a0');
       markerBuilder.pop();
       markerParagraph = markerBuilder.build();
@@ -589,6 +604,9 @@ class LayoutEngine {
         (((block.kind == TextBlockKind.paragraph ||
                     block.kind == TextBlockKind.blockquote) &&
                 resolvedAlign == BlockAlign.justify) ||
+            (block.kind == TextBlockKind.listItem &&
+                (resolvedAlign == BlockAlign.start ||
+                    resolvedAlign == BlockAlign.justify)) ||
             (block.kind == TextBlockKind.caption &&
                 resolvedAlign == BlockAlign.start))) {
       final optimized = _tryBuildOptimizedParagraph(
@@ -603,6 +621,7 @@ class LayoutEngine {
         isQuote: isQuote,
         firstLineIndent: indentWidth,
         width: width,
+        publicationLanguage: style.publicationLanguage,
       );
       if (optimized != null) {
         paragraph.dispose();
@@ -733,6 +752,7 @@ class LayoutEngine {
     required bool isQuote,
     required double firstLineIndent,
     required double width,
+    required String publicationLanguage,
   }) {
     final slices = <_SourceRunSlice>[];
     final text = StringBuffer();
@@ -743,9 +763,17 @@ class LayoutEngine {
           return null;
         case MathInline():
           return null;
-        case TextRun(text: final value, style: final runStyle, :final link):
+        case TextRun(
+          text: final value,
+          style: final runStyle,
+          :final link,
+          :final language,
+        ):
           if (value.isEmpty) continue;
-          if (_usesFootnoteIcon(runStyle, link)) return null;
+          final footnoteIcon = _usesFootnoteIcon(runStyle, link);
+          final authoredScale = unified
+              ? blockScale
+              : runStyle.sizeScale * blockScale;
           final start = sourceOffset;
           sourceOffset += value.length;
           text.write(value);
@@ -755,6 +783,11 @@ class LayoutEngine {
               end: sourceOffset,
               style: runStyle,
               link: link,
+              language: language,
+              footnoteIcon: footnoteIcon,
+              footnoteSize: footnoteIcon
+                  ? (baseSize * authoredScale * 0.78).clamp(8.0, 12.0)
+                  : 0,
               fontSize: _resolvedFontSize(
                 runStyle,
                 unified: unified,
@@ -770,6 +803,28 @@ class LayoutEngine {
     final legalBreaks = Icu4xLineBreaker.instance.breakOpportunities(
       sourceText,
     );
+    final hyphenationBreaks =
+        hyphenator?.breakOpportunities(
+          text: sourceText,
+          spans: [
+            for (final slice in slices)
+              HyphenationSpan(
+                start: slice.start,
+                end: slice.end,
+                language: slice.language,
+                suppress: slice.link != null || slice.footnoteIcon,
+              ),
+          ],
+          publicationLanguage: publicationLanguage,
+        ) ??
+        const <int>{};
+    final measurementBreaks = {...legalBreaks, ...hyphenationBreaks};
+    if (_debugHyphenation && hyphenationBreaks.isNotEmpty) {
+      debugPrint(
+        'TORTO_HYPH candidates=${hyphenationBreaks.length} '
+        'language=$publicationLanguage text=${sourceText.substring(0, math.min(60, sourceText.length))}',
+      );
+    }
 
     final measureBuilder = ui.ParagraphBuilder(
       ui.ParagraphStyle(
@@ -781,6 +836,14 @@ class LayoutEngine {
       ),
     );
     for (final slice in slices) {
+      if (slice.footnoteIcon) {
+        _appendFootnotePlaceholder(
+          measureBuilder,
+          sourceText.substring(slice.start, slice.end),
+          slice.footnoteSize,
+        );
+        continue;
+      }
       measureBuilder.pushStyle(
         _resolvedUiTextStyle(
           runStyle: slice.style,
@@ -800,7 +863,7 @@ class LayoutEngine {
     }
     final measurement = measureBuilder.build()
       ..layout(const ui.ParagraphConstraints(width: 1000000));
-    final ranges = _measurementRanges(sourceText, slices, legalBreaks);
+    final ranges = _measurementRanges(sourceText, slices, measurementBreaks);
     if (ranges == null) {
       measurement.dispose();
       return null;
@@ -816,6 +879,23 @@ class LayoutEngine {
       if (range.end > slice.end) {
         measurement.dispose();
         return null;
+      }
+      if (slice.footnoteIcon) {
+        if (range.start != slice.start || range.end != slice.end) {
+          measurement.dispose();
+          return null;
+        }
+        measured.add(
+          MeasuredCluster(
+            start: range.start,
+            end: range.end,
+            advance: slice.footnoteSize,
+            em: slice.fontSize,
+            ordinaryBaseline: false,
+            footnoteReference: true,
+          ),
+        );
+        continue;
       }
       final boxes = measurement.getBoxesForRange(range.start, range.end);
       var advance = boxes.fold<double>(
@@ -844,15 +924,63 @@ class LayoutEngine {
       );
     }
     measurement.dispose();
+    final hyphenBreakWidths = <int, double>{};
+    var hyphenSliceIndex = 0;
+    final orderedHyphenBreaks = hyphenationBreaks.toList()..sort();
+    for (final offset in orderedHyphenBreaks) {
+      if (offset <= 0 || offset >= sourceText.length) continue;
+      while (hyphenSliceIndex + 1 < slices.length &&
+          slices[hyphenSliceIndex].end < offset) {
+        hyphenSliceIndex++;
+      }
+      final slice = slices[hyphenSliceIndex];
+      if (offset <= slice.start || offset > slice.end) continue;
+      final advance = _measureDiscretionaryHyphen(
+        slice: slice,
+        unified: unified,
+        blockScale: blockScale,
+        baseSize: baseSize,
+        lineHeight: lineHeight,
+        foreground: foreground,
+        fontFamily: fontFamily,
+        isHeading: isHeading,
+        isQuote: isQuote,
+        isDefinitionTerm: block.kind == TextBlockKind.definitionTerm,
+      );
+      if (advance.isFinite && advance > 0) {
+        hyphenBreakWidths[offset] = advance;
+      }
+    }
+    // Leave one physical-pixel-sized sliver for SkParagraph shaping and
+    // letter-spacing rounding. Without it, a line that is mathematically an
+    // exact fit can auto-wrap its final word before our explicit line break.
+    final optimizedWidth = math.max(
+      1.0,
+      width - math.min(1.0, baseSize * 0.05),
+    );
     final plan = const ParagraphOptimizer().plan(
       text: sourceText,
       clusters: measured,
       legalBreaks: legalBreaks,
-      lineWidth: width,
+      hyphenBreaks: hyphenBreakWidths,
+      lineWidth: optimizedWidth,
       firstLineIndent: firstLineIndent,
       defaultEm: baseSize,
     );
-    if (plan == null || plan.lines.length < 2) return null;
+    if (plan == null || plan.lines.length < 2) {
+      if (_debugHyphenation && hyphenationBreaks.isNotEmpty) {
+        debugPrint(
+          'TORTO_HYPH rejected=optimizer-null candidates=${hyphenationBreaks.length}',
+        );
+      }
+      return null;
+    }
+    if (_debugHyphenation && hyphenationBreaks.isNotEmpty) {
+      debugPrint(
+        'TORTO_HYPH planned=${plan.lines.length} '
+        'selected=${plan.lines.where((line) => line.hyphenated).length}',
+      );
+    }
 
     final builder = ui.ParagraphBuilder(
       ui.ParagraphStyle(
@@ -881,6 +1009,7 @@ class LayoutEngine {
     final sourceToDisplayEnd = List<int>.filled(sourceText.length + 1, -1);
     sourceToDisplayStart[0] = displayOffset;
     sourceToDisplayEnd[0] = displayOffset;
+    final intendedLineEnds = <int>[];
     var activeSlice = 0;
     for (var lineIndex = 0; lineIndex < plan.lines.length; lineIndex++) {
       final line = plan.lines[lineIndex];
@@ -911,6 +1040,24 @@ class LayoutEngine {
         }
         final sourceStart = cluster.start;
         final sourceEnd = measured[segmentEnd - 1].end;
+
+        if (slice.footnoteIcon) {
+          _appendFootnotePlaceholder(
+            builder,
+            sourceText.substring(sourceStart, sourceEnd),
+            slice.footnoteSize,
+          );
+          for (var unit = sourceStart; unit < sourceEnd; unit++) {
+            sourceToDisplayStart[unit] = displayOffset;
+            sourceToDisplayEnd[unit] = displayOffset;
+            displayOffset++;
+            displayToSource.add(unit + 1);
+          }
+          sourceToDisplayStart[sourceEnd] = displayOffset;
+          sourceToDisplayEnd[sourceEnd] = displayOffset;
+          clusterIndex = segmentEnd;
+          continue;
+        }
 
         void addSegment(int start, int end, double? letterSpacing) {
           if (end <= start) return;
@@ -960,7 +1107,29 @@ class LayoutEngine {
       }
       if (lineIndex + 1 < plan.lines.length) {
         final boundary = measured[line.endCluster - 1].end;
+        if (line.hyphenated) {
+          final slice = slices[activeSlice];
+          builder.pushStyle(
+            _resolvedUiTextStyle(
+              runStyle: slice.style,
+              linked: slice.link != null,
+              unified: unified,
+              blockScale: blockScale,
+              baseSize: baseSize,
+              foreground: foreground,
+              fontFamily: fontFamily,
+              isHeading: isHeading,
+              isQuote: isQuote,
+              isDefinitionTerm: block.kind == TextBlockKind.definitionTerm,
+            ),
+          );
+          builder.addText('\u2010');
+          builder.pop();
+          displayOffset++;
+          displayToSource.add(boundary);
+        }
         sourceToDisplayEnd[boundary] = displayOffset;
+        intendedLineEnds.add(displayOffset);
         builder.addText('\n');
         displayOffset++;
         displayToSource.add(boundary);
@@ -971,20 +1140,51 @@ class LayoutEngine {
       ..layout(ui.ParagraphConstraints(width: width));
     final metrics = paragraph.computeLineMetrics();
     if (metrics.length != plan.lines.length) {
+      if (_debugHyphenation && hyphenationBreaks.isNotEmpty) {
+        final planned = plan.lines
+            .map(
+              (line) =>
+                  '${line.naturalWidth.toStringAsFixed(1)}${line.hyphenated ? 'h' : ''}',
+            )
+            .join(',');
+        final actual = metrics
+            .map(
+              (metric) =>
+                  '${metric.width.toStringAsFixed(1)}${metric.hardBreak ? '!' : ''}',
+            )
+            .join(',');
+        final intended = intendedLineEnds
+            .map((offset) => paragraph.getLineNumberAt(math.max(0, offset - 1)))
+            .join(',');
+        debugPrint(
+          'TORTO_HYPH rejected=line-count planned=${plan.lines.length} '
+          'actual=${metrics.length} plan=[$planned] metrics=[$actual] '
+          'ends=[$intended]',
+        );
+      }
       paragraph.dispose();
       return null;
     }
     final tolerance = math.max(1.0, width * 0.01);
     for (var index = 0; index + 1 < metrics.length; index++) {
-      if ((metrics[index].width - width).abs() > tolerance) {
+      if ((metrics[index].width - optimizedWidth).abs() > tolerance) {
+        if (_debugHyphenation && hyphenationBreaks.isNotEmpty) {
+          debugPrint(
+            'TORTO_HYPH rejected=width line=$index '
+            'actual=${metrics[index].width} target=$optimizedWidth',
+          );
+        }
         paragraph.dispose();
         return null;
       }
     }
+    if (_debugHyphenation && hyphenationBreaks.isNotEmpty) {
+      debugPrint('TORTO_HYPH accepted');
+    }
     final links = <TextLinkRange>[];
     for (final slice in slices) {
       final link = slice.link;
-      if (link == null) continue;
+      if (link == null && !slice.footnoteIcon) continue;
       final start = sourceToDisplayStart[slice.start];
       final end = sourceToDisplayEnd[slice.end];
       if (start < 0 || end <= start) continue;
@@ -992,9 +1192,13 @@ class LayoutEngine {
         TextLinkRange(
           start: start,
           end: end,
-          href: link,
+          href: link ?? '',
           marker: sourceText.substring(slice.start, slice.end).trim(),
           role: slice.style.linkRole,
+          footnoteIcon: slice.footnoteIcon,
+          inlineNote: slice.style.inlineRole == InlineRole.footnote
+              ? sourceText.substring(slice.start, slice.end).trim()
+              : null,
         ),
       );
     }
@@ -1004,6 +1208,50 @@ class LayoutEngine {
       links: links,
       displayToSource: displayToSource,
     );
+  }
+
+  static double _measureDiscretionaryHyphen({
+    required _SourceRunSlice slice,
+    required bool unified,
+    required double blockScale,
+    required double baseSize,
+    required double lineHeight,
+    required ui.Color foreground,
+    required String? fontFamily,
+    required bool isHeading,
+    required bool isQuote,
+    required bool isDefinitionTerm,
+  }) {
+    final builder = ui.ParagraphBuilder(
+      ui.ParagraphStyle(
+        textAlign: ui.TextAlign.left,
+        textDirection: ui.TextDirection.ltr,
+        fontSize: baseSize * blockScale,
+        height: lineHeight,
+        fontFamily: fontFamily,
+      ),
+    );
+    builder.pushStyle(
+      _resolvedUiTextStyle(
+        runStyle: slice.style,
+        linked: slice.link != null,
+        unified: unified,
+        blockScale: blockScale,
+        baseSize: baseSize,
+        foreground: foreground,
+        fontFamily: fontFamily,
+        isHeading: isHeading,
+        isQuote: isQuote,
+        isDefinitionTerm: isDefinitionTerm,
+      ),
+    );
+    builder.addText('\u2010');
+    builder.pop();
+    final paragraph = builder.build()
+      ..layout(const ui.ParagraphConstraints(width: 1000));
+    final advance = paragraph.maxIntrinsicWidth;
+    paragraph.dispose();
+    return advance;
   }
 
   static double _resolvedFontSize(
@@ -1043,6 +1291,16 @@ class LayoutEngine {
         sliceIndex++;
       }
       if (end > slices[sliceIndex].end) return null;
+      if (slices[sliceIndex].footnoteIcon) {
+        flushGroup();
+        if (offset == slices[sliceIndex].start) {
+          ranges.add(
+            _MeasurementRange(slices[sliceIndex].start, slices[sliceIndex].end),
+          );
+        }
+        offset = end;
+        continue;
+      }
       if (_requiresStandaloneMeasurement(grapheme)) {
         flushGroup();
         ranges.add(_MeasurementRange(offset, end));
@@ -1382,6 +1640,7 @@ class LayoutEngine {
         textDirection: ui.TextDirection.ltr,
         fontSize: style.baseFontSize * fontScale,
         height: unified ? lineHeight : lineHeight * cell.style.lineHeight,
+        fontFamily: _readerFontFamily,
       ),
     );
     final links = <TextLinkRange>[];
@@ -1431,6 +1690,7 @@ class LayoutEngine {
               fontStyle: runStyle.italic ? ui.FontStyle.italic : null,
               decoration: _decorationFor(runStyle, includeUnderline: !unified),
               fontSize: style.baseFontSize * scale,
+              fontFamily: _readerFontFamily,
             ),
           );
           builder.addText(text);
@@ -1774,6 +2034,9 @@ class LayoutEngine {
     double contentWidth,
     double sectionTextOffset,
   ) {
+    // Desktop rule: probe with centered layout first. A one-line caption
+    // stays centered; a multi-line caption is rebuilt start-aligned through
+    // the whole-paragraph optimizer (including ICU and hyphenation).
     var prepared = _prepareText(
       caption,
       style,
@@ -1910,6 +2173,9 @@ class _SourceRunSlice {
   final int end;
   final TextStyle style;
   final String? link;
+  final String? language;
+  final bool footnoteIcon;
+  final double footnoteSize;
   final double fontSize;
 
   const _SourceRunSlice({
@@ -1917,6 +2183,9 @@ class _SourceRunSlice {
     required this.end,
     required this.style,
     required this.link,
+    required this.language,
+    required this.footnoteIcon,
+    required this.footnoteSize,
     required this.fontSize,
   });
 }

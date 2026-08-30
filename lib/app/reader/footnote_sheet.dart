@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../core/linebreak/english_hyphenator.dart';
 import '../../core/linebreak/paragraph_optimizer.dart';
 import '../../core/linebreak/unicode_line_breaker.dart';
 
@@ -9,8 +10,31 @@ Future<void> showReaderFootnoteSheet(
   required String text,
   required Color background,
   required Color foreground,
-}) {
+  String publicationLanguage = '',
+}) async {
+  await EnglishHyphenator.instance.ensureLoadedForLanguage(publicationLanguage);
+  if (!context.mounted) return;
   final viewport = MediaQuery.sizeOf(context);
+  final baseTheme = Theme.of(context);
+  final brightness = background.computeLuminance() < 0.5
+      ? Brightness.dark
+      : Brightness.light;
+  final colorScheme = ColorScheme.fromSeed(
+    seedColor: baseTheme.colorScheme.primary,
+    brightness: brightness,
+  ).copyWith(surface: background, onSurface: foreground);
+  final sheetTheme = baseTheme.copyWith(
+    brightness: brightness,
+    colorScheme: colorScheme,
+    bottomSheetTheme: baseTheme.bottomSheetTheme.copyWith(
+      backgroundColor: background,
+    ),
+    iconTheme: baseTheme.iconTheme.copyWith(color: foreground),
+    textTheme: baseTheme.textTheme.apply(
+      bodyColor: foreground,
+      displayColor: foreground,
+    ),
+  );
   return showModalBottomSheet<void>(
     context: context,
     backgroundColor: background,
@@ -22,19 +46,27 @@ Future<void> showReaderFootnoteSheet(
       maxWidth: viewport.width,
       maxHeight: viewport.height * 0.75,
     ),
-    builder: (context) =>
-        ReaderFootnoteSheet(text: text, foreground: foreground),
+    builder: (context) => Theme(
+      data: sheetTheme,
+      child: ReaderFootnoteSheet(
+        text: text,
+        foreground: foreground,
+        publicationLanguage: publicationLanguage,
+      ),
+    ),
   );
 }
 
 class ReaderFootnoteSheet extends StatelessWidget {
   final String text;
   final Color foreground;
+  final String publicationLanguage;
 
   const ReaderFootnoteSheet({
     super.key,
     required this.text,
     required this.foreground,
+    this.publicationLanguage = '',
   });
 
   @override
@@ -46,7 +78,13 @@ class ReaderFootnoteSheet extends StatelessWidget {
         padding: const EdgeInsets.fromLTRB(24, 4, 24, 28),
         child: OptimizedJustifiedText(
           text,
-          style: TextStyle(color: foreground, fontSize: 17, height: 1.55),
+          publicationLanguage: publicationLanguage,
+          style: TextStyle(
+            color: foreground,
+            fontFamily: 'sans-serif',
+            fontSize: 17,
+            height: 1.55,
+          ),
         ),
       ),
     ),
@@ -59,8 +97,16 @@ class ReaderFootnoteSheet extends StatelessWidget {
 class OptimizedJustifiedText extends StatelessWidget {
   final String text;
   final TextStyle style;
+  final String publicationLanguage;
+  final ParagraphHyphenator? hyphenator;
 
-  const OptimizedJustifiedText(this.text, {super.key, required this.style});
+  const OptimizedJustifiedText(
+    this.text, {
+    super.key,
+    required this.style,
+    this.publicationLanguage = '',
+    this.hyphenator,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -75,7 +121,12 @@ class OptimizedJustifiedText extends StatelessWidget {
             if (paragraphs[index].isEmpty)
               SizedBox(height: lineHeight)
             else
-              _OptimizedParagraphText(paragraphs[index], style: style),
+              _OptimizedParagraphText(
+                paragraphs[index],
+                style: style,
+                publicationLanguage: publicationLanguage,
+                hyphenator: hyphenator ?? EnglishHyphenator.instance,
+              ),
           ],
         ],
       ),
@@ -86,8 +137,15 @@ class OptimizedJustifiedText extends StatelessWidget {
 class _OptimizedParagraphText extends StatelessWidget {
   final String text;
   final TextStyle style;
+  final String publicationLanguage;
+  final ParagraphHyphenator hyphenator;
 
-  const _OptimizedParagraphText(this.text, {required this.style});
+  const _OptimizedParagraphText(
+    this.text, {
+    required this.style,
+    required this.publicationLanguage,
+    required this.hyphenator,
+  });
 
   @override
   Widget build(BuildContext context) => LayoutBuilder(
@@ -99,6 +157,8 @@ class _OptimizedParagraphText extends StatelessWidget {
         style,
         width,
         MediaQuery.textScalerOf(context),
+        publicationLanguage,
+        hyphenator,
       );
       if (span == null) {
         return Text(text, style: style, textAlign: TextAlign.justify);
@@ -118,6 +178,8 @@ TextSpan? _optimizedTextSpan(
   TextStyle style,
   double width,
   TextScaler textScaler,
+  String publicationLanguage,
+  ParagraphHyphenator hyphenator,
 ) {
   final ranges = <({int start, int end})>[];
   var offset = 0;
@@ -167,10 +229,28 @@ TextSpan? _optimizedTextSpan(
   }
   measurement.dispose();
 
+  final hyphenationBreaks = hyphenator.breakOpportunities(
+    text: text,
+    spans: [HyphenationSpan(start: 0, end: text.length)],
+    publicationLanguage: publicationLanguage,
+  );
+  final hyphenPainter = TextPainter(
+    text: TextSpan(text: '\u2010', style: style),
+    textDirection: TextDirection.ltr,
+    textScaler: textScaler,
+    maxLines: 1,
+  )..layout();
+  final hyphenWidth = hyphenPainter.width;
+  hyphenPainter.dispose();
+
   final plan = const ParagraphOptimizer().plan(
     text: text,
     clusters: clusters,
     legalBreaks: Icu4xLineBreaker.instance.breakOpportunities(text),
+    hyphenBreaks: {
+      for (final offset in hyphenationBreaks)
+        if (hyphenWidth.isFinite && hyphenWidth > 0) offset: hyphenWidth,
+    },
     lineWidth: width,
     firstLineIndent: 0,
     defaultEm: textScaler.scale(style.fontSize ?? 17),
@@ -206,6 +286,7 @@ TextSpan? _optimizedTextSpan(
     }
     flushPlain();
     if (lineIndex + 1 < plan.lines.length) {
+      if (line.hyphenated) children.add(const TextSpan(text: '\u2010'));
       children.add(const TextSpan(text: '\n'));
     }
   }

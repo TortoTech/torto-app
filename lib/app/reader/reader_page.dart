@@ -2,10 +2,14 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../../core/ir/style.dart' show LinkRole;
 import '../../core/layout/layout_types.dart';
 import '../../core/render/page_painter.dart';
+import '../../l10n/app_localizations.dart';
+import '../settings/ai_providers_page.dart';
+import '../settings/app_preferences.dart';
 import 'footnote_sheet.dart';
 import 'reader_controller.dart';
 import 'reader_preferences_store.dart';
@@ -45,8 +49,12 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     marginLeft: 24,
     marginRight: 24,
   );
-  static const _background = Color(0xFFFAF8F3);
-  static const _foreground = Color(0xFF000000);
+  static const _lightBackground = Color(0xFFFAF8F3);
+  static const _lightForeground = Color(0xFF000000);
+  static const _darkBackground = Color(0xFF000000);
+  static const _darkForeground = Color(0xFF959595);
+  static const _darkChromeBackground = Color(0xFF1C1C1C);
+  static const _darkChromeForeground = Color(0xFFB4B4B6);
 
   ReaderController? _controller;
   late final ReaderPreferencesStore _preferencesStore;
@@ -54,7 +62,15 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
   bool _ownsController = false;
   bool _opening = false;
   bool _overlayVisible = false;
+  bool _darkMode = false;
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+
+  Color get _background => Color(_style.background);
+  Color get _foreground => Color(_style.foreground);
+  Color get _chromeBackground =>
+      _darkMode ? _darkChromeBackground : _background;
+  Color get _chromeForeground =>
+      _darkMode ? _darkChromeForeground : _foreground;
 
   _TurnPhase _turnPhase = _TurnPhase.idle;
   _TurnDirection? _turnDirection;
@@ -84,7 +100,14 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     _controller = controller;
     _ownsController = widget.controller == null;
     if (controller.opened) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        // An injected, already-open controller can render immediately while
+        // the persisted presentation preferences are being restored.
+        if (mounted) setState(() {});
+        await _restorePreferences();
+        if (!mounted) return;
+        _applySystemUiStyle();
+        await controller.updateStyle(_style);
         if (!mounted) return;
         setState(() {});
         _schedulePeekPreparation();
@@ -95,9 +118,9 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     _opening = true;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       try {
-        final mode = await _preferencesStore.loadTypesettingMode();
+        await _restorePreferences();
         if (!mounted) return;
-        _style = _baseStyle.copyWith(typesettingMode: mode);
+        _applySystemUiStyle();
         await controller.open(widget.file, viewport, _style);
         // open() may finish before the ListenableBuilder below ever
         // entered the tree (the first build returns the plain spinner),
@@ -109,7 +132,11 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
         debugPrint('Could not open ${widget.file.path}: $error\n$stackTrace');
         if (!mounted) return;
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Could not open this book.')),
+          SnackBar(
+            content: Text(
+              context.l10n.text('无法打开这本书。', 'Could not open this book.'),
+            ),
+          ),
         );
         Navigator.of(context).pop();
       } finally {
@@ -118,11 +145,34 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     });
   }
 
+  Future<void> _restorePreferences() async {
+    final appPreferences = AppPreferencesScope.maybeOf(context);
+    final inheritedDarkMode = Theme.of(context).brightness == Brightness.dark;
+    final modeFuture = _preferencesStore.loadTypesettingMode();
+    final mode = await modeFuture;
+    final darkMode = appPreferences == null
+        ? await _preferencesStore.loadDarkMode()
+        : inheritedDarkMode;
+    _darkMode = darkMode;
+    _style = _themedStyle(_baseStyle.copyWith(typesettingMode: mode), darkMode);
+  }
+
+  static ReaderStyle _themedStyle(ReaderStyle style, bool darkMode) =>
+      style.copyWith(
+        foreground: darkMode
+            ? _darkForeground.toARGB32()
+            : _lightForeground.toARGB32(),
+        background: darkMode
+            ? _darkBackground.toARGB32()
+            : _lightBackground.toARGB32(),
+      );
+
   @override
   void dispose() {
     _peekTimer?.cancel();
     _turnAnimation?.dispose();
     if (_ownsController) _controller?.dispose();
+    SystemChrome.setSystemUIOverlayStyle(_systemUiStyle(darkMode: false));
     super.dispose();
   }
 
@@ -152,10 +202,10 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
       return;
     }
     final fraction = details.localPosition.dx / width;
-    if (fraction < 0.3) {
+    if (fraction < 0.2) {
       if (_overlayVisible) setState(() => _overlayVisible = false);
       controller.prevPage().then((_) => _schedulePeekPreparation());
-    } else if (fraction > 0.7) {
+    } else if (fraction > 0.8) {
       if (_overlayVisible) setState(() => _overlayVisible = false);
       controller.nextPage().then((_) => _schedulePeekPreparation());
     } else {
@@ -177,16 +227,21 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
           : ReaderFootnote(marker: '', text: inlineNote);
       if (!mounted) return;
       if (note == null) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('无法读取脚注内容')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              context.l10n.text('无法读取脚注内容', 'Could not read this footnote'),
+            ),
+          ),
+        );
         return;
       }
       await showReaderFootnoteSheet(
         context,
         text: note.text,
-        background: _background,
-        foreground: _foreground,
+        background: _chromeBackground,
+        foreground: _chromeForeground,
+        publicationLanguage: controller.publicationLanguage,
       );
       return;
     }
@@ -196,9 +251,13 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     if (navigated) {
       _schedulePeekPreparation();
     } else {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('暂时无法打开此引用')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            context.l10n.text('暂时无法打开此引用', 'Could not open this reference'),
+          ),
+        ),
+      );
     }
   }
 
@@ -405,7 +464,7 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     final imageResolver = controller.resolveImage;
 
     Widget page(PageLayout? layout) => layout == null
-        ? const ColoredBox(color: _background)
+        ? ColoredBox(color: _background)
         : PageWidget(
             page: layout,
             imageResolver: imageResolver,
@@ -453,38 +512,103 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      key: _scaffoldKey,
-      backgroundColor: _background,
-      drawer: _buildDrawer(),
-      body: Stack(
-        children: [
-          Positioned.fill(
-            child: SafeArea(
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  var controller = _controller;
-                  if (controller == null) {
-                    _startOpen(
-                      LayoutViewport(
-                        width: constraints.maxWidth,
-                        height: constraints.maxHeight,
-                      ),
-                    );
-                    controller = _controller;
-                    return const Center(child: CircularProgressIndicator());
-                  }
-                  return ListenableBuilder(
-                    listenable: controller,
-                    builder: (context, _) =>
-                        _buildReader(controller!, constraints),
-                  );
-                },
+    final background = _background;
+    final foreground = _foreground;
+    final systemOverlay = _systemUiStyle(darkMode: _darkMode);
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: systemOverlay,
+      child: Theme(
+        data: _readerThemeData(Theme.of(context), background, foreground),
+        child: Scaffold(
+          key: _scaffoldKey,
+          backgroundColor: background,
+          drawer: _buildDrawer(),
+          body: Stack(
+            children: [
+              Positioned.fill(
+                child: SafeArea(
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      var controller = _controller;
+                      if (controller == null) {
+                        _startOpen(
+                          LayoutViewport(
+                            width: constraints.maxWidth,
+                            height: constraints.maxHeight,
+                          ),
+                        );
+                        controller = _controller;
+                        return const Center(child: CircularProgressIndicator());
+                      }
+                      return ListenableBuilder(
+                        listenable: controller,
+                        builder: (context, _) =>
+                            _buildReader(controller!, constraints),
+                      );
+                    },
+                  ),
+                ),
               ),
-            ),
+              if (_overlayVisible) ...[
+                _buildReaderHeader(),
+                _buildReaderFooter(),
+              ],
+            ],
           ),
-          if (_overlayVisible) ...[_buildReaderHeader(), _buildReaderFooter()],
-        ],
+        ),
+      ),
+    );
+  }
+
+  static SystemUiOverlayStyle _systemUiStyle({required bool darkMode}) =>
+      SystemUiOverlayStyle(
+        statusBarColor: Colors.transparent,
+        statusBarIconBrightness: darkMode ? Brightness.light : Brightness.dark,
+        statusBarBrightness: darkMode ? Brightness.dark : Brightness.light,
+        systemNavigationBarColor: Colors.transparent,
+        systemNavigationBarDividerColor: Colors.transparent,
+        systemNavigationBarIconBrightness: darkMode
+            ? Brightness.light
+            : Brightness.dark,
+        systemStatusBarContrastEnforced: false,
+        systemNavigationBarContrastEnforced: false,
+      );
+
+  void _applySystemUiStyle() {
+    SystemChrome.setSystemUIOverlayStyle(_systemUiStyle(darkMode: _darkMode));
+  }
+
+  ThemeData _readerThemeData(
+    ThemeData base,
+    Color background,
+    Color foreground,
+  ) {
+    final brightness = _darkMode ? Brightness.dark : Brightness.light;
+    final surface = _darkMode ? _darkChromeBackground : background;
+    final onSurface = _darkMode ? _darkChromeForeground : foreground;
+    final scheme =
+        ColorScheme.fromSeed(
+          seedColor: base.colorScheme.primary,
+          brightness: brightness,
+        ).copyWith(
+          surface: surface,
+          onSurface: onSurface,
+          onSurfaceVariant: onSurface,
+        );
+    return base.copyWith(
+      brightness: brightness,
+      colorScheme: scheme,
+      scaffoldBackgroundColor: background,
+      canvasColor: background,
+      iconTheme: base.iconTheme.copyWith(color: onSurface),
+      textTheme: base.textTheme.apply(
+        fontFamily: 'sans-serif',
+        bodyColor: onSurface,
+        displayColor: onSurface,
+      ),
+      bottomSheetTheme: base.bottomSheetTheme.copyWith(
+        backgroundColor: surface,
+        surfaceTintColor: Colors.transparent,
       ),
     );
   }
@@ -495,7 +619,8 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     right: 0,
     child: Material(
       key: const Key('reader-header'),
-      color: _background,
+      color: _chromeBackground,
+      surfaceTintColor: Colors.transparent,
       elevation: 2,
       child: SafeArea(
         bottom: false,
@@ -505,8 +630,8 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
             children: [
               IconButton(
                 key: const Key('reader-back-button'),
-                icon: const Icon(Icons.arrow_back),
-                tooltip: '返回书架',
+                icon: Icon(Icons.arrow_back, color: _chromeForeground),
+                tooltip: context.l10n.text('返回书架', 'Back to library'),
                 onPressed: () => Navigator.of(context).maybePop(),
               ),
             ],
@@ -522,7 +647,8 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     right: 0,
     child: Material(
       key: const Key('reader-footer'),
-      color: _background,
+      color: _chromeBackground,
+      surfaceTintColor: Colors.transparent,
       elevation: 2,
       child: SafeArea(
         top: false,
@@ -537,8 +663,11 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
                   width: 64,
                   height: 56,
                 ),
-                icon: const Icon(Icons.format_list_bulleted),
-                tooltip: '目录',
+                icon: Icon(
+                  Icons.format_list_bulleted,
+                  color: _chromeForeground,
+                ),
+                tooltip: context.l10n.text('目录', 'Contents'),
                 onPressed: () => _scaffoldKey.currentState?.openDrawer(),
               ),
               IconButton(
@@ -548,9 +677,28 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
                   width: 64,
                   height: 56,
                 ),
-                icon: const Icon(Icons.text_format),
-                tooltip: '版式',
+                icon: Icon(Icons.text_format, color: _chromeForeground),
+                tooltip: context.l10n.text('版式', 'Typesetting'),
                 onPressed: _showTypesettingSheet,
+              ),
+              _buildTranslationButton(),
+              IconButton(
+                key: const Key('reader-theme-button'),
+                iconSize: 32,
+                constraints: const BoxConstraints.tightFor(
+                  width: 64,
+                  height: 56,
+                ),
+                icon: Icon(
+                  _darkMode
+                      ? Icons.light_mode_outlined
+                      : Icons.dark_mode_outlined,
+                  color: _chromeForeground,
+                ),
+                tooltip: _darkMode
+                    ? context.l10n.text('浅色模式', 'Light mode')
+                    : context.l10n.text('深色模式', 'Dark mode'),
+                onPressed: _toggleColorMode,
               ),
             ],
           ),
@@ -559,39 +707,169 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     ),
   );
 
+  Widget _buildTranslationButton() {
+    final controller = _controller;
+    if (controller == null) return const SizedBox(width: 64, height: 56);
+    return ListenableBuilder(
+      listenable: controller,
+      builder: (context, _) {
+        final status = controller.translationStatus;
+        final selected = controller.translationEnabled;
+        final color = status == ReaderTranslationStatus.error
+            ? Theme.of(context).colorScheme.error
+            : selected
+            ? const Color(0xFF60A5FA)
+            : _chromeForeground;
+        return IconButton(
+          key: const Key('reader-translation-button'),
+          iconSize: 32,
+          constraints: const BoxConstraints.tightFor(width: 64, height: 56),
+          icon: status == ReaderTranslationStatus.translating
+              ? SizedBox.square(
+                  dimension: 26,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2.5,
+                    color: color,
+                  ),
+                )
+              : Icon(Icons.translate, color: color),
+          tooltip: selected
+              ? context.l10n.text('关闭翻译', 'Turn translation off')
+              : context.l10n.text('开启翻译', 'Turn translation on'),
+          onPressed: controller.busy ? null : _toggleTranslation,
+        );
+      },
+    );
+  }
+
+  Future<void> _toggleTranslation() async {
+    final controller = _controller;
+    if (controller == null) return;
+    final changed = await controller.toggleTranslation();
+    if (!mounted || changed || controller.translationError == null) return;
+    final error = controller.translationError!;
+    final localizedError = _localizedTranslationError(error);
+    final needsConfiguration =
+        error.contains('Configure') ||
+        error.contains('Select an AI provider') ||
+        error.contains('API Key');
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(localizedError),
+        action: needsConfiguration
+            ? SnackBarAction(
+                label: context.l10n.text('去配置', 'Configure'),
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => const AiProvidersPage(),
+                  ),
+                ),
+              )
+            : null,
+      ),
+    );
+  }
+
+  String _localizedTranslationError(String error) {
+    final l10n = context.l10n;
+    if (error.contains('Fixed-layout PDF')) {
+      return l10n.text(
+        '当前版本暂不支持固定版式 PDF 翻译。',
+        'Fixed-layout PDF translation is not supported in this version.',
+      );
+    }
+    if (error.contains('AI provider URL')) {
+      return l10n.text(
+        '请先配置 AI 提供商接口地址。',
+        'Configure the AI provider URL first.',
+      );
+    }
+    if (error.contains('API Key')) {
+      return l10n.text(
+        '请先配置 AI 提供商 API Key。',
+        'Configure the AI provider API Key first.',
+      );
+    }
+    if (error.contains('Select an AI provider')) {
+      return l10n.text('请先选择 AI 提供商。', 'Select an AI provider first.');
+    }
+    if (error.contains('Select a translation model')) {
+      return l10n.text('请先选择翻译模型。', 'Select a translation model first.');
+    }
+    return error;
+  }
+
+  Future<void> _toggleColorMode() async {
+    final controller = _controller;
+    if (controller == null || controller.busy) return;
+    final nextDarkMode = !_darkMode;
+    final nextStyle = _themedStyle(_style, nextDarkMode);
+    setState(() {
+      _darkMode = nextDarkMode;
+      _style = nextStyle;
+    });
+    _applySystemUiStyle();
+    unawaited(
+      (AppPreferencesScope.maybeOf(context) == null
+              ? _preferencesStore.saveDarkMode(nextDarkMode)
+              : AppPreferencesScope.of(context).setTheme(
+                  nextDarkMode
+                      ? AppThemePreference.dark
+                      : AppThemePreference.light,
+                ))
+          .catchError((Object error) {
+            debugPrint('Could not persist reader color mode: $error');
+          }),
+    );
+    await controller.updateStyle(nextStyle);
+    _schedulePeekPreparation();
+  }
+
   Future<void> _showTypesettingSheet() async {
     final controller = _controller;
     if (controller == null || controller.busy) return;
     final selected = await showModalBottomSheet<TypesettingMode>(
       context: context,
-      backgroundColor: _background,
-      builder: (context) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              const Padding(
-                padding: EdgeInsets.fromLTRB(16, 0, 16, 8),
-                child: Text(
-                  '版式',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w600),
+      backgroundColor: _chromeBackground,
+      builder: (sheetContext) => Theme(
+        data: _readerThemeData(Theme.of(context), _background, _foreground),
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                  child: Text(
+                    context.l10n.text('版式', 'Typesetting'),
+                    style: const TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
                 ),
-              ),
-              _typesettingChoice(
-                context,
-                TypesettingMode.unified,
-                '统一版式',
-                '统一正文、标题、段落、列表和表格的排版',
-              ),
-              _typesettingChoice(
-                context,
-                TypesettingMode.book,
-                '跟随书籍',
-                '保留书籍自带的字号、行距、缩进和颜色',
-              ),
-            ],
+                _typesettingChoice(
+                  sheetContext,
+                  TypesettingMode.unified,
+                  context.l10n.text('统一版式', 'Unified'),
+                  context.l10n.text(
+                    '统一正文、标题、段落、列表和表格的排版',
+                    'Use consistent styling for body text, headings, lists and tables',
+                  ),
+                ),
+                _typesettingChoice(
+                  sheetContext,
+                  TypesettingMode.book,
+                  context.l10n.text('跟随书籍', 'Follow book'),
+                  context.l10n.text(
+                    '保留书籍自带的字号、行距、缩进和颜色',
+                    'Keep the book’s font size, line height, indentation and colors',
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),

@@ -5,6 +5,7 @@ import '../../core/layout/layout_types.dart';
 /// Persists reader-wide presentation choices shared by every book.
 class ReaderPreferencesStore {
   static const _typesettingModeKey = 'reader_typesetting_mode_v1';
+  static const _darkModeKey = 'reader_dark_mode_v1';
 
   final SharedPreferences? _injected;
   SharedPreferences? _resolved;
@@ -30,5 +31,17 @@ class ReaderPreferencesStore {
 
   Future<void> saveTypesettingMode(TypesettingMode mode) async {
     await (await _preferences).setString(_typesettingModeKey, mode.name);
+  }
+
+  Future<bool> loadDarkMode() async {
+    try {
+      return (await _preferences).getBool(_darkModeKey) ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> saveDarkMode(bool enabled) async {
+    await (await _preferences).setBool(_darkModeKey, enabled);
   }
 }

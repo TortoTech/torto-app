@@ -223,7 +223,7 @@ packages:
     source: hosted
     version: "6.0.0"
   flutter_localizations:
-    dependency: transitive
+    dependency: "direct main"
     description: flutter
     source: sdk
     version: "0.0.0"
@@ -325,6 +325,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "4.1.2"
+  hyphen:
+    dependency: "direct main"
+    description:
+      name: hyphen
+      sha256: "4f0294b7f380e1b9fee3927d89a0b7e11da842166b4164e098c94c0c85721744"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.3.1"
   icu4x:
     dependency: "direct main"
     description:

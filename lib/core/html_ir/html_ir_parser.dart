@@ -322,6 +322,7 @@ void _stripAuthoredListMarker(List<Inline> content) {
         remainder,
         style: inline.style,
         link: inline.link,
+        language: inline.language,
       );
     }
     return;
@@ -2057,14 +2058,19 @@ class _SectionParser {
     TextStyle inherited,
     String? link,
     _InlineCollector collector, {
+    String? language,
     bool preserveBlockBoundaries = false,
   }) {
+    final inheritedLanguage = node is XmlElement
+        ? _declaredLanguage(node) ?? language ?? _ancestorLanguage(node)
+        : language;
     for (final child in node.children) {
       _collectInlineNode(
         child,
         inherited,
         link,
         collector,
+        language: inheritedLanguage,
         preserveBlockBoundaries: preserveBlockBoundaries,
       );
     }
@@ -2075,14 +2081,15 @@ class _SectionParser {
     TextStyle inherited,
     String? link,
     _InlineCollector collector, {
+    String? language,
     bool preserveBlockBoundaries = false,
   }) {
     if (node is XmlText) {
-      collector.pushText(node.value, inherited, link);
+      collector.pushText(node.value, inherited, link, language);
       return;
     }
     if (node is XmlCDATA) {
-      collector.pushText(node.value, inherited, link);
+      collector.pushText(node.value, inherited, link, language);
       return;
     }
     if (node is! XmlElement) return;
@@ -2097,6 +2104,7 @@ class _SectionParser {
           _footnoteReferenceImageMarker(node),
           inherited,
           link,
+          language,
         );
       }
       return;
@@ -2107,6 +2115,7 @@ class _SectionParser {
     if (preserveBlockBoundaries && _isBlockBoundary(name)) {
       collector.pushBreakIfNeeded();
     }
+    final childLanguage = _declaredLanguage(node) ?? language;
 
     var style = inherited;
     switch (name) {
@@ -2179,8 +2188,24 @@ class _SectionParser {
       style,
       childLink,
       collector,
+      language: childLanguage,
       preserveBlockBoundaries: preserveBlockBoundaries,
     );
+  }
+
+  static String? _declaredLanguage(XmlElement element) {
+    final raw = _attr(element, 'lang')?.trim();
+    return raw == null || raw.isEmpty ? null : raw;
+  }
+
+  static String? _ancestorLanguage(XmlElement element) {
+    var ancestor = element.parentElement;
+    while (ancestor != null) {
+      final language = _declaredLanguage(ancestor);
+      if (language != null) return language;
+      ancestor = ancestor.parentElement;
+    }
+    return null;
   }
 
   String _resolveLink(String rawHref) {
@@ -2480,18 +2505,24 @@ class _InlineCollector {
 
   _InlineCollector({required this.preserveWhitespace});
 
-  void pushText(String text, TextStyle style, String? link) {
+  void pushText(String text, TextStyle style, String? link, String? language) {
     final normalized = preserveWhitespace ? text : _collapse(text);
     if (normalized.isEmpty) return;
     final last = content.isEmpty ? null : content.last;
-    if (last is TextRun && last.style == style && last.link == link) {
+    if (last is TextRun &&
+        last.style == style &&
+        last.link == link &&
+        last.language == language) {
       content[content.length - 1] = TextRun(
         last.text + normalized,
         style: style,
         link: link,
+        language: language,
       );
     } else {
-      content.add(TextRun(normalized, style: style, link: link));
+      content.add(
+        TextRun(normalized, style: style, link: link, language: language),
+      );
     }
   }
 
@@ -2499,6 +2530,7 @@ class _InlineCollector {
     String marker,
     TextStyle style,
     String link,
+    String? language,
   ) {
     if (!preserveWhitespace && content.isNotEmpty) {
       final last = content.last;
@@ -2511,12 +2543,13 @@ class _InlineCollector {
             trimmed,
             style: last.style,
             link: last.link,
+            language: last.language,
           );
         }
       }
       _lastWasSpace = false;
     }
-    pushText(marker, style, link);
+    pushText(marker, style, link, language);
   }
 
   String _collapse(String text) {
@@ -2565,6 +2598,7 @@ class _InlineCollector {
           trimmed,
           style: last.style,
           link: last.link,
+          language: last.language,
         );
       }
     }

@@ -5,6 +5,25 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:torto/core/ir/ir.dart';
 import 'package:torto/core/layout/layout_engine.dart';
 import 'package:torto/core/layout/layout_types.dart';
+import 'package:torto/core/linebreak/english_hyphenator.dart';
+
+class _RecordingHyphenator implements ParagraphHyphenator {
+  String? text;
+  String? publicationLanguage;
+  List<HyphenationSpan> spans = const [];
+
+  @override
+  Set<int> breakOpportunities({
+    required String text,
+    required List<HyphenationSpan> spans,
+    required String? publicationLanguage,
+  }) {
+    this.text = text;
+    this.spans = spans;
+    this.publicationLanguage = publicationLanguage;
+    return const {};
+  }
+}
 
 const _viewport = LayoutViewport(width: 300, height: 500);
 const _eps = 0.5;
@@ -283,10 +302,23 @@ void main() {
   });
 
   test('unified multi-line figure caption is start-aligned', () {
-    final pages = engine.paginate(
-      _section([_figure(caption: _lorem(8))]),
+    final hyphenator = _RecordingHyphenator();
+    final languageEngine = LayoutEngine(hyphenator: hyphenator);
+    final captionText = _lorem(8);
+    final pages = languageEngine.paginate(
+      _section([
+        FigureBlock(
+          images: const [ImageBlock(href: 'img/figure.png')],
+          captions: [
+            TextBlock(
+              kind: TextBlockKind.caption,
+              inlines: [TextRun(captionText, language: 'en-GB')],
+            ),
+          ],
+        ),
+      ]),
       _viewport,
-      _style(),
+      _style().copyWith(publicationLanguage: 'en-US'),
       imageSizeResolver: (_) => const ui.Size(100, 80),
     );
     final caption = pages
@@ -297,6 +329,9 @@ void main() {
 
     expect(caption.lineMetrics.length, greaterThan(1));
     expect(firstBox.left, closeTo(0, _eps));
+    expect(hyphenator.text, captionText);
+    expect(hyphenator.publicationLanguage, 'en-US');
+    expect(hyphenator.spans.single.language, 'en-GB');
     _disposeAll(pages);
   });
 
@@ -860,6 +895,115 @@ void main() {
 
     expect(firstLine.width, closeTo(placement.width, _eps));
     _disposeAll(pages);
+  });
+
+  test('optimized layout passes run language before publication fallback', () {
+    final hyphenator = _RecordingHyphenator();
+    final languageEngine = LayoutEngine(hyphenator: hyphenator);
+    final prose = _lorem(4);
+    final pages = languageEngine.paginate(
+      _section([
+        TextBlock(inlines: [TextRun(prose, language: 'en-GB')]),
+      ]),
+      _viewport,
+      _style().copyWith(publicationLanguage: 'en-US'),
+    );
+
+    expect(hyphenator.text, prose);
+    expect(hyphenator.publicationLanguage, 'en-US');
+    expect(hyphenator.spans, hasLength(1));
+    expect(hyphenator.spans.single.language, 'en-GB');
+    _disposeAll(pages);
+  });
+
+  test('optimized list body reaches hyphenator and keeps its marker', () {
+    final hyphenator = _RecordingHyphenator();
+    final languageEngine = LayoutEngine(hyphenator: hyphenator);
+    final prose = _lorem(4);
+    final pages = languageEngine.paginate(
+      _section([
+        TextBlock(
+          kind: TextBlockKind.listItem,
+          listOrdered: true,
+          listOrdinal: 3,
+          inlines: [TextRun(prose, language: 'en-GB')],
+        ),
+      ]),
+      _viewport,
+      _style().copyWith(publicationLanguage: 'en-US'),
+    );
+
+    expect(hyphenator.text, prose);
+    expect(hyphenator.publicationLanguage, 'en-US');
+    expect(hyphenator.spans, hasLength(1));
+    expect(hyphenator.spans.single.language, 'en-GB');
+    expect(
+      pages.expand((page) => page.items).whereType<ListMarkerPlacement>(),
+      isNotEmpty,
+    );
+    _disposeAll(pages);
+  });
+
+  test('optimized list body also covers start-aligned CJK content', () {
+    final hyphenator = _RecordingHyphenator();
+    final languageEngine = LayoutEngine(hyphenator: hyphenator);
+    final prose = '系统思考帮助我们理解复杂世界中的结构反馈延迟以及行为之间的关系。' * 4;
+    final pages = languageEngine.paginate(
+      _section([
+        TextBlock(
+          kind: TextBlockKind.listItem,
+          inlines: [TextRun(prose, language: 'zh-CN')],
+        ),
+      ]),
+      _viewport,
+      _style(),
+    );
+
+    expect(hyphenator.text, prose);
+    expect(hyphenator.spans.single.language, 'zh-CN');
+    expect(
+      pages.expand((page) => page.items).whereType<ListMarkerPlacement>(),
+      isNotEmpty,
+    );
+    _disposeAll(pages);
+  });
+
+  test('inline footnote does not disable optimized paragraph layout', () {
+    final hyphenator = _RecordingHyphenator();
+    final languageEngine = LayoutEngine(hyphenator: hyphenator);
+    final pages = languageEngine.paginate(
+      _section([
+        TextBlock(
+          inlines: [
+            TextRun(_lorem(2), language: 'en-US'),
+            const TextRun(
+              '1',
+              link: 's.xhtml#note-1',
+              language: 'en-US',
+              style: TextStyle(
+                baseline: TextBaselineShift.superscript,
+                linkRole: LinkRole.footnoteReference,
+              ),
+            ),
+            TextRun(_lorem(2), language: 'en-US'),
+          ],
+        ),
+      ]),
+      _viewport,
+      _style().copyWith(publicationLanguage: 'en-US'),
+    );
+    addTearDown(() => _disposeAll(pages));
+
+    expect(hyphenator.text, isNotNull);
+    expect(hyphenator.spans, hasLength(3));
+    expect(hyphenator.spans[1].suppress, isTrue);
+    final link = pages
+        .expand((page) => page.items)
+        .whereType<TextPlacement>()
+        .expand((placement) => placement.links)
+        .single;
+    expect(link.footnoteIcon, isTrue);
+    expect(link.href, 's.xhtml#note-1');
   });
 
   test('unified semantic block alignment matches desktop rules', () {

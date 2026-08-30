@@ -25,6 +25,7 @@ class OptimizedLine {
   final double naturalWidth;
   final double adjustmentRatio;
   final double badness;
+  final bool hyphenated;
 
   const OptimizedLine({
     required this.startCluster,
@@ -32,6 +33,7 @@ class OptimizedLine {
     required this.naturalWidth,
     required this.adjustmentRatio,
     required this.badness,
+    this.hyphenated = false,
   });
 }
 
@@ -51,6 +53,7 @@ class _Item {
   final double boundaryWidthAfter;
   final double boundaryShrinkAfter;
   final double lineEndAdjustment;
+  final double hyphenWidthAfter;
   final bool breakAfter;
   final bool trimmable;
   final bool justifiableAfter;
@@ -62,6 +65,7 @@ class _Item {
     required this.boundaryWidthAfter,
     required this.boundaryShrinkAfter,
     required this.lineEndAdjustment,
+    required this.hyphenWidthAfter,
     required this.breakAfter,
     required this.trimmable,
     required this.justifiableAfter,
@@ -98,6 +102,7 @@ class _CandidateLine {
   final double shrink;
   final int justifiable;
   final bool last;
+  final bool hyphenated;
 
   const _CandidateLine({
     required this.start,
@@ -111,6 +116,7 @@ class _CandidateLine {
     required this.shrink,
     required this.justifiable,
     required this.last,
+    required this.hyphenated,
   });
 }
 
@@ -129,6 +135,7 @@ class ParagraphOptimizer {
     required String text,
     required List<MeasuredCluster> clusters,
     required Set<int> legalBreaks,
+    Map<int, double> hyphenBreaks = const {},
     required double lineWidth,
     required double firstLineIndent,
     required double defaultEm,
@@ -194,7 +201,12 @@ class ParagraphOptimizer {
       final whitespace = source.runes.every(_isWhitespace);
       final breakableSpace = source.runes.every(_isBreakableSpace);
       final breakAfter =
-          index == clusters.length - 1 || legalBreaks.contains(cluster.end);
+          index == clusters.length - 1 ||
+          legalBreaks.contains(cluster.end) ||
+          hyphenBreaks.containsKey(cluster.end);
+      final hyphenWidth = legalBreaks.contains(cluster.end)
+          ? 0.0
+          : (hyphenBreaks[cluster.end] ?? 0.0);
       items.add(
         _Item(
           width: cluster.advance,
@@ -203,6 +215,9 @@ class ParagraphOptimizer {
           boundaryWidthAfter: boundaryWidth,
           boundaryShrinkAfter: boundaryShrink,
           lineEndAdjustment: -punctuation.$2,
+          hyphenWidthAfter: hyphenWidth.isFinite && hyphenWidth > 0
+              ? hyphenWidth
+              : 0,
           breakAfter: breakAfter,
           trimmable: breakableSpace,
           justifiableAfter: justifiable,
@@ -270,7 +285,16 @@ class ParagraphOptimizer {
           break;
         }
         if (!best[startCandidate].isFinite) continue;
-        final demerit = math.pow(10 + line.badness, 2).toDouble();
+        var demerit = math.pow(10 + line.badness, 2).toDouble();
+        if (line.hyphenated) {
+          // TeX-style positive penalty: hyphenation remains available when
+          // it materially improves a narrow line, but an ordinary word/space
+          // boundary wins when both solutions are similarly good.
+          demerit += 2500;
+          if (selected[startCandidate]?.hyphenated ?? false) {
+            demerit += 2500;
+          }
+        }
         final total = best[startCandidate] + demerit;
         if (total < best[endCandidate]) {
           best[endCandidate] = total;
@@ -303,6 +327,7 @@ class ParagraphOptimizer {
             naturalWidth: line.naturalWidth,
             adjustmentRatio: line.ratio,
             badness: line.badness,
+            hyphenated: line.hyphenated,
           ),
       ],
       adjustments: adjustments,
@@ -330,11 +355,15 @@ class ParagraphOptimizer {
         : prefix[measuredEnd - 1].boundaryShrink - prefix[start].boundaryShrink;
     final shrink =
         prefix[measuredEnd].shrink - prefix[start].shrink + boundaryShrink;
+    final hyphenWidth = measuredEnd == end && end < items.length
+        ? items[measuredEnd - 1].hyphenWidthAfter
+        : 0.0;
     final minimum =
         itemWidth +
         boundaryWidth +
         items[measuredEnd - 1].lineEndAdjustment -
-        shrink;
+        shrink +
+        hyphenWidth;
     return minimum > target + _epsilon;
   }
 
@@ -362,8 +391,14 @@ class ParagraphOptimizer {
     final justifiable = measuredEnd - start < 2
         ? 0
         : prefix[measuredEnd - 1].justifiable - prefix[start].justifiable;
+    final hyphenWidth = measuredEnd == end && end < items.length
+        ? items[measuredEnd - 1].hyphenWidthAfter
+        : 0.0;
     final natural =
-        itemWidth + boundaryWidth + items[measuredEnd - 1].lineEndAdjustment;
+        itemWidth +
+        boundaryWidth +
+        items[measuredEnd - 1].lineEndAdjustment +
+        hyphenWidth;
     final stretch = prefix[measuredEnd].stretch - prefix[start].stretch;
     final shrink =
         prefix[measuredEnd].shrink - prefix[start].shrink + boundaryShrink;
@@ -392,6 +427,7 @@ class ParagraphOptimizer {
       shrink: shrink,
       justifiable: justifiable,
       last: last,
+      hyphenated: hyphenWidth > 0,
     );
   }
 

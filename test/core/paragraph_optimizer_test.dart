@@ -76,4 +76,24 @@ void main() {
       isNull,
     );
   });
+
+  test('accounts for discretionary hyphen width in Knuth-Plass lines', () {
+    const text = 'abcdefghijklmno';
+    final plan = optimizer.plan(
+      text: text,
+      clusters: clustersFor(text),
+      legalBreaks: const {text.length},
+      hyphenBreaks: const {5: 5, 10: 5},
+      lineWidth: 55,
+      firstLineIndent: 0,
+      defaultEm: 10,
+    );
+
+    expect(plan, isNotNull);
+    expect(plan!.lines, hasLength(3));
+    expect(plan.lines.map((line) => line.hyphenated), [true, true, false]);
+    expect(plan.lines.first.naturalWidth, closeTo(55, 1e-9));
+    expect(plan.lines[1].naturalWidth, closeTo(55, 1e-9));
+    expect(plan.lines.last.naturalWidth, closeTo(50, 1e-9));
+  });
 }

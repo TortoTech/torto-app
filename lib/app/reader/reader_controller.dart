@@ -10,6 +10,12 @@ import '../../core/html_ir/package_path.dart';
 import '../../core/ir/ir.dart';
 import '../../core/layout/layout_engine.dart';
 import '../../core/layout/layout_types.dart';
+import '../../core/linebreak/english_hyphenator.dart';
+import '../../core/translation/translation_book_source.dart';
+import '../../core/translation/translation_models.dart';
+import '../ai/ai_models.dart';
+import '../ai/ai_settings_store.dart';
+import '../ai/openai_compatible_client.dart';
 import '../progress_store.dart';
 import '../sync/derived_data_store.dart';
 
@@ -20,6 +26,8 @@ class ReaderFootnote {
   const ReaderFootnote({required this.marker, required this.text});
 }
 
+enum ReaderTranslationStatus { off, translating, on, error }
+
 /// Owns the reading session for one book: the parsed source, paginated
 /// sections (prev/current/next cached), page navigation, image decoding,
 /// and progress persistence.
@@ -27,9 +35,17 @@ class ReaderController extends ChangeNotifier {
   final ProgressStore progressStore;
   final String? titleHint;
   final String? publicationIdHint;
-  final LayoutEngine _engine = const LayoutEngine();
+  final AiSettingsStore aiSettingsStore;
+  final OpenAiCompatibleClient translationClient;
+  final bool _ownsTranslationClient;
+  final LayoutEngine _engine = LayoutEngine(
+    hyphenator: EnglishHyphenator.instance,
+  );
 
   BookSource? _source;
+  BookSource? _resourceSource;
+  TranslationBookSource? _translationSource;
+  BookFormat? _format;
   LayoutViewport _viewport = const LayoutViewport(width: 0, height: 0);
   ReaderStyle _style = const ReaderStyle();
   int _paginationGeneration = 0;
@@ -55,6 +71,13 @@ class ReaderController extends ChangeNotifier {
 
   String title = '';
   List<TocEntry> _derivedToc = const [];
+  AiSettings? _activeAiSettings;
+  bool translationEnabled = false;
+  bool _translationInFlight = false;
+  bool _tocTranslationInFlight = false;
+  int _translationGeneration = 0;
+  String? translationError;
+  final Map<int, String> _translatedTocLabels = {};
 
   Timer? _saveTimer;
   bool _progressDirty = false;
@@ -63,7 +86,12 @@ class ReaderController extends ChangeNotifier {
     ProgressStore? progressStore,
     this.titleHint,
     this.publicationIdHint,
-  }) : progressStore = progressStore ?? ProgressStore();
+    AiSettingsStore? aiSettingsStore,
+    OpenAiCompatibleClient? translationClient,
+  }) : progressStore = progressStore ?? ProgressStore(),
+       aiSettingsStore = aiSettingsStore ?? AiSettingsStore(),
+       translationClient = translationClient ?? OpenAiCompatibleClient(),
+       _ownsTranslationClient = translationClient == null;
 
   Book get _book => _source!.book;
 
@@ -76,13 +104,45 @@ class ReaderController extends ChangeNotifier {
 
   int get sectionCount => _source?.book.sectionCount ?? 0;
 
+  /// Normalized en-US/en-GB fallback selected from publication metadata.
+  String get publicationLanguage => _style.publicationLanguage;
+
   ReaderStyle get style => _style;
 
   bool _peekPreparing = false;
 
   /// Table of contents from the book's navigation document (may be empty).
-  List<TocEntry> get toc =>
-      _derivedToc.isNotEmpty ? _derivedToc : (_source?.book.toc ?? const []);
+  List<TocEntry> get toc {
+    final original = _derivedToc.isNotEmpty
+        ? _derivedToc
+        : (_source?.book.toc ?? const []);
+    final settings = _activeAiSettings?.translation;
+    if (!translationEnabled ||
+        settings?.translateToc != true ||
+        _translatedTocLabels.isEmpty) {
+      return original;
+    }
+    var index = 0;
+    List<TocEntry> translate(List<TocEntry> entries) => [
+      for (final entry in entries)
+        TocEntry(
+          label: _translatedTocLabels[index++] ?? entry.label,
+          href: entry.href,
+          spineIndex: entry.spineIndex,
+          children: translate(entry.children),
+        ),
+    ];
+    return translate(original);
+  }
+
+  ReaderTranslationStatus get translationStatus {
+    if (!translationEnabled) return ReaderTranslationStatus.off;
+    if (_translationInFlight || _tocTranslationInFlight) {
+      return ReaderTranslationStatus.translating;
+    }
+    if (translationError != null) return ReaderTranslationStatus.error;
+    return ReaderTranslationStatus.on;
+  }
 
   double get totalProgression {
     final count = sectionCount;
@@ -107,6 +167,7 @@ class ReaderController extends ChangeNotifier {
     _style = style;
     final fileName = _baseName(file.path);
     final format = BookFormat.fromFileName(fileName);
+    _format = format;
     final BookSource source;
     if (format == BookFormat.epub) {
       source = await EpubBookSource.fromFileInBackground(
@@ -123,8 +184,16 @@ class ReaderController extends ChangeNotifier {
         publicationIdHint: publicationIdHint,
       );
     }
-    _source = source;
-    _style = style.copyWith(writingSystem: _book.metadata.writingSystem);
+    _resourceSource = source;
+    final translationSource = TranslationBookSource(source);
+    _translationSource = translationSource;
+    _source = translationSource;
+    _style = style.copyWith(
+      writingSystem: _book.metadata.writingSystem,
+      publicationLanguage: _preferredHyphenationLanguage(
+        _book.metadata.languages,
+      ),
+    );
     _derivedToc = const [];
     title = _book.metadata.title.isEmpty
         ? _fileTitle(file.path)
@@ -179,8 +248,12 @@ class ReaderController extends ChangeNotifier {
     final toc = await DerivedDataStore.fromBooksDirectory(
       booksDirectory,
     ).generatedToc(source.book.id, source.book);
-    if (!identical(_source, source) || toc.isEmpty) return;
+    if (!identical(_resourceSource, source) || toc.isEmpty) return;
     _derivedToc = toc;
+    if (translationEnabled) {
+      _translatedTocLabels.clear();
+      _queueTocTranslation();
+    }
     notifyListeners();
   }
 
@@ -224,6 +297,286 @@ class ReaderController extends ChangeNotifier {
       _scheduleSave();
     }
   }
+
+  /// Turns the in-memory translation overlay on or off. Translation never
+  /// changes the canonical publication and never blocks a page turn.
+  Future<bool> toggleTranslation() async {
+    if (!opened || busy) return false;
+    final source = _translationSource;
+    if (source == null) return false;
+    translationError = null;
+    if (translationEnabled) {
+      translationEnabled = false;
+      _translationGeneration++;
+      source.enabled = false;
+      _translationInFlight = false;
+      _tocTranslationInFlight = false;
+      notifyListeners();
+      await _refreshCurrentSectionPreservingPosition();
+      return true;
+    }
+    if (_format == BookFormat.pdf) {
+      translationError =
+          'Fixed-layout PDF translation is not supported in this version.';
+      notifyListeners();
+      return false;
+    }
+    final settings = await aiSettingsStore.load();
+    final translation = settings.translation;
+    final provider = settings.provider(translation.providerId);
+    final error = _translationConfigurationError(provider, translation.model);
+    if (error != null) {
+      translationError = error;
+      notifyListeners();
+      return false;
+    }
+    final languageCode = _targetLanguageCode(
+      translation.target,
+      ui.PlatformDispatcher.instance.locale.languageCode,
+    );
+    _activeAiSettings = settings;
+    _translationGeneration++;
+    translationEnabled = true;
+    source
+      ..mode = translation.mode
+      ..targetLanguageCode = languageCode
+      ..enabled = true;
+    notifyListeners();
+    _queueVisibleTranslation();
+    _queueTocTranslation();
+    return true;
+  }
+
+  void retryTranslation() {
+    if (!translationEnabled) return;
+    translationError = null;
+    _queueVisibleTranslation();
+    _queueTocTranslation();
+  }
+
+  void _queueVisibleTranslation() {
+    if (!translationEnabled || _translationInFlight || busy) return;
+    final source = _translationSource;
+    final settings = _activeAiSettings;
+    final page = currentPage;
+    if (source == null || settings == null || page == null) return;
+    final visibleNodes = <String>{};
+    for (final item in page.items) {
+      final nodeId = switch (item) {
+        TextPlacement(:final nodeId) => nodeId,
+        TableCellPlacement(:final nodeId) => nodeId,
+        _ => '',
+      };
+      if (nodeId.isNotEmpty) visibleNodes.add(nodeId);
+    }
+    if (visibleNodes.isEmpty) return;
+    final generation = _translationGeneration;
+    final requestedSection = sectionIndex;
+    _translationInFlight = true;
+    translationError = null;
+    notifyListeners();
+    unawaited(() async {
+      var succeeded = false;
+      try {
+        final blocks = await source.untranslatedBlocksForNodes(
+          requestedSection,
+          visibleNodes,
+        );
+        if (blocks.isEmpty) return;
+        final translation = settings.translation;
+        final provider = settings.provider(translation.providerId)!;
+        final results = await translationClient.translateBlocks(
+          provider: provider,
+          model: translation.model,
+          targetLanguage: resolvedTranslationTarget(
+            translation.target,
+            ui.PlatformDispatcher.instance.locale.languageCode,
+          ),
+          blocks: blocks,
+        );
+        if (generation != _translationGeneration || !translationEnabled) return;
+        await source.storeBatch(requestedSection, results);
+        if (generation != _translationGeneration || !translationEnabled) return;
+        succeeded = true;
+        if (sectionIndex == requestedSection && !busy) {
+          await _refreshCurrentSectionPreservingPosition();
+        }
+      } catch (error, stackTrace) {
+        debugPrint(
+          'Could not translate visible book text: $error\n$stackTrace',
+        );
+        if (generation == _translationGeneration && translationEnabled) {
+          translationError = error.toString();
+        }
+      } finally {
+        if (generation == _translationGeneration) {
+          _translationInFlight = false;
+          notifyListeners();
+          if (succeeded && translationEnabled) {
+            _queueVisibleTranslation();
+          }
+        }
+      }
+    }());
+  }
+
+  void _queueTocTranslation() {
+    final settings = _activeAiSettings;
+    if (!translationEnabled ||
+        _tocTranslationInFlight ||
+        settings == null ||
+        !settings.translation.translateToc ||
+        _translatedTocLabels.isNotEmpty) {
+      return;
+    }
+    final original = _derivedToc.isNotEmpty ? _derivedToc : _book.toc;
+    final labels = <(int, String)>[];
+    var tocIndex = 0;
+    void collect(List<TocEntry> entries) {
+      for (final entry in entries) {
+        final index = tocIndex++;
+        if (entry.label.trim().isNotEmpty) {
+          labels.add((index, entry.label.trim()));
+        }
+        collect(entry.children);
+      }
+    }
+
+    collect(original);
+    if (labels.isEmpty) return;
+    final generation = _translationGeneration;
+    _tocTranslationInFlight = true;
+    notifyListeners();
+    unawaited(() async {
+      try {
+        final translation = settings.translation;
+        final provider = settings.provider(translation.providerId)!;
+        final results = await translationClient.translateBlocks(
+          provider: provider,
+          model: translation.model,
+          targetLanguage: resolvedTranslationTarget(
+            translation.target,
+            ui.PlatformDispatcher.instance.locale.languageCode,
+          ),
+          blocks: [
+            for (final label in labels)
+              TranslationBlockInput(
+                blockIndex: label.$1,
+                nodeId: 'toc-${label.$1}',
+                text: label.$2,
+              ),
+          ],
+        );
+        if (generation != _translationGeneration || !translationEnabled) return;
+        _translatedTocLabels
+          ..clear()
+          ..addEntries(
+            results.map(
+              (translation) =>
+                  MapEntry(translation.blockIndex, translation.text),
+            ),
+          );
+      } catch (error, stackTrace) {
+        debugPrint(
+          'Could not translate table of contents: $error\n$stackTrace',
+        );
+        if (generation == _translationGeneration && translationEnabled) {
+          translationError ??= error.toString();
+        }
+      } finally {
+        if (generation == _translationGeneration) {
+          _tocTranslationInFlight = false;
+          notifyListeners();
+        }
+      }
+    }());
+  }
+
+  Future<void> _refreshCurrentSectionPreservingPosition() async {
+    if (!opened || busy || _source == null) return;
+    final currentSection = sectionIndex;
+    final progression = currentPage?.progression ?? 0.0;
+    final anchor = currentPage?.firstAnchor;
+    final staleSections = Map<int, List<PageLayout>>.of(_sections);
+    _sections.clear();
+    _paginations.clear();
+    _paginationGeneration++;
+    busy = true;
+    notifyListeners();
+    await Future<void>.delayed(Duration.zero);
+    for (final pages in staleSections.values) {
+      _disposePages(pages);
+    }
+    try {
+      final pages = await _paginate(currentSection);
+      sectionIndex = currentSection;
+      if (pages.isEmpty) {
+        pageIndex = 0;
+      } else if (anchor != null) {
+        pageIndex = _pageForAnchor(pages, anchor, progression);
+      } else {
+        pageIndex = (progression * (pages.length - 1)).round().clamp(
+          0,
+          pages.length - 1,
+        );
+      }
+      _evictDistantSections();
+    } finally {
+      busy = false;
+      notifyListeners();
+      _scheduleSave();
+    }
+  }
+
+  static int _pageForAnchor(
+    List<PageLayout> pages,
+    SourceAnchor anchor,
+    double fallbackProgression,
+  ) {
+    var match = -1;
+    for (var index = 0; index < pages.length; index++) {
+      for (final item in pages[index].items) {
+        if (item is TextPlacement &&
+            item.nodeId == anchor.node &&
+            item.textOffsetAtStart <= anchor.textOffset) {
+          match = index;
+        } else if (item is TableCellPlacement && item.nodeId == anchor.node) {
+          match = index;
+        }
+      }
+    }
+    return match >= 0
+        ? match
+        : (fallbackProgression * (pages.length - 1)).round().clamp(
+            0,
+            pages.length - 1,
+          );
+  }
+
+  static String? _translationConfigurationError(
+    AiProviderConfig? provider,
+    String model,
+  ) {
+    if (provider == null) return 'Select an AI provider first.';
+    if (provider.baseUrl.trim().isEmpty) {
+      return 'Configure the AI provider URL first.';
+    }
+    if (provider.apiKey.trim().isEmpty) {
+      return 'Configure the AI provider API Key first.';
+    }
+    if (model.trim().isEmpty) return 'Select a translation model first.';
+    return null;
+  }
+
+  static String _targetLanguageCode(
+    TranslationTarget target,
+    String systemLanguageCode,
+  ) => switch (target) {
+    TranslationTarget.system =>
+      systemLanguageCode.toLowerCase() == 'zh' ? 'zh-CN' : 'en',
+    TranslationTarget.simplifiedChinese => 'zh-CN',
+    TranslationTarget.english => 'en',
+  };
 
   /// Chooses the page matching [locator] within an already-paginated section.
   ///
@@ -399,6 +752,7 @@ class ReaderController extends ChangeNotifier {
       pageIndex++;
       notifyListeners();
       _scheduleSave();
+      _queueVisibleTranslation();
       return;
     }
     await _stepSection(1);
@@ -410,6 +764,7 @@ class ReaderController extends ChangeNotifier {
       pageIndex--;
       notifyListeners();
       _scheduleSave();
+      _queueVisibleTranslation();
       return;
     }
     await _stepSection(-1);
@@ -447,6 +802,7 @@ class ReaderController extends ChangeNotifier {
       busy = false;
       notifyListeners();
       _scheduleSave();
+      _queueVisibleTranslation();
     }
   }
 
@@ -490,7 +846,10 @@ class ReaderController extends ChangeNotifier {
     } finally {
       busy = false;
       notifyListeners();
-      if (navigated) _scheduleSave();
+      if (navigated) {
+        _scheduleSave();
+        _queueVisibleTranslation();
+      }
     }
   }
 
@@ -535,6 +894,7 @@ class ReaderController extends ChangeNotifier {
       busy = false;
       notifyListeners();
       _scheduleSave();
+      _queueVisibleTranslation();
     }
   }
 
@@ -563,7 +923,13 @@ class ReaderController extends ChangeNotifier {
 
   Future<List<PageLayout>> _paginateFresh(int index, int generation) async {
     final section = await _source!.parseSection(index);
-    await _decodeSectionImages(section);
+    await Future.wait([
+      _decodeSectionImages(section),
+      EnglishHyphenator.instance.ensureLoadedForSection(
+        section,
+        publicationLanguage: _style.publicationLanguage,
+      ),
+    ]);
     await Future<void>.delayed(Duration.zero);
     final pages = _engine.paginate(
       section,
@@ -579,6 +945,14 @@ class ReaderController extends ChangeNotifier {
     }
     _sections[index] = pages;
     return pages;
+  }
+
+  static String _preferredHyphenationLanguage(List<String> languages) {
+    for (final language in languages) {
+      final locale = EnglishHyphenator.localeForLanguageTag(language);
+      if (locale != null) return locale.languageTag;
+    }
+    return '';
   }
 
   /// Decodes every image referenced by [section]'s blocks into [_images]
@@ -601,7 +975,7 @@ class ReaderController extends ChangeNotifier {
     await Future.wait(
       hrefs.map((href) async {
         try {
-          final source = _source!;
+          final source = _resourceSource!;
           if (source is RasterResourceSource) {
             final rasterSource = source as RasterResourceSource;
             _images[href] = await rasterSource.rasterResource(
@@ -751,11 +1125,15 @@ class ReaderController extends ChangeNotifier {
       image?.dispose();
     }
     _images.clear();
-    final source = _source;
-    if (source is DisposableBookSource) {
-      (source as DisposableBookSource).dispose();
+    final resourceSource = _resourceSource;
+    if (resourceSource is DisposableBookSource) {
+      (resourceSource as DisposableBookSource).dispose();
     }
+    _translationGeneration++;
     _source = null;
+    _resourceSource = null;
+    _translationSource = null;
+    if (_ownsTranslationClient) translationClient.close();
     super.dispose();
   }
 }

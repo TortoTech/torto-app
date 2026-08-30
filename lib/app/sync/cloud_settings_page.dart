@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../../l10n/app_localizations.dart';
 import 'cloud_sync_controller.dart';
 import 'sync_models.dart';
 
@@ -55,7 +56,14 @@ class _CloudSettingsPageState extends State<CloudSettingsPage> {
             settings.username.isEmpty ||
             _password.text.isEmpty)) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Complete the WebDAV settings.')),
+        SnackBar(
+          content: Text(
+            context.l10n.text(
+              '请填写完整的 WebDAV 配置。',
+              'Complete the WebDAV settings.',
+            ),
+          ),
+        ),
       );
       return;
     }
@@ -67,16 +75,20 @@ class _CloudSettingsPageState extends State<CloudSettingsPage> {
 
   @override
   Widget build(BuildContext context) {
+    final l10n = context.l10n;
     return Scaffold(
-      appBar: AppBar(title: const Text('Cloud sync')),
+      appBar: AppBar(title: Text(l10n.text('云同步', 'Cloud sync'))),
       body: ListView(
         padding: const EdgeInsets.all(20),
         children: [
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
-            title: const Text('Enable cloud sync'),
-            subtitle: const Text(
-              'Sync books and reading progress with WebDAV.',
+            title: Text(l10n.text('启用云同步', 'Enable cloud sync')),
+            subtitle: Text(
+              l10n.text(
+                '通过 WebDAV 同步书籍与阅读进度。',
+                'Sync books and reading progress with WebDAV.',
+              ),
             ),
             value: _enabled,
             onChanged: (value) => setState(() => _enabled = value),
@@ -84,9 +96,9 @@ class _CloudSettingsPageState extends State<CloudSettingsPage> {
           const SizedBox(height: 12),
           DropdownButtonFormField<CloudProvider>(
             initialValue: _provider,
-            decoration: const InputDecoration(
-              labelText: 'Cloud provider',
-              border: OutlineInputBorder(),
+            decoration: InputDecoration(
+              labelText: l10n.text('云盘提供商', 'Cloud provider'),
+              border: const OutlineInputBorder(),
             ),
             items: [
               for (final provider in CloudProvider.values)
@@ -113,9 +125,9 @@ class _CloudSettingsPageState extends State<CloudSettingsPage> {
           TextField(
             controller: _username,
             autocorrect: false,
-            decoration: const InputDecoration(
-              labelText: 'Username',
-              border: OutlineInputBorder(),
+            decoration: InputDecoration(
+              labelText: l10n.text('用户名', 'Username'),
+              border: const OutlineInputBorder(),
             ),
           ),
           const SizedBox(height: 16),
@@ -124,22 +136,25 @@ class _CloudSettingsPageState extends State<CloudSettingsPage> {
             obscureText: true,
             autocorrect: false,
             enableSuggestions: false,
-            decoration: const InputDecoration(
-              labelText: 'App password',
-              border: OutlineInputBorder(),
+            decoration: InputDecoration(
+              labelText: l10n.text('应用密码', 'App password'),
+              border: const OutlineInputBorder(),
             ),
           ),
           const SizedBox(height: 16),
           TextField(
             controller: _deviceName,
-            decoration: const InputDecoration(
-              labelText: 'Device name',
-              border: OutlineInputBorder(),
+            decoration: InputDecoration(
+              labelText: l10n.text('设备名称', 'Device name'),
+              border: const OutlineInputBorder(),
             ),
           ),
           const SizedBox(height: 20),
           Text(
-            'The password is stored in the system credential store. Torto uploads book files and reading progress only after you enable sync.',
+            l10n.text(
+              '密码保存在系统凭据存储中。只有启用同步后，Torto 才会上传书籍文件与阅读进度。',
+              'The password is stored in the system credential store. Torto uploads book files and reading progress only after you enable sync.',
+            ),
             style: Theme.of(context).textTheme.bodySmall,
           ),
           const SizedBox(height: 24),
@@ -150,7 +165,7 @@ class _CloudSettingsPageState extends State<CloudSettingsPage> {
                     dimension: 20,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : const Text('Save'),
+                : Text(l10n.text('保存', 'Save')),
           ),
         ],
       ),

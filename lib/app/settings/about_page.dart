@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../l10n/app_localizations.dart';
 import '../update/app_update_service.dart';
 
 const _appIconAsset = 'android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png';
@@ -51,17 +52,20 @@ class _AboutPageState extends State<AboutPage> {
   Future<void> _openUri(Uri uri) async {
     final opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
     if (!opened && mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('无法打开链接。')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(context.l10n.text('无法打开链接。', 'Could not open link.')),
+        ),
+      );
     }
   }
 
   Future<void> _showLicenses() async {
+    final l10n = context.l10n;
     String? version;
     try {
       final info = await _packageInfo;
-      version = _displayVersion(info);
+      version = _displayVersion(info, l10n);
     } catch (_) {
       // The license page remains useful when package metadata is unavailable.
     }
@@ -74,20 +78,38 @@ class _AboutPageState extends State<AboutPage> {
     );
   }
 
-  String get _updateStatus {
-    if (_checking) return '正在连接 GitHub Releases…';
-    if (_updateError != null) return '检查失败，点击重试';
-    final updateInfo = _updateInfo;
-    if (updateInfo == null) return '从 GitHub Releases 检查新版本';
-    if (!updateInfo.hasRelease) return '尚未发布正式版本';
-    if (updateInfo.updateAvailable) {
-      return '发现新版本 v${updateInfo.latestVersion}';
+  String _updateStatus(AppLocalizations l10n) {
+    if (_checking) {
+      return l10n.text(
+        '正在连接 GitHub Releases…',
+        'Connecting to GitHub Releases…',
+      );
     }
-    return '已是最新版本';
+    if (_updateError != null) {
+      return l10n.text('检查失败，点击重试', 'Check failed. Tap to retry.');
+    }
+    final updateInfo = _updateInfo;
+    if (updateInfo == null) {
+      return l10n.text(
+        '从 GitHub Releases 检查新版本',
+        'Check GitHub Releases for updates',
+      );
+    }
+    if (!updateInfo.hasRelease) {
+      return l10n.text('尚未发布正式版本', 'No stable release is available yet');
+    }
+    if (updateInfo.updateAvailable) {
+      return l10n.text(
+        '发现新版本 v${updateInfo.latestVersion}',
+        'Version ${updateInfo.latestVersion} is available',
+      );
+    }
+    return l10n.text('已是最新版本', 'Torto is up to date');
   }
 
   @override
   Widget build(BuildContext context) {
+    final l10n = context.l10n;
     final colorScheme = Theme.of(context).colorScheme;
     final updateInfo = _updateInfo;
     final updatePage = updateInfo?.updateAvailable == true
@@ -95,7 +117,7 @@ class _AboutPageState extends State<AboutPage> {
         : null;
     final canOpenUpdate = updatePage != null;
     return Scaffold(
-      appBar: AppBar(title: const Text('关于')),
+      appBar: AppBar(title: Text(l10n.text('关于', 'About'))),
       body: ListView(
         padding: const EdgeInsets.fromLTRB(20, 24, 20, 32),
         children: [
@@ -118,8 +140,8 @@ class _AboutPageState extends State<AboutPage> {
                   future: _packageInfo,
                   builder: (context, snapshot) => Text(
                     snapshot.hasData
-                        ? _displayVersion(snapshot.data!)
-                        : '版本信息加载中',
+                        ? _displayVersion(snapshot.data!, l10n)
+                        : l10n.text('版本信息加载中', 'Loading version information'),
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                       color: colorScheme.onSurfaceVariant,
                     ),
@@ -127,7 +149,10 @@ class _AboutPageState extends State<AboutPage> {
                 ),
                 const SizedBox(height: 12),
                 Text(
-                  '专注阅读体验的开源电子书阅读器',
+                  l10n.text(
+                    '专注阅读体验的开源电子书阅读器',
+                    'An open-source e-book reader focused on reading',
+                  ),
                   textAlign: TextAlign.center,
                   style: Theme.of(context).textTheme.bodyLarge,
                 ),
@@ -141,15 +166,15 @@ class _AboutPageState extends State<AboutPage> {
               children: [
                 ListTile(
                   leading: const Icon(Icons.system_update_outlined),
-                  title: const Text('检查更新'),
-                  subtitle: Text(_updateStatus),
+                  title: Text(l10n.text('检查更新', 'Check for updates')),
+                  subtitle: Text(_updateStatus(l10n)),
                   trailing: _checking
                       ? const SizedBox.square(
                           dimension: 20,
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
                       : canOpenUpdate
-                      ? const Text('下载')
+                      ? Text(l10n.text('下载', 'Download'))
                       : const Icon(Icons.chevron_right),
                   onTap: _checking
                       ? null
@@ -161,14 +186,19 @@ class _AboutPageState extends State<AboutPage> {
                 ListTile(
                   leading: const Icon(Icons.code),
                   title: const Text('GitHub'),
-                  subtitle: const Text('源代码、问题反馈与版本发布'),
+                  subtitle: Text(
+                    l10n.text(
+                      '源代码、问题反馈与版本发布',
+                      'Source code, issue tracking and releases',
+                    ),
+                  ),
                   trailing: const Icon(Icons.open_in_new),
                   onTap: () => _openUri(_repositoryUri),
                 ),
                 const Divider(height: 1, indent: 56),
                 ListTile(
                   leading: const Icon(Icons.description_outlined),
-                  title: const Text('开源许可'),
+                  title: Text(l10n.text('开源许可', 'Open-source licenses')),
                   trailing: const Icon(Icons.chevron_right),
                   onTap: _showLicenses,
                 ),
@@ -189,7 +219,12 @@ class _AboutPageState extends State<AboutPage> {
   }
 }
 
-String _displayVersion(PackageInfo info) {
+String _displayVersion(PackageInfo info, AppLocalizations l10n) {
   final build = info.buildNumber.trim();
-  return build.isEmpty ? '版本 ${info.version}' : '版本 ${info.version} ($build)';
+  return build.isEmpty
+      ? l10n.text('版本 ${info.version}', 'Version ${info.version}')
+      : l10n.text(
+          '版本 ${info.version} ($build)',
+          'Version ${info.version} ($build)',
+        );
 }

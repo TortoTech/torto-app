@@ -79,6 +79,43 @@ class _FakeReaderController extends ReaderController {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
+  testWidgets('tap zones reserve the middle sixty percent for controls', (
+    tester,
+  ) async {
+    final controller = _FakeReaderController();
+    await tester.binding.setSurfaceSize(const Size(411, 914));
+    addTearDown(() async {
+      await tester.pumpWidget(const SizedBox.shrink());
+      controller.dispose();
+      await tester.binding.setSurfaceSize(null);
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ReaderPage(file: File('unused.epub'), controller: controller),
+      ),
+    );
+    await tester.pump();
+
+    await tester.tapAt(const Offset(83, 450));
+    await tester.pump();
+    expect(controller.pageIndex, 1);
+    expect(find.byKey(const Key('reader-header')), findsOneWidget);
+
+    await tester.tapAt(const Offset(82, 450));
+    await tester.pump();
+    expect(controller.pageIndex, 0);
+
+    await tester.tapAt(const Offset(328, 450));
+    await tester.pump();
+    expect(controller.pageIndex, 0);
+    expect(find.byKey(const Key('reader-header')), findsOneWidget);
+
+    await tester.tapAt(const Offset(329, 450));
+    await tester.pump();
+    expect(controller.pageIndex, 1);
+  });
+
   testWidgets('rapid page turns settle deterministically', (tester) async {
     final controller = _FakeReaderController();
     await tester.binding.setSurfaceSize(const Size(411, 914));
@@ -224,11 +261,13 @@ void main() {
     final back = find.byKey(const Key('reader-back-button'));
     final contents = find.byKey(const Key('reader-toc-button'));
     final style = find.byKey(const Key('reader-style-button'));
+    final theme = find.byKey(const Key('reader-theme-button'));
     final header = find.byKey(const Key('reader-header'));
     final footer = find.byKey(const Key('reader-footer'));
     expect(back, findsOneWidget);
     expect(contents, findsOneWidget);
     expect(style, findsOneWidget);
+    expect(theme, findsOneWidget);
     expect(find.text('目录'), findsNothing);
     expect(find.text('Gesture test'), findsNothing);
     expect(find.textContaining('section'), findsNothing);
@@ -241,8 +280,31 @@ void main() {
     expect(tester.getCenter(contents).dx, lessThan(100));
     expect(tester.getSize(contents), const Size(64, 56));
     expect(tester.getSize(style), const Size(64, 56));
+    expect(tester.getSize(theme), const Size(64, 56));
     expect(tester.widget<IconButton>(contents).iconSize, 32);
     expect(tester.widget<IconButton>(style).iconSize, 32);
+    expect(tester.widget<IconButton>(theme).iconSize, 32);
+    expect(tester.widget<IconButton>(theme).tooltip, '深色模式');
+
+    await tester.tap(theme);
+    await tester.pumpAndSettle();
+    expect(await preferences.loadDarkMode(), isTrue);
+    expect(
+      tester.widget<PageWidget>(find.byType(PageWidget)).background,
+      const Color(0xFF000000),
+    );
+    expect(
+      tester.widget<PageWidget>(find.byType(PageWidget)).foreground,
+      const Color(0xFF959595),
+    );
+    expect(tester.widget<Material>(header).color, const Color(0xFF1C1C1C));
+    expect(tester.widget<Material>(footer).color, const Color(0xFF1C1C1C));
+    expect(
+      tester
+          .widget<IconButton>(find.byKey(const Key('reader-theme-button')))
+          .tooltip,
+      '浅色模式',
+    );
 
     await tester.tap(style);
     await tester.pumpAndSettle();
@@ -270,8 +332,8 @@ void main() {
 
     await tester.tap(contents);
     await tester.pumpAndSettle();
-    expect(find.text('No table of contents'), findsOneWidget);
-    Navigator.of(tester.element(find.text('No table of contents'))).pop();
+    expect(find.text('没有目录'), findsOneWidget);
+    Navigator.of(tester.element(find.text('没有目录'))).pop();
     await tester.pumpAndSettle();
 
     await tester.tap(back);
