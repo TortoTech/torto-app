@@ -41,6 +41,136 @@ const double _imageBlockGap = 14.0;
 const bool _debugHyphenation = bool.fromEnvironment('TORTO_DEBUG_HYPHENATION');
 const String _readerFontFamily = 'sans-serif';
 
+enum _SemanticScriptClass { cjk, italicFriendly, neutral }
+
+class _SemanticTextSegment {
+  final int start;
+  final int end;
+  final TextStyle style;
+
+  const _SemanticTextSegment(this.start, this.end, this.style);
+}
+
+class _SemanticCluster {
+  final int start;
+  final int end;
+  final int? firstRune;
+  _SemanticScriptClass script;
+
+  _SemanticCluster(this.start, this.end, this.firstRune, this.script);
+}
+
+List<_SemanticTextSegment> _semanticTextSegments(
+  String text,
+  TextStyle style, {
+  required bool unified,
+  required WritingSystem fallbackWritingSystem,
+}) {
+  final semantic = style.emphasis || style.alternateVoice || style.citation;
+  if (!unified || !semantic || text.isEmpty) {
+    return [_SemanticTextSegment(0, text.length, style)];
+  }
+  final clusters = <_SemanticCluster>[];
+  var offset = 0;
+  for (final grapheme in text.characters) {
+    final end = offset + grapheme.length;
+    clusters.add(
+      _SemanticCluster(
+        offset,
+        end,
+        grapheme.runes.firstOrNull,
+        _semanticGraphemeScript(grapheme),
+      ),
+    );
+    offset = end;
+  }
+  if (clusters.isEmpty) return const [];
+  final fallback = fallbackWritingSystem == WritingSystem.cjk
+      ? _SemanticScriptClass.cjk
+      : _SemanticScriptClass.italicFriendly;
+  final nextStrong = List<_SemanticScriptClass?>.filled(clusters.length, null);
+  _SemanticScriptClass? next;
+  for (var index = clusters.length - 1; index >= 0; index--) {
+    nextStrong[index] = next;
+    if (clusters[index].script != _SemanticScriptClass.neutral) {
+      next = clusters[index].script;
+    }
+  }
+  _SemanticScriptClass? previous;
+  for (var index = 0; index < clusters.length; index++) {
+    final cluster = clusters[index];
+    if (cluster.script == _SemanticScriptClass.neutral) {
+      final right = nextStrong[index];
+      cluster.script = _isSemanticOpeningPunctuation(cluster.firstRune)
+          ? right ?? previous ?? fallback
+          : previous ?? right ?? fallback;
+    }
+    previous = cluster.script;
+  }
+
+  final segments = <_SemanticTextSegment>[];
+  for (final cluster in clusters) {
+    var resolved = style;
+    if (cluster.script == _SemanticScriptClass.cjk) {
+      resolved = resolved.copyWith(
+        bold: resolved.bold || resolved.emphasis || resolved.alternateVoice,
+        italic: false,
+      );
+    } else {
+      resolved = resolved.copyWith(italic: true);
+    }
+    if (segments.isNotEmpty &&
+        segments.last.end == cluster.start &&
+        segments.last.style == resolved) {
+      final previousSegment = segments.removeLast();
+      segments.add(
+        _SemanticTextSegment(previousSegment.start, cluster.end, resolved),
+      );
+    } else {
+      segments.add(_SemanticTextSegment(cluster.start, cluster.end, resolved));
+    }
+  }
+  return segments;
+}
+
+_SemanticScriptClass _semanticGraphemeScript(String grapheme) {
+  for (final rune in grapheme.runes) {
+    if (_isSemanticCjkRune(rune)) return _SemanticScriptClass.cjk;
+    if (_isSemanticItalicFriendlyRune(rune)) {
+      return _SemanticScriptClass.italicFriendly;
+    }
+  }
+  return _SemanticScriptClass.neutral;
+}
+
+bool _isSemanticCjkRune(int rune) =>
+    (rune >= 0x3400 && rune <= 0x9fff) ||
+    (rune >= 0xf900 && rune <= 0xfaff) ||
+    (rune >= 0x20000 && rune <= 0x323af) ||
+    (rune >= 0x3040 && rune <= 0x30ff) ||
+    (rune >= 0x31f0 && rune <= 0x31ff) ||
+    (rune >= 0xac00 && rune <= 0xd7af) ||
+    (rune >= 0x1100 && rune <= 0x11ff);
+
+bool _isSemanticItalicFriendlyRune(int rune) =>
+    (rune >= 0x0041 && rune <= 0x024f) ||
+    (rune >= 0x0370 && rune <= 0x052f) ||
+    (rune >= 0x1e00 && rune <= 0x1eff) ||
+    (rune >= 0x2c60 && rune <= 0x2c7f) ||
+    (rune >= 0xa640 && rune <= 0xa69f);
+
+bool _isSemanticOpeningPunctuation(int? rune) => const {
+  0x0028,
+  0x005b,
+  0x2018,
+  0x201c,
+  0x3008,
+  0x300a,
+  0x300c,
+  0x3010,
+  0xff08,
+}.contains(rune);
+
 class LayoutEngine {
   final ParagraphHyphenator? hyphenator;
 
@@ -63,6 +193,26 @@ class LayoutEngine {
     isQuote: isQuote,
     isDefinitionTerm: isDefinitionTerm,
   );
+
+  @visibleForTesting
+  static List<({String text, bool bold, bool italic})>
+  debugResolvedSemanticSegments(
+    String text,
+    TextStyle style, {
+    WritingSystem writingSystem = WritingSystem.unknown,
+  }) => [
+    for (final segment in _semanticTextSegments(
+      text,
+      style,
+      unified: true,
+      fallbackWritingSystem: writingSystem,
+    ))
+      (
+        text: text.substring(segment.start, segment.end),
+        bold: segment.style.bold,
+        italic: segment.style.italic,
+      ),
+  ];
 
   @visibleForTesting
   static BlockAlign debugResolvedUnifiedAlignment(
@@ -172,6 +322,7 @@ class LayoutEngine {
             contentLeft,
             contentWidth,
             textStartOf[block] ?? 0,
+            imageSizeResolver: imageSizeResolver,
           );
           if (prepared == null) continue;
           paginator.pushText(prepared);
@@ -354,6 +505,7 @@ class LayoutEngine {
     double contentWidth,
     double sectionTextOffset, {
     BlockAlign? unifiedAlignmentOverride,
+    ui.Size? Function(String href)? imageSizeResolver,
   }) {
     final baseSize = style.baseFontSize;
     final unified = style.typesettingMode == TypesettingMode.unified;
@@ -442,7 +594,8 @@ class LayoutEngine {
       (i) =>
           i is TextRun && i.text.isNotEmpty ||
           i is BreakInline ||
-          i is MathInline && i.latex.isNotEmpty,
+          i is MathInline && i.latex.isNotEmpty ||
+          i is InlineImageRun,
     );
     if (!hasText) return null;
 
@@ -475,6 +628,8 @@ class LayoutEngine {
             _ => block.style.indent,
           };
     var syntheticPrefixLength = 0;
+    final normalDisplayToSource = <int>[0];
+    var sourceOffset = 0;
     if (indentWidth > 0) {
       builder.addPlaceholder(
         indentWidth,
@@ -484,10 +639,18 @@ class LayoutEngine {
         baselineOffset: baseSize * 0.8,
       );
       syntheticPrefixLength = 1;
+      normalDisplayToSource.add(0);
     }
 
     final links = <TextLinkRange>[];
+    final inlineImages = <InlineImageRange>[];
     var paragraphOffset = syntheticPrefixLength;
+
+    void appendSourceUnits(int length) {
+      for (var unit = 0; unit < length; unit++) {
+        normalDisplayToSource.add(++sourceOffset);
+      }
+    }
 
     for (final inline in block.inlines) {
       switch (inline) {
@@ -517,24 +680,32 @@ class LayoutEngine {
               ),
             );
             paragraphOffset += text.length;
+            appendSourceUnits(text.length);
             continue;
           }
-          builder.pushStyle(
-            _resolvedUiTextStyle(
-              runStyle: runStyle,
-              linked: link != null,
-              unified: unified,
-              blockScale: blockScale,
-              baseSize: baseSize,
-              foreground: foreground,
-              fontFamily: fontFamily,
-              isHeading: isHeading,
-              isQuote: isQuote,
-              isDefinitionTerm: isDefinitionTerm,
-            ),
-          );
-          builder.addText(text);
-          builder.pop();
+          for (final segment in _semanticTextSegments(
+            text,
+            runStyle,
+            unified: unified,
+            fallbackWritingSystem: style.writingSystem,
+          )) {
+            builder.pushStyle(
+              _resolvedUiTextStyle(
+                runStyle: segment.style,
+                linked: link != null,
+                unified: unified,
+                blockScale: blockScale,
+                baseSize: baseSize,
+                foreground: foreground,
+                fontFamily: fontFamily,
+                isHeading: isHeading,
+                isQuote: isQuote,
+                isDefinitionTerm: isDefinitionTerm,
+              ),
+            );
+            builder.addText(text.substring(segment.start, segment.end));
+            builder.pop();
+          }
           if (link != null) {
             links.add(
               TextLinkRange(
@@ -547,6 +718,7 @@ class LayoutEngine {
             );
           }
           paragraphOffset += text.length;
+          appendSourceUnits(text.length);
         case MathInline(:final latex, :final sizeScale):
           if (latex.isEmpty) continue;
           final scale = unified ? blockScale : sizeScale * blockScale;
@@ -561,9 +733,33 @@ class LayoutEngine {
           builder.addText(latex);
           builder.pop();
           paragraphOffset += latex.length;
+          appendSourceUnits(latex.length);
         case BreakInline():
           builder.addText('\n');
           paragraphOffset++;
+          appendSourceUnits(1);
+        case InlineImageRun(:final image, :final sizeScale):
+          final dimensions = _inlineImageDimensions(
+            image.href,
+            requestedHeight:
+                baseSize * (unified ? blockScale : sizeScale * blockScale),
+            availableWidth: contentWidth,
+            imageSizeResolver: imageSizeResolver,
+          );
+          builder.addPlaceholder(
+            dimensions.width,
+            dimensions.height,
+            ui.PlaceholderAlignment.middle,
+          );
+          inlineImages.add(
+            InlineImageRange(
+              start: paragraphOffset,
+              end: paragraphOffset + 1,
+              href: image.href,
+            ),
+          );
+          paragraphOffset++;
+          normalDisplayToSource.add(sourceOffset);
       }
     }
 
@@ -598,7 +794,9 @@ class LayoutEngine {
     final width = math.max(1.0, contentWidth - textStart);
     paragraph.layout(ui.ParagraphConstraints(width: width));
     var metrics = paragraph.computeLineMetrics();
-    List<int>? displayToSource;
+    List<int>? displayToSource = inlineImages.isEmpty
+        ? null
+        : normalDisplayToSource;
     if (style.lineBreakStrategy == LineBreakStrategy.optimized &&
         metrics.length > 1 &&
         (((block.kind == TextBlockKind.paragraph ||
@@ -622,6 +820,7 @@ class LayoutEngine {
         firstLineIndent: indentWidth,
         width: width,
         publicationLanguage: style.publicationLanguage,
+        writingSystem: style.writingSystem,
       );
       if (optimized != null) {
         paragraph.dispose();
@@ -664,6 +863,7 @@ class LayoutEngine {
       spineIndex: spineIndex,
       sectionTextOffset: sectionTextOffset,
       links: links,
+      inlineImages: inlineImages,
       displayToSource: displayToSource,
     );
   }
@@ -732,9 +932,20 @@ class LayoutEngine {
   }) {
     final clearBold = unified && (isHeading || isQuote);
     final clearItalic = unified && (isHeading || isQuote);
+    final semantic =
+        runStyle.emphasis || runStyle.alternateVoice || runStyle.citation;
+    final semanticCjkEmphasis =
+        unified &&
+        (runStyle.emphasis || runStyle.alternateVoice) &&
+        runStyle.bold &&
+        !runStyle.italic;
     return (
-      bold: (runStyle.bold && !clearBold) || isHeading || isDefinitionTerm,
-      italic: runStyle.italic && !clearItalic,
+      bold:
+          (runStyle.bold && !clearBold) ||
+          semanticCjkEmphasis ||
+          isHeading ||
+          isDefinitionTerm,
+      italic: runStyle.italic && (!clearItalic || semantic),
       underline: !unified && runStyle.underline,
       strikethrough: runStyle.strikethrough,
     );
@@ -753,6 +964,7 @@ class LayoutEngine {
     required double firstLineIndent,
     required double width,
     required String publicationLanguage,
+    required WritingSystem writingSystem,
   }) {
     final slices = <_SourceRunSlice>[];
     final text = StringBuffer();
@@ -762,6 +974,8 @@ class LayoutEngine {
         case BreakInline():
           return null;
         case MathInline():
+          return null;
+        case InlineImageRun():
           return null;
         case TextRun(
           text: final value,
@@ -774,28 +988,39 @@ class LayoutEngine {
           final authoredScale = unified
               ? blockScale
               : runStyle.sizeScale * blockScale;
-          final start = sourceOffset;
+          final runStart = sourceOffset;
           sourceOffset += value.length;
           text.write(value);
-          slices.add(
-            _SourceRunSlice(
-              start: start,
-              end: sourceOffset,
-              style: runStyle,
-              link: link,
-              language: language,
-              footnoteIcon: footnoteIcon,
-              footnoteSize: footnoteIcon
-                  ? (baseSize * authoredScale * 0.78).clamp(8.0, 12.0)
-                  : 0,
-              fontSize: _resolvedFontSize(
-                runStyle,
-                unified: unified,
-                blockScale: blockScale,
-                baseSize: baseSize,
+          final semanticSegments = footnoteIcon
+              ? [_SemanticTextSegment(0, value.length, runStyle)]
+              : _semanticTextSegments(
+                  value,
+                  runStyle,
+                  unified: unified,
+                  fallbackWritingSystem: writingSystem,
+                );
+          for (final segment in semanticSegments) {
+            final segmentStyle = segment.style;
+            slices.add(
+              _SourceRunSlice(
+                start: runStart + segment.start,
+                end: runStart + segment.end,
+                style: segmentStyle,
+                link: link,
+                language: language,
+                footnoteIcon: footnoteIcon,
+                footnoteSize: footnoteIcon
+                    ? (baseSize * authoredScale * 0.78).clamp(8.0, 12.0)
+                    : 0,
+                fontSize: _resolvedFontSize(
+                  segmentStyle,
+                  unified: unified,
+                  blockScale: blockScale,
+                  baseSize: baseSize,
+                ),
               ),
-            ),
-          );
+            );
+          }
       }
     }
     final sourceText = text.toString();
@@ -1407,6 +1632,27 @@ class LayoutEngine {
     }
   }
 
+  static ui.Size _inlineImageDimensions(
+    String href, {
+    required double requestedHeight,
+    required double availableWidth,
+    required ui.Size? Function(String href)? imageSizeResolver,
+  }) {
+    final intrinsic = imageSizeResolver?.call(href);
+    final aspectRatio = intrinsic == null || intrinsic.height <= 0
+        ? 1.0
+        : intrinsic.width / intrinsic.height;
+    final height = math.max(1.0, requestedHeight);
+    final requestedWidth = height * aspectRatio;
+    final widthScale = requestedWidth <= 0
+        ? 1.0
+        : math.min(1.0, availableWidth / requestedWidth);
+    return ui.Size(
+      math.max(1.0, requestedWidth * widthScale),
+      math.max(1.0, height * widthScale),
+    );
+  }
+
   _PreparedTable? _prepareTable(
     TableBlock table,
     ReaderStyle style,
@@ -1675,26 +1921,39 @@ class LayoutEngine {
             paragraphOffset += text.length;
             continue;
           }
-          var scale = unified ? fontScale : fontScale * runStyle.sizeScale;
-          if (runStyle.baseline != TextBaselineShift.none) scale *= 0.7;
-          builder.pushStyle(
-            ui.TextStyle(
-              color: _resolvedRunColor(
-                runStyle: runStyle,
-                unified: unified,
-                foreground: foreground,
+          for (final segment in _semanticTextSegments(
+            text,
+            runStyle,
+            unified: unified,
+            fallbackWritingSystem: style.writingSystem,
+          )) {
+            final segmentStyle = segment.style;
+            var scale = unified
+                ? fontScale
+                : fontScale * segmentStyle.sizeScale;
+            if (segmentStyle.baseline != TextBaselineShift.none) scale *= 0.7;
+            builder.pushStyle(
+              ui.TextStyle(
+                color: _resolvedRunColor(
+                  runStyle: segmentStyle,
+                  unified: unified,
+                  foreground: foreground,
+                ),
+                fontWeight: cell.header || segmentStyle.bold
+                    ? ui.FontWeight.bold
+                    : null,
+                fontStyle: segmentStyle.italic ? ui.FontStyle.italic : null,
+                decoration: _decorationFor(
+                  segmentStyle,
+                  includeUnderline: !unified,
+                ),
+                fontSize: style.baseFontSize * scale,
+                fontFamily: _readerFontFamily,
               ),
-              fontWeight: cell.header || runStyle.bold
-                  ? ui.FontWeight.bold
-                  : null,
-              fontStyle: runStyle.italic ? ui.FontStyle.italic : null,
-              decoration: _decorationFor(runStyle, includeUnderline: !unified),
-              fontSize: style.baseFontSize * scale,
-              fontFamily: _readerFontFamily,
-            ),
-          );
-          builder.addText(text);
-          builder.pop();
+            );
+            builder.addText(text.substring(segment.start, segment.end));
+            builder.pop();
+          }
           if (link != null) {
             links.add(
               TextLinkRange(
@@ -1723,6 +1982,8 @@ class LayoutEngine {
           builder.addText(latex);
           builder.pop();
           paragraphOffset += latex.length;
+        case InlineImageRun():
+          continue;
       }
     }
     final paragraph = builder.build()
@@ -2273,6 +2534,7 @@ class _PreparedText {
   final int spineIndex;
   final double sectionTextOffset;
   final List<TextLinkRange> links;
+  final List<InlineImageRange> inlineImages;
 
   /// Maps UTF-16 offsets in a paragraph containing optimizer-inserted line
   /// breaks back to offsets in the source text.
@@ -2297,6 +2559,7 @@ class _PreparedText {
     required this.spineIndex,
     required this.sectionTextOffset,
     required this.links,
+    required this.inlineImages,
     required this.displayToSource,
   });
 
@@ -2319,6 +2582,7 @@ class _PreparedText {
     spineIndex: spineIndex,
     sectionTextOffset: sectionTextOffset,
     links: links,
+    inlineImages: inlineImages,
     displayToSource: displayToSource,
   );
 }
@@ -2440,6 +2704,7 @@ class _Paginator {
           sliceHeight: sliceBottom - sliceTop,
           sectionTextOffset: prepared.sectionTextOffset,
           links: prepared.links,
+          inlineImages: prepared.inlineImages,
         ),
       );
       hasContent = true;

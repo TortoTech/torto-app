@@ -126,6 +126,75 @@ void main() {
     picture.dispose();
   });
 
+  test('inline images paint inside their paragraph placeholder', () async {
+    const width = 120;
+    const height = 70;
+    final block = TextBlock(
+      kind: TextBlockKind.heading,
+      headingLevel: 2,
+      inlines: const [
+        InlineImageRun(
+          image: ImageBlock(href: 'img/icon.png'),
+          sizeScale: 1,
+          presentation: true,
+        ),
+        TextRun('Title'),
+      ],
+    );
+    final pages = const LayoutEngine().paginate(
+      Section(spineIndex: 0, href: 's.xhtml', blocks: [block]),
+      LayoutViewport(width: width.toDouble(), height: height.toDouble()),
+      const ReaderStyle(
+        baseFontSize: 10,
+        marginTop: 10,
+        marginBottom: 10,
+        marginLeft: 10,
+        marginRight: 10,
+      ),
+      imageSizeResolver: (_) => const ui.Size(2, 1),
+    );
+    addTearDown(() {
+      for (final page in pages) {
+        page.dispose();
+      }
+    });
+
+    final sourceRecorder = ui.PictureRecorder();
+    ui.Canvas(sourceRecorder).drawRect(
+      const ui.Rect.fromLTWH(0, 0, 2, 1),
+      ui.Paint()..color = const ui.Color(0xFFFF0000),
+    );
+    final sourcePicture = sourceRecorder.endRecording();
+    final sourceImage = await sourcePicture.toImage(2, 1);
+
+    final recorder = ui.PictureRecorder();
+    PagePainter(
+      page: pages.single,
+      imageResolver: (_) => sourceImage,
+      background: Colors.white,
+    ).paint(ui.Canvas(recorder), ui.Size(width.toDouble(), height.toDouble()));
+    final picture = recorder.endRecording();
+    final rendered = await picture.toImage(width, height);
+    final bytes = (await rendered.toByteData(
+      format: ui.ImageByteFormat.rawRgba,
+    ))!.buffer.asUint8List();
+
+    final placement = pages.single.items.whereType<TextPlacement>().single;
+    final inline = placement.inlineImages.single;
+    final box = placement.paragraph
+        .getBoxesForRange(inline.start, inline.end)
+        .single;
+    final sampleX = (placement.x + (box.left + box.right) / 2).floor();
+    final sampleY =
+        (placement.y - placement.sliceTop + (box.top + box.bottom) / 2).floor();
+    expect(_pixel(bytes, width, sampleX, sampleY), [255, 0, 0, 255]);
+
+    sourceImage.dispose();
+    sourcePicture.dispose();
+    rendered.dispose();
+    picture.dispose();
+  });
+
   testWidgets('PageWidget builds a CustomPaint at viewport size', (
     tester,
   ) async {

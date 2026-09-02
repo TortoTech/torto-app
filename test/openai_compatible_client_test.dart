@@ -16,6 +16,34 @@ void main() {
     models: ['book-model'],
   );
 
+  test('translation prompt carries structured book translation rules', () {
+    final prompt = translationSystemPrompt('简体中文');
+    expect(prompt, contains('# 翻译任务'));
+    expect(prompt, contains('# 中文表达'));
+    expect(prompt, contains('# 正文结构'));
+    expect(prompt, contains('# 输出格式'));
+    expect(prompt, contains('<cite>'));
+    expect(prompt, contains('<torto-italic>'));
+    expect(prompt, contains('不需要用括号附原文'));
+  });
+
+  test('translation reasoning effort defaults and round-trips', () {
+    expect(
+      TranslationSettings.fromJson(const {}).reasoningEffort,
+      ReasoningEffort.defaultLevel,
+    );
+    final restored = TranslationSettings.fromJson(
+      const TranslationSettings(reasoningEffort: ReasoningEffort.high).toJson(),
+    );
+    expect(restored.reasoningEffort, ReasoningEffort.high);
+  });
+
+  test('leading list markers are preserved deterministically', () {
+    expect(preserveLeadingListMarker('Paragraph', '• 译文'), '译文');
+    expect(preserveLeadingListMarker('1. Item', '2. 项目'), '1. 项目');
+    expect(preserveLeadingListMarker('• Item', '• 项目'), '• 项目');
+  });
+
   test('loads and sorts models from an OpenAI-compatible endpoint', () async {
     final client = OpenAiCompatibleClient(
       client: MockClient((request) async {
@@ -121,6 +149,87 @@ void main() {
     expect(result.single.text, '你好');
     client.close();
   });
+
+  test('retries when translated inline markup fails validation', () async {
+    var requests = 0;
+    final client = OpenAiCompatibleClient(
+      client: MockClient((request) async {
+        requests++;
+        final value = requests == 1 ? '<em>损坏' : '<em>有效</em>';
+        return _jsonResponse({
+          'choices': [
+            {
+              'message': {
+                'content': jsonEncode({'0': value}),
+              },
+            },
+          ],
+        });
+      }),
+    );
+
+    final result = await client.translateBlocks(
+      provider: provider,
+      model: 'book-model',
+      targetLanguage: '简体中文',
+      blocks: const [
+        TranslationBlockInput(
+          blockIndex: 0,
+          nodeId: 'node',
+          text: '<em>Hello</em>',
+        ),
+      ],
+      validate: (translations) {
+        if (!translations.single.text.endsWith('</em>')) {
+          throw const FormatException('invalid inline markup');
+        }
+      },
+    );
+
+    expect(requests, 2);
+    expect(result.single.text, '<em>有效</em>');
+    client.close();
+  });
+
+  test(
+    'reasoning effort is omitted by default and sent when selected',
+    () async {
+      final payloads = <Map<String, dynamic>>[];
+      final client = OpenAiCompatibleClient(
+        client: MockClient((request) async {
+          payloads.add(jsonDecode(request.body) as Map<String, dynamic>);
+          return _jsonResponse({
+            'choices': [
+              {
+                'message': {'content': '{"0":"你好"}'},
+              },
+            ],
+          });
+        }),
+      );
+      const blocks = [
+        TranslationBlockInput(blockIndex: 0, nodeId: 'node', text: 'Hello'),
+      ];
+
+      await client.translateBlocks(
+        provider: provider,
+        model: 'book-model',
+        targetLanguage: '简体中文',
+        blocks: blocks,
+      );
+      await client.translateBlocks(
+        provider: provider,
+        model: 'book-model',
+        targetLanguage: '简体中文',
+        reasoningEffort: ReasoningEffort.minimal,
+        blocks: blocks,
+      );
+
+      expect(payloads.first.containsKey('reasoning_effort'), isFalse);
+      expect(payloads.last['reasoning_effort'], 'minimal');
+      client.close();
+    },
+  );
 }
 
 http.Response _jsonResponse(Object body) => http.Response.bytes(

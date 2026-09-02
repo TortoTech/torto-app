@@ -18,6 +18,16 @@ enum InlineRole { normal, footnote }
 class TextStyle {
   final bool bold;
   final bool italic;
+
+  /// Semantic stress emphasis originating from HTML `<em>`.
+  final bool emphasis;
+
+  /// Semantic alternate voice or term originating from HTML `<i>`.
+  final bool alternateVoice;
+
+  /// Authored work-title or citation semantics originating from HTML `<cite>`.
+  final bool citation;
+
   final bool underline;
   final bool strikethrough;
 
@@ -34,6 +44,9 @@ class TextStyle {
   const TextStyle({
     this.bold = false,
     this.italic = false,
+    this.emphasis = false,
+    this.alternateVoice = false,
+    this.citation = false,
     this.underline = false,
     this.strikethrough = false,
     this.sizeScale = 1.0,
@@ -51,6 +64,9 @@ class TextStyle {
     return TextStyle(
       bold: bold || overlay.bold,
       italic: italic || overlay.italic,
+      emphasis: emphasis || overlay.emphasis,
+      alternateVoice: alternateVoice || overlay.alternateVoice,
+      citation: citation || overlay.citation,
       underline: underline || overlay.underline,
       strikethrough: strikethrough || overlay.strikethrough,
       sizeScale: sizeScale * overlay.sizeScale,
@@ -67,11 +83,43 @@ class TextStyle {
     );
   }
 
+  TextStyle copyWith({
+    bool? bold,
+    bool? italic,
+    bool? emphasis,
+    bool? alternateVoice,
+    bool? citation,
+    bool? underline,
+    bool? strikethrough,
+    double? sizeScale,
+    int? color,
+    bool clearColor = false,
+    TextBaselineShift? baseline,
+    LinkRole? linkRole,
+    InlineRole? inlineRole,
+  }) => TextStyle(
+    bold: bold ?? this.bold,
+    italic: italic ?? this.italic,
+    emphasis: emphasis ?? this.emphasis,
+    alternateVoice: alternateVoice ?? this.alternateVoice,
+    citation: citation ?? this.citation,
+    underline: underline ?? this.underline,
+    strikethrough: strikethrough ?? this.strikethrough,
+    sizeScale: sizeScale ?? this.sizeScale,
+    color: clearColor ? null : (color ?? this.color),
+    baseline: baseline ?? this.baseline,
+    linkRole: linkRole ?? this.linkRole,
+    inlineRole: inlineRole ?? this.inlineRole,
+  );
+
   @override
   bool operator ==(Object other) =>
       other is TextStyle &&
       other.bold == bold &&
       other.italic == italic &&
+      other.emphasis == emphasis &&
+      other.alternateVoice == alternateVoice &&
+      other.citation == citation &&
       other.underline == underline &&
       other.strikethrough == strikethrough &&
       other.sizeScale == sizeScale &&
@@ -84,6 +132,9 @@ class TextStyle {
   int get hashCode => Object.hash(
     bold,
     italic,
+    emphasis,
+    alternateVoice,
+    citation,
     underline,
     strikethrough,
     sizeScale,

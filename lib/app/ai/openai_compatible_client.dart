@@ -1,10 +1,76 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:characters/characters.dart';
 import 'package:http/http.dart' as http;
 
 import '../../core/translation/translation_models.dart';
 import 'ai_models.dart';
+
+String translationSystemPrompt(
+  String targetLanguage, {
+  String fixedPageHint = '',
+}) {
+  final fixedPageSection = fixedPageHint.trim().isEmpty
+      ? ''
+      : '\n# PDF 文字层\n- ${fixedPageHint.trim()}\n';
+  return '''你是一名专业图书翻译。
+
+# 翻译任务
+- 把输入 JSON 对象中的每个值翻译为$targetLanguage。
+- 忠实保留原文语气、事实、专名所指与段落结构。
+
+# 中文表达（目标语言为中文时）
+- 人名、地名、书名、机构名、专业术语等外文专名，显示译名即可，不需要用括号附原文。
+- 尽量不保留破折号句式，仅当用于话语中断作用时才保留。
+
+# 正文结构
+- 每个 JSON 值都是独立正文块。原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时保持相同类型。
+- <strong>、<em>、<i>、<cite>、<torto-italic>、<u>、<s>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记。必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。
+- <torto-math-0/>、<torto-math-1/> 等自闭合标签是不可修改的公式占位符。可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。
+$fixedPageSection
+# 输出格式
+- 只返回一个 JSON 对象，保留完全相同的键；每个值只能是对应译文字符串。''';
+}
+
+String preserveLeadingListMarker(String source, String translation) {
+  final sourceMarker = _leadingListMarker(source);
+  final translationMarker = _leadingListMarker(translation);
+  if (sourceMarker == null && translationMarker != null) {
+    return translation.substring(translationMarker.$2).trimLeft();
+  }
+  if (sourceMarker != null &&
+      translationMarker != null &&
+      sourceMarker.$1 != translationMarker.$1) {
+    return '${sourceMarker.$1} '
+        '${translation.substring(translationMarker.$2).trimLeft()}';
+  }
+  return translation;
+}
+
+(String, int)? _leadingListMarker(String text) {
+  final trimmed = text.trimLeft();
+  final leadingUnits = text.length - trimmed.length;
+  if (trimmed.isEmpty) return null;
+  final first = trimmed.characters.first;
+  if (const {'•', '·', '●', '○', '▪', '‣', '◦', '∙'}.contains(first)) {
+    return (first, leadingUnits + first.length);
+  }
+  if (const {'-', '*', '+'}.contains(first) &&
+      trimmed.substring(first.length).characters.firstOrNull?.trim().isEmpty ==
+          true) {
+    return (first, leadingUnits + first.length);
+  }
+  final token = trimmed.split(RegExp(r'\s')).first;
+  final body = token.replaceFirst(RegExp(r'(?:\.|、|\)|）)$'), '');
+  if (body.isEmpty ||
+      body.runes.length > 6 ||
+      !RegExp(r'^[A-Za-z0-9]+$').hasMatch(body) ||
+      body.length == token.length) {
+    return null;
+  }
+  return (token, leadingUnits + token.length);
+}
 
 class OpenAiCompatibleClient {
   static const _maxTranslationChars = 2000;
@@ -44,6 +110,8 @@ class OpenAiCompatibleClient {
     required String model,
     required String targetLanguage,
     required List<TranslationBlockInput> blocks,
+    ReasoningEffort reasoningEffort = ReasoningEffort.defaultLevel,
+    FutureOr<void> Function(List<BlockTranslation> translations)? validate,
   }) async {
     _validateProvider(provider, model);
     final output = <BlockTranslation>[];
@@ -54,6 +122,8 @@ class OpenAiCompatibleClient {
           model: model,
           targetLanguage: targetLanguage,
           blocks: batch,
+          reasoningEffort: reasoningEffort,
+          validate: validate,
         ),
       );
     }
@@ -65,6 +135,9 @@ class OpenAiCompatibleClient {
     required String model,
     required String targetLanguage,
     required List<TranslationBlockInput> blocks,
+    required ReasoningEffort reasoningEffort,
+    required FutureOr<void> Function(List<BlockTranslation> translations)?
+    validate,
   }) async {
     final input = <String, String>{
       for (var index = 0; index < blocks.length; index++)
@@ -83,14 +156,11 @@ class OpenAiCompatibleClient {
               body: jsonEncode({
                 'model': model,
                 'temperature': 0.2,
+                'reasoning_effort': ?reasoningEffort.apiValue,
                 'messages': [
                   {
                     'role': 'system',
-                    'content':
-                        'You are a professional book translator. Translate every value in the input JSON object into $targetLanguage. Preserve tone, proper names, paragraph meaning, and every key. '
-                        'The tags <strong>, <em>, <u>, <s>, <sup>, <sub>, <noteref>, <noteback>, and <inlinefootnote> are protected inline structure: move each complete tag pair to the corresponding translated words without translating, deleting, splitting, or widening it. '
-                        'Self-closing tags such as <torto-math-0/> are protected formula placeholders. Each must appear exactly once, unchanged, although it may move with sentence order. '
-                        'Return only one JSON object with the same keys and translated string values.',
+                    'content': translationSystemPrompt(targetLanguage),
                   },
                   {'role': 'user', 'content': jsonEncode(input)},
                 ],
@@ -102,14 +172,19 @@ class OpenAiCompatibleClient {
         }
         final content = _messageContent(response.body);
         final values = _translationObject(content, blocks.length);
-        return [
+        final translations = [
           for (var index = 0; index < blocks.length; index++)
             BlockTranslation(
               blockIndex: blocks[index].blockIndex,
               segmentIndex: blocks[index].segmentIndex,
-              text: values[index],
+              text: preserveLeadingListMarker(
+                blocks[index].text,
+                values[index],
+              ),
             ),
         ];
+        await validate?.call(translations);
+        return translations;
       } catch (error) {
         lastError = error;
       }

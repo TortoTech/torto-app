@@ -222,6 +222,7 @@ class TextPlacement extends PageItem {
 
   /// Interactive link ranges in the retained paragraph's UTF-16 text.
   final List<TextLinkRange> links;
+  final List<InlineImageRange> inlineImages;
 
   const TextPlacement({
     required this.paragraph,
@@ -239,6 +240,20 @@ class TextPlacement extends PageItem {
     required this.sliceHeight,
     required this.sectionTextOffset,
     this.links = const [],
+    this.inlineImages = const [],
+  });
+}
+
+/// One inline image occupying a paragraph placeholder range.
+class InlineImageRange {
+  final int start;
+  final int end;
+  final String href;
+
+  const InlineImageRange({
+    required this.start,
+    required this.end,
+    required this.href,
   });
 }
 
@@ -297,6 +312,7 @@ class TableCellPlacement extends PageItem {
   final int spineIndex;
   final double sectionTextOffset;
   final List<TextLinkRange> links;
+  final List<InlineImageRange> inlineImages;
 
   const TableCellPlacement({
     required this.paragraph,
@@ -308,6 +324,7 @@ class TableCellPlacement extends PageItem {
     required this.spineIndex,
     required this.sectionTextOffset,
     this.links = const [],
+    this.inlineImages = const [],
   });
 }
 

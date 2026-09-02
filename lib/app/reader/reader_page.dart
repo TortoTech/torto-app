@@ -63,6 +63,8 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
   bool _opening = false;
   bool _overlayVisible = false;
   bool _darkMode = false;
+  bool _initialThemeSeeded = false;
+  Brightness? _inheritedAppBrightness;
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
   Color get _background => Color(_style.background);
@@ -93,6 +95,21 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
   void initState() {
     super.initState();
     _preferencesStore = widget.preferencesStore ?? ReaderPreferencesStore();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final brightness = Theme.of(context).brightness;
+    final inheritsAppTheme = AppPreferencesScope.maybeOf(context) != null;
+    if (!_initialThemeSeeded ||
+        (inheritsAppTheme && brightness != _inheritedAppBrightness)) {
+      final darkMode = brightness == Brightness.dark;
+      _darkMode = darkMode;
+      _style = _themedStyle(_style, darkMode);
+      _initialThemeSeeded = true;
+    }
+    _inheritedAppBrightness = inheritsAppTheme ? brightness : null;
   }
 
   void _startOpen(LayoutViewport viewport) {

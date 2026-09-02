@@ -2,11 +2,13 @@ import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:torto/app/reader/reader_controller.dart';
 import 'package:torto/app/reader/reader_page.dart';
 import 'package:torto/app/reader/reader_preferences_store.dart';
+import 'package:torto/app/settings/app_preferences.dart';
 import 'package:torto/core/layout/layout_types.dart';
 import 'package:torto/core/render/page_painter.dart';
 
@@ -78,6 +80,44 @@ class _FakeReaderController extends ReaderController {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  testWidgets('reader first frame inherits the dark app theme', (tester) async {
+    final controller = _FakeReaderController();
+    SharedPreferences.setMockInitialValues({});
+    final preferences = AppPreferencesController(
+      preferences: await SharedPreferences.getInstance(),
+    );
+    await preferences.setTheme(AppThemePreference.dark);
+    addTearDown(() async {
+      await tester.pumpWidget(const SizedBox.shrink());
+      controller.dispose();
+      preferences.dispose();
+    });
+
+    await tester.pumpWidget(
+      AppPreferencesScope(
+        controller: preferences,
+        child: MaterialApp(
+          theme: ThemeData.dark(),
+          home: ReaderPage(file: File('unused.epub'), controller: controller),
+        ),
+      ),
+    );
+
+    final scaffold = find.descendant(
+      of: find.byType(ReaderPage),
+      matching: find.byType(Scaffold),
+    );
+    expect(tester.widget<Scaffold>(scaffold).backgroundColor, Colors.black);
+    final systemUi = tester.widget<AnnotatedRegion<SystemUiOverlayStyle>>(
+      find.descendant(
+        of: find.byType(ReaderPage),
+        matching: find.byType(AnnotatedRegion<SystemUiOverlayStyle>),
+      ),
+    );
+    expect(systemUi.value.statusBarIconBrightness, Brightness.light);
+    expect(systemUi.value.systemNavigationBarIconBrightness, Brightness.light);
+  });
 
   testWidgets('tap zones reserve the middle sixty percent for controls', (
     tester,

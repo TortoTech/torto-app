@@ -84,12 +84,31 @@ class AiProviderConfig {
 
 enum TranslationTarget { system, simplifiedChinese, english }
 
+enum ReasoningEffort { defaultLevel, none, minimal, low, medium, high }
+
+extension ReasoningEffortDetails on ReasoningEffort {
+  String get label => switch (this) {
+    ReasoningEffort.defaultLevel => 'default',
+    ReasoningEffort.none => 'none',
+    ReasoningEffort.minimal => 'minimal',
+    ReasoningEffort.low => 'low',
+    ReasoningEffort.medium => 'medium',
+    ReasoningEffort.high => 'high',
+  };
+
+  String? get apiValue => switch (this) {
+    ReasoningEffort.defaultLevel => null,
+    _ => label,
+  };
+}
+
 class TranslationSettings {
   final String providerId;
   final String model;
   final TranslationTarget target;
   final TranslationMode mode;
   final bool translateToc;
+  final ReasoningEffort reasoningEffort;
 
   const TranslationSettings({
     this.providerId = 'provider-1',
@@ -97,6 +116,7 @@ class TranslationSettings {
     this.target = TranslationTarget.system,
     this.mode = TranslationMode.replace,
     this.translateToc = true,
+    this.reasoningEffort = ReasoningEffort.defaultLevel,
   });
 
   TranslationSettings copyWith({
@@ -105,12 +125,14 @@ class TranslationSettings {
     TranslationTarget? target,
     TranslationMode? mode,
     bool? translateToc,
+    ReasoningEffort? reasoningEffort,
   }) => TranslationSettings(
     providerId: providerId ?? this.providerId,
     model: model ?? this.model,
     target: target ?? this.target,
     mode: mode ?? this.mode,
     translateToc: translateToc ?? this.translateToc,
+    reasoningEffort: reasoningEffort ?? this.reasoningEffort,
   );
 
   Map<String, dynamic> toJson() => {
@@ -119,6 +141,7 @@ class TranslationSettings {
     'target': target.name,
     'mode': mode.name,
     'translate_toc': translateToc,
+    'reasoning_effort': reasoningEffort.label,
   };
 
   factory TranslationSettings.fromJson(Map<String, dynamic> json) =>
@@ -134,6 +157,10 @@ class TranslationSettings {
           orElse: () => TranslationMode.replace,
         ),
         translateToc: json['translate_toc'] as bool? ?? true,
+        reasoningEffort: ReasoningEffort.values.firstWhere(
+          (candidate) => candidate.label == json['reasoning_effort'],
+          orElse: () => ReasoningEffort.defaultLevel,
+        ),
       );
 }
 
@@ -164,7 +191,7 @@ class AiSettings {
   }
 
   Map<String, dynamic> toJson() => {
-    'version': 1,
+    'version': 2,
     'providers': providers.map((provider) => provider.toJson()).toList(),
     'translation': translation.toJson(),
   };

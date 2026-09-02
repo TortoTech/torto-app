@@ -371,18 +371,30 @@ class ReaderController extends ChangeNotifier {
     }
     if (visibleNodes.isEmpty) return;
     final generation = _translationGeneration;
-    final requestedSection = sectionIndex;
+    final visibleSection = sectionIndex;
     _translationInFlight = true;
     translationError = null;
     notifyListeners();
     unawaited(() async {
       var succeeded = false;
       try {
-        final blocks = await source.untranslatedBlocksForNodes(
-          requestedSection,
+        final candidates = await _translationCandidateNodes(
+          visibleSection,
           visibleNodes,
         );
-        if (blocks.isEmpty) return;
+        int? requestedSection;
+        List<TranslationBlockInput>? blocks;
+        for (final candidate in candidates) {
+          final untranslated = await source.untranslatedBlocksForNodes(
+            candidate.$1,
+            candidate.$2,
+          );
+          if (untranslated.isEmpty) continue;
+          requestedSection = candidate.$1;
+          blocks = untranslated;
+          break;
+        }
+        if (requestedSection == null || blocks == null) return;
         final translation = settings.translation;
         final provider = settings.provider(translation.providerId)!;
         final results = await translationClient.translateBlocks(
@@ -393,6 +405,9 @@ class ReaderController extends ChangeNotifier {
             ui.PlatformDispatcher.instance.locale.languageCode,
           ),
           blocks: blocks,
+          reasoningEffort: translation.reasoningEffort,
+          validate: (translations) =>
+              source.validateBatch(requestedSection!, translations),
         );
         if (generation != _translationGeneration || !translationEnabled) return;
         await source.storeBatch(requestedSection, results);
@@ -418,6 +433,21 @@ class ReaderController extends ChangeNotifier {
         }
       }
     }());
+  }
+
+  Future<List<(int, Set<String>)>> _translationCandidateNodes(
+    int visibleSection,
+    Set<String> visibleNodes,
+  ) {
+    final source = _resourceSource;
+    if (source == null) {
+      return Future.value([(visibleSection, visibleNodes)]);
+    }
+    return linkedFootnoteTranslationCandidates(
+      source,
+      visibleSection,
+      visibleNodes,
+    );
   }
 
   void _queueTocTranslation() {
@@ -458,6 +488,7 @@ class ReaderController extends ChangeNotifier {
             translation.target,
             ui.PlatformDispatcher.instance.locale.languageCode,
           ),
+          reasoningEffort: translation.reasoningEffort,
           blocks: [
             for (final label in labels)
               TranslationBlockInput(
@@ -959,18 +990,47 @@ class ReaderController extends ChangeNotifier {
   /// (null marks known-missing/undecodable). No-op for cached hrefs.
   Future<void> _decodeSectionImages(Section section) async {
     final hrefs = <String>{};
-    for (final block in section.blocks) {
+    void collectInlines(List<Inline> inlines) {
+      for (final inline in inlines) {
+        if (inline case InlineImageRun(:final image)) {
+          if (!_images.containsKey(image.href)) hrefs.add(image.href);
+        }
+      }
+    }
+
+    void collectBlock(Block block) {
       switch (block) {
         case ImageBlock():
           if (!_images.containsKey(block.href)) hrefs.add(block.href);
-        case FigureBlock():
-          for (final image in block.images) {
+        case TextBlock(:final inlines):
+          collectInlines(inlines);
+        case QuoteBlock(:final body, :final attribution):
+          for (final text in [...body, ?attribution]) {
+            collectInlines(text.inlines);
+          }
+        case TableBlock(:final rows):
+          for (final cell in rows.expand((row) => row.cells)) {
+            collectInlines(cell.inlines);
+          }
+        case FigureBlock(:final images, :final captions):
+          for (final image in images) {
             if (!_images.containsKey(image.href)) hrefs.add(image.href);
           }
-        default:
-          continue;
+          for (final caption in captions) {
+            collectInlines(caption.inlines);
+          }
+        case NoteBlock(:final blocks):
+          blocks.forEach(collectBlock);
+        case SeparatorBlock(:final image):
+          if (image != null && !_images.containsKey(image.href)) {
+            hrefs.add(image.href);
+          }
+        case PageBreakBlock() || LineBreakBlock():
+          break;
       }
     }
+
+    section.blocks.forEach(collectBlock);
     if (hrefs.isEmpty) return;
     await Future.wait(
       hrefs.map((href) async {
@@ -1145,6 +1205,139 @@ SectionAnchor? _anchorByFragment(Section section, String fragment) {
   return null;
 }
 
+@visibleForTesting
+Future<List<(int, Set<String>)>> linkedFootnoteTranslationCandidates(
+  BookSource source,
+  int visibleSection,
+  Set<String> visibleNodes,
+) async {
+  final candidates = <int, Set<String>>{
+    visibleSection: {...visibleNodes},
+  };
+  final parsed = <int, Section>{};
+  try {
+    parsed[visibleSection] = await source.parseSection(visibleSection);
+  } catch (_) {
+    return candidates.entries
+        .map((entry) => (entry.key, entry.value))
+        .toList(growable: false);
+  }
+  final targets = _footnoteTargetsForVisibleNodes(
+    parsed[visibleSection]!,
+    visibleNodes,
+  );
+  for (final href in targets) {
+    if (isExternalHref(href)) continue;
+    final (path, fragment) = splitPackageFragment(href);
+    if (fragment == null || fragment.isEmpty) continue;
+    final targetSection = source.book.spine.indexWhere(
+      (item) => item.href == path,
+    );
+    if (targetSection < 0) continue;
+    Section target;
+    try {
+      target = parsed[targetSection] ??= await source.parseSection(
+        targetSection,
+      );
+    } catch (_) {
+      continue;
+    }
+    final anchor = _anchorByFragment(target, fragment);
+    if (anchor == null) continue;
+    final nodes = _translationNodesForFootnoteAnchor(
+      target,
+      anchor.source.node,
+    );
+    if (nodes.isNotEmpty) {
+      candidates.putIfAbsent(targetSection, () => {}).addAll(nodes);
+    }
+  }
+  return candidates.entries
+      .map((entry) => (entry.key, entry.value))
+      .toList(growable: false);
+}
+
+Set<String> _footnoteTargetsForVisibleNodes(
+  Section section,
+  Set<String> visibleNodes,
+) {
+  final targets = <String>{};
+  for (final block in section.blocks) {
+    _visitBlockText(block, (nodeId, inlines) {
+      if (!visibleNodes.contains(nodeId)) return;
+      for (final run in inlines.whereType<TextRun>()) {
+        if (run.style.linkRole == LinkRole.footnoteReference &&
+            run.link != null &&
+            run.link!.isNotEmpty) {
+          targets.add(run.link!);
+        }
+      }
+    });
+  }
+  return targets;
+}
+
+Set<String> _translationNodesForFootnoteAnchor(
+  Section section,
+  String anchorNode,
+) {
+  Block? target;
+  for (final block in section.blocks) {
+    if (block is NoteBlock && _blockContainsTextNode(block, anchorNode)) {
+      target = block;
+      break;
+    }
+  }
+  target ??= section.blocks
+      .where((block) => _blockContainsTextNode(block, anchorNode))
+      .firstOrNull;
+  if (target == null) return const <String>{};
+  final nodes = <String>{};
+  _visitBlockText(target, (nodeId, _) {
+    if (nodeId.isNotEmpty) nodes.add(nodeId);
+  });
+  return nodes;
+}
+
+bool _blockContainsTextNode(Block block, String nodeId) {
+  var found = false;
+  _visitBlockText(block, (candidate, _) {
+    if (candidate == nodeId) found = true;
+  });
+  return found;
+}
+
+void _visitBlockText(
+  Block block,
+  void Function(String nodeId, List<Inline> inlines) visit,
+) {
+  switch (block) {
+    case TextBlock(:final nodeId, :final inlines):
+      visit(nodeId, inlines);
+    case QuoteBlock(:final body, :final attribution):
+      for (final text in [...body, ?attribution]) {
+        visit(text.nodeId, text.inlines);
+      }
+    case TableBlock(:final rows):
+      for (final cell in rows.expand((row) => row.cells)) {
+        visit(cell.nodeId, cell.inlines);
+      }
+    case FigureBlock(:final captions):
+      for (final caption in captions) {
+        visit(caption.nodeId, caption.inlines);
+      }
+    case NoteBlock(:final blocks):
+      for (final child in blocks) {
+        _visitBlockText(child, visit);
+      }
+    case ImageBlock() ||
+        SeparatorBlock() ||
+        PageBreakBlock() ||
+        LineBreakBlock():
+      break;
+  }
+}
+
 String? _textForSourceNode(Section section, String nodeId) {
   return _textForSourceNodeInBlocks(section.blocks, nodeId);
 }
@@ -1192,6 +1385,8 @@ String _readableInlineText(List<Inline> inlines) {
         buffer.write('\n');
       case MathInline(:final latex):
         buffer.write(latex);
+      case InlineImageRun():
+        break;
     }
   }
   return buffer.toString();

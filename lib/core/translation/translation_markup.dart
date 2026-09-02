@@ -1,8 +1,10 @@
+import 'package:characters/characters.dart';
+
 import '../ir/ir.dart';
 
 class TranslationMarkupCodec {
   static final _tokenPattern = RegExp(
-    r'</?(?:strong|em|u|s|sup|sub|noteref|noteback|inlinefootnote)>|<torto-math-(\d+)/>',
+    r'</?(?:strong|em|i|cite|torto-italic|u|s|sup|sub|noteref|noteback|inlinefootnote)>|<torto-math-(\d+)/>',
   );
 
   static String encode(List<Inline> inlines) {
@@ -29,7 +31,15 @@ class TranslationMarkupCodec {
               open('noteback');
           }
           if (inline.style.bold) open('strong');
-          if (inline.style.italic) open('em');
+          if (inline.style.emphasis) open('em');
+          if (inline.style.alternateVoice) open('i');
+          if (inline.style.citation) open('cite');
+          if (inline.style.italic &&
+              !inline.style.emphasis &&
+              !inline.style.alternateVoice &&
+              !inline.style.citation) {
+            open('torto-italic');
+          }
           if (inline.style.underline) open('u');
           if (inline.style.strikethrough) open('s');
           switch (inline.style.baseline) {
@@ -48,6 +58,8 @@ class TranslationMarkupCodec {
           output.write('\n');
         case MathInline():
           output.write('<torto-math-${mathIndex++}/>');
+        case InlineImageRun():
+          break;
       }
     }
     return output.toString();
@@ -98,7 +110,86 @@ class TranslationMarkupCodec {
     if (stack.length != 1) {
       throw const FormatException('Translation left inline markup unclosed.');
     }
+    _restoreInlineImages(output, original);
     return output;
+  }
+
+  static void _restoreInlineImages(List<Inline> output, List<Inline> original) {
+    final originalLength = original.fold<int>(
+      0,
+      (total, inline) => total + _translationUnits(inline),
+    );
+    final translatedLength = output.fold<int>(
+      0,
+      (total, inline) => total + _translationUnits(inline),
+    );
+    var cursor = 0;
+    final images = <(int, InlineImageRun)>[];
+    for (final inline in original) {
+      if (inline case InlineImageRun()) {
+        final target = originalLength == 0
+            ? 0
+            : cursor * translatedLength ~/ originalLength;
+        images.add((target, inline));
+      } else {
+        cursor += _translationUnits(inline);
+      }
+    }
+    for (final (target, image) in images.reversed) {
+      _insertInlineAtOffset(output, target, image);
+    }
+  }
+
+  static int _translationUnits(Inline inline) => switch (inline) {
+    TextRun(:final text) => text.characters.length,
+    MathInline() || BreakInline() => 1,
+    InlineImageRun() => 0,
+  };
+
+  static void _insertInlineAtOffset(
+    List<Inline> output,
+    int offset,
+    Inline value,
+  ) {
+    var cursor = 0;
+    for (var index = 0; index < output.length; index++) {
+      final inline = output[index];
+      final length = _translationUnits(inline);
+      if (offset <= cursor) {
+        output.insert(index, value);
+        return;
+      }
+      if (inline case TextRun(
+        :final text,
+        :final style,
+        :final link,
+        :final language,
+      ) when offset < cursor + length) {
+        final graphemes = text.characters.toList(growable: false);
+        final split = offset - cursor;
+        final replacement = <Inline>[
+          if (split > 0)
+            TextRun(
+              graphemes.take(split).join(),
+              style: style,
+              link: link,
+              language: language,
+            ),
+          value,
+          if (split < graphemes.length)
+            TextRun(
+              graphemes.skip(split).join(),
+              style: style,
+              link: link,
+              language: language,
+            ),
+        ];
+        output.replaceRange(index, index + 1, replacement);
+        return;
+      }
+      cursor += length;
+    }
+    output.add(value);
   }
 
   static void _validateMathPlaceholders(
@@ -138,7 +229,11 @@ class TranslationMarkupCodec {
 
   static TextStyle _applyTag(TextStyle style, String tag) => TextStyle(
     bold: style.bold || tag == 'strong',
-    italic: style.italic || tag == 'em',
+    italic:
+        style.italic || const {'em', 'i', 'cite', 'torto-italic'}.contains(tag),
+    emphasis: style.emphasis || tag == 'em',
+    alternateVoice: style.alternateVoice || tag == 'i',
+    citation: style.citation || tag == 'cite',
     underline: style.underline || tag == 'u',
     strikethrough: style.strikethrough || tag == 's',
     sizeScale: style.sizeScale,

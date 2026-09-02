@@ -95,6 +95,28 @@ class _TranslationSettingsPageState extends State<TranslationSettingsPage> {
         ),
         const Divider(indent: 16, endIndent: 16),
         ListTile(
+          title: Text(l10n.text('思考等级', 'Reasoning effort')),
+          trailing: DropdownButton<ReasoningEffort>(
+            value: translation.reasoningEffort,
+            items: [
+              for (final effort in ReasoningEffort.values)
+                DropdownMenuItem(
+                  value: effort,
+                  child: Text(
+                    effort == ReasoningEffort.defaultLevel
+                        ? l10n.text('默认', 'default')
+                        : effort.label,
+                  ),
+                ),
+            ],
+            onChanged: (value) {
+              if (value != null) {
+                _update(translation.copyWith(reasoningEffort: value));
+              }
+            },
+          ),
+        ),
+        ListTile(
           title: Text(l10n.text('翻译为', 'Translate to')),
           trailing: DropdownButton<TranslationTarget>(
             value: translation.target,

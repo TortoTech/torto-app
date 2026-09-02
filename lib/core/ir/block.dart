@@ -108,6 +108,21 @@ class MathInline extends Inline {
   const MathInline(this.latex, {this.display = false, this.sizeScale = 1.0});
 }
 
+/// A small authored image that participates in the surrounding text line.
+/// Parsing creates these only for em-sized presentation images in headings;
+/// ordinary illustrations remain block-level [ImageBlock]s.
+class InlineImageRun extends Inline {
+  final ImageBlock image;
+  final double sizeScale;
+  final bool presentation;
+
+  const InlineImageRun({
+    required this.image,
+    required this.sizeScale,
+    this.presentation = false,
+  });
+}
+
 enum TextBlockKind {
   paragraph,
   heading,
@@ -175,6 +190,8 @@ class TextBlock extends Block {
           buf.write('\n');
         case MathInline(:final latex):
           buf.write(latex);
+        case InlineImageRun():
+          break;
       }
     }
     return buf.toString();
@@ -275,6 +292,8 @@ class TableCell {
           buffer.write('\n');
         case MathInline(:final latex):
           buffer.write(latex);
+        case InlineImageRun():
+          break;
       }
     }
     return buffer.toString();

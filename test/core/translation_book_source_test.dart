@@ -45,6 +45,10 @@ void main() {
     const link = 'chapter.xhtml#note';
     const original = <Inline>[
       TextRun('Important', style: TextStyle(bold: true)),
+      TextRun(' emphasis', style: TextStyle(italic: true, emphasis: true)),
+      TextRun(' term', style: TextStyle(italic: true, alternateVoice: true)),
+      TextRun(' work', style: TextStyle(italic: true, citation: true)),
+      TextRun(' visual', style: TextStyle(italic: true)),
       TextRun(
         '1',
         style: TextStyle(
@@ -57,17 +61,58 @@ void main() {
     ];
     final encoded = TranslationMarkupCodec.encode(original);
     expect(encoded, contains('<strong>Important</strong>'));
+    expect(encoded, contains('<em> emphasis</em>'));
+    expect(encoded, contains('<i> term</i>'));
+    expect(encoded, contains('<cite> work</cite>'));
+    expect(encoded, contains('<torto-italic> visual</torto-italic>'));
     expect(encoded, contains('<torto-math-0/>'));
 
     final decoded = TranslationMarkupCodec.decode(
-      '<strong>重要</strong><noteref><sup>1</sup></noteref><torto-math-0/>',
+      '<strong>重要</strong><em>强调</em><i>术语</i><cite>作品</cite>'
+      '<torto-italic>视觉</torto-italic>'
+      '<noteref><sup>1</sup></noteref><torto-math-0/>',
       original,
       language: 'zh-CN',
     );
     expect((decoded[0] as TextRun).style.bold, isTrue);
-    expect((decoded[1] as TextRun).link, link);
-    expect(decoded[2], isA<MathInline>());
+    expect((decoded[1] as TextRun).style.emphasis, isTrue);
+    expect((decoded[2] as TextRun).style.alternateVoice, isTrue);
+    expect((decoded[3] as TextRun).style.citation, isTrue);
+    expect((decoded[4] as TextRun).style.italic, isTrue);
+    expect((decoded[4] as TextRun).style.emphasis, isFalse);
+    expect((decoded[5] as TextRun).link, link);
+    expect(decoded[6], isA<MathInline>());
   });
+
+  test(
+    'translation restores inline images near their relative text position',
+    () {
+      const image = InlineImageRun(
+        image: ImageBlock(href: 'images/chapter-icon.png'),
+        sizeScale: 1,
+        presentation: true,
+      );
+      const original = <Inline>[TextRun('Chapter '), image, TextRun('title')];
+
+      expect(TranslationMarkupCodec.encode(original), 'Chapter title');
+      final translated = TranslationMarkupCodec.decode(
+        '章节标题',
+        original,
+        language: 'zh-CN',
+      );
+
+      final imageIndex = translated.indexWhere(
+        (inline) => inline is InlineImageRun,
+      );
+      expect(imageIndex, greaterThan(0));
+      expect(imageIndex, lessThan(translated.length - 1));
+      expect(translated[imageIndex], same(image));
+      expect(
+        translated.whereType<TextRun>().map((run) => run.text).join(),
+        '章节标题',
+      );
+    },
+  );
 
   test(
     'translation source overlays visible semantic blocks and toggles off',
@@ -145,5 +190,37 @@ void main() {
     expect(blocks.first.listMarkerVisible, isTrue);
     expect(blocks.last.listMarkerVisible, isFalse);
     expect(blocks.last.listOrdinal, 2);
+  });
+
+  test('note definitions translate nested semantic text blocks', () async {
+    final note = NoteBlock(
+      kind: NoteBlockKind.definition,
+      blocks: [
+        _text('Original note', 'note'),
+        QuoteBlock(body: [_text('Quoted note', 'note-quote')]),
+      ],
+    );
+    final source = TranslationBookSource(
+      _Source(Section(spineIndex: 0, href: 'chapter.xhtml', blocks: [note])),
+    );
+
+    final inputs = await source.untranslatedBlocksForNodes(0, {
+      'note',
+      'note-quote',
+    });
+    expect(inputs.map((input) => input.segmentIndex), [0, 1]);
+    await source.storeBatch(0, const [
+      BlockTranslation(blockIndex: 0, segmentIndex: 0, text: '脚注译文'),
+      BlockTranslation(blockIndex: 0, segmentIndex: 1, text: '引用译文'),
+    ]);
+    source.enabled = true;
+
+    final translated =
+        (await source.parseSection(0)).blocks.single as NoteBlock;
+    expect((translated.blocks[0] as TextBlock).plainText, '脚注译文');
+    expect(
+      ((translated.blocks[1] as QuoteBlock).body.single).plainText,
+      '引用译文',
+    );
   });
 }

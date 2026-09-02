@@ -99,7 +99,7 @@ Map<XmlElement, LinkRole> _classifyFootnoteLinks(
   }
   final sectionPath = splitPackageFragment(sectionHref).$1;
   for (final anchor in anchors) {
-    final sourceFragment = _nodeFragment(anchor);
+    final sourceFragment = _footnoteReferenceFragment(anchor);
     final rawTarget = _attr(anchor, 'href');
     if (sourceFragment == null || rawTarget == null) continue;
     final target = _resolveDocumentLink(sectionHref, baseDir, rawTarget);
@@ -166,6 +166,28 @@ LinkRole? _explicitLinkRole(XmlElement anchor) {
 String? _nodeFragment(XmlElement element) {
   final fragment = (_attr(element, 'id') ?? _attr(element, 'name'))?.trim();
   return fragment == null || fragment.isEmpty ? null : fragment;
+}
+
+String? _footnoteReferenceFragment(XmlElement anchor) {
+  final own = _nodeFragment(anchor);
+  if (own != null) return own;
+  final parent = anchor.parent;
+  if (parent == null) return null;
+  final siblings = parent.children;
+  final index = siblings.indexWhere((node) => identical(node, anchor));
+  if (index <= 0) return null;
+  for (var candidateIndex = index - 1; candidateIndex >= 0; candidateIndex--) {
+    final candidate = siblings[candidateIndex];
+    if (candidate is XmlText && candidate.value.trim().isEmpty) continue;
+    if (candidate is XmlElement &&
+        _name(candidate) == 'a' &&
+        _attr(candidate, 'href') == null &&
+        _nodeText(candidate).trim().isEmpty) {
+      return _nodeFragment(candidate);
+    }
+    return null;
+  }
+  return null;
 }
 
 String _resolveDocumentLink(
@@ -478,6 +500,7 @@ bool _isNoteSectionLabel(String value) {
 TextBlock _copyTextBlock(
   TextBlock block, {
   TextBlockKind? kind,
+  List<Inline>? inlines,
   BlockStyle? style,
 }) => TextBlock(
   kind: kind ?? block.kind,
@@ -486,7 +509,7 @@ TextBlock _copyTextBlock(
   listOrdinal: block.listOrdinal,
   listDepth: block.listDepth,
   listMarkerVisible: block.listMarkerVisible,
-  inlines: block.inlines,
+  inlines: inlines ?? block.inlines,
   style: style ?? block.style,
   source: block.source,
   nodeId: block.nodeId,
@@ -1130,9 +1153,33 @@ class _SectionParser {
         style: block.style.copyWith(hardBreakAfter: true),
       );
     }
-    final resolvedAttribution = attribution == null
+    var resolvedAttribution = attribution == null
         ? null
         : _copyTextBlock(attribution, kind: TextBlockKind.quoteAttribution);
+    if (resolvedAttribution != null &&
+        attributionElement != null &&
+        _name(attributionElement) == 'cite') {
+      resolvedAttribution = _copyTextBlock(
+        resolvedAttribution,
+        inlines: [
+          for (final inline in resolvedAttribution.inlines)
+            if (inline case TextRun(
+              :final text,
+              :final style,
+              :final link,
+              :final language,
+            ))
+              TextRun(
+                text,
+                style: _copyTextStyle(style, italic: true, citation: true),
+                link: link,
+                language: language,
+              )
+            else
+              inline,
+        ],
+      );
+    }
     blocks.addAll(detached);
     blocks.add(
       QuoteBlock(
@@ -1821,8 +1868,19 @@ class _SectionParser {
       kind,
       headingLevel: headingLevel,
     );
+    final inlineHeadingImages =
+        kind == TextBlockKind.heading &&
+        element.descendants.whereType<XmlText>().any(
+          (text) => text.value.trim().isNotEmpty,
+        );
     final collector = _InlineCollector(preserveWhitespace: preserveWhitespace);
-    _collectInline(element, textStyle, null, collector);
+    _collectInline(
+      element,
+      textStyle,
+      null,
+      collector,
+      inlineHeadingImages: inlineHeadingImages,
+    );
     collector.finish();
     if (stripAuthoredListMarker) {
       _stripAuthoredListMarker(collector.content);
@@ -1839,7 +1897,13 @@ class _SectionParser {
         listMarkerVisible: listMarkerVisible,
       );
     }
-    final images = _descendantImages(element).toList(growable: false);
+    final images = _descendantImages(element)
+        .where(
+          (image) =>
+              !inlineHeadingImages ||
+              _inlinePresentationImage(image, textStyle) == null,
+        )
+        .toList(growable: false);
     for (var index = 0; index < images.length; index++) {
       _pushImage(
         images[index],
@@ -1873,6 +1937,7 @@ class _SectionParser {
         TextRun(:final text) => text.length,
         BreakInline() => 1,
         MathInline(:final latex) => latex.length,
+        InlineImageRun() => 0,
       };
     }
     blocks.add(
@@ -2060,6 +2125,7 @@ class _SectionParser {
     _InlineCollector collector, {
     String? language,
     bool preserveBlockBoundaries = false,
+    bool inlineHeadingImages = false,
   }) {
     final inheritedLanguage = node is XmlElement
         ? _declaredLanguage(node) ?? language ?? _ancestorLanguage(node)
@@ -2072,6 +2138,7 @@ class _SectionParser {
         collector,
         language: inheritedLanguage,
         preserveBlockBoundaries: preserveBlockBoundaries,
+        inlineHeadingImages: inlineHeadingImages,
       );
     }
   }
@@ -2083,6 +2150,7 @@ class _SectionParser {
     _InlineCollector collector, {
     String? language,
     bool preserveBlockBoundaries = false,
+    bool inlineHeadingImages = false,
   }) {
     if (node is XmlText) {
       collector.pushText(node.value, inherited, link, language);
@@ -2106,6 +2174,9 @@ class _SectionParser {
           link,
           language,
         );
+      } else if (inlineHeadingImages) {
+        final image = _inlinePresentationImage(node, inherited);
+        if (image != null) collector.pushImage(image);
       }
       return;
     }
@@ -2121,8 +2192,12 @@ class _SectionParser {
     switch (name) {
       case 'b' || 'strong':
         style = _copyTextStyle(style, bold: true);
-      case 'i' || 'em' || 'cite':
-        style = _copyTextStyle(style, italic: true);
+      case 'em':
+        style = _copyTextStyle(style, italic: true, emphasis: true);
+      case 'i':
+        style = _copyTextStyle(style, italic: true, alternateVoice: true);
+      case 'cite':
+        style = _copyTextStyle(style, italic: true, citation: true);
       case 'u' || 'ins':
         style = _copyTextStyle(style, underline: true);
       case 's' || 'strike' || 'del':
@@ -2190,6 +2265,33 @@ class _SectionParser {
       collector,
       language: childLanguage,
       preserveBlockBoundaries: preserveBlockBoundaries,
+      inlineHeadingImages: inlineHeadingImages,
+    );
+  }
+
+  InlineImageRun? _inlinePresentationImage(
+    XmlElement element,
+    TextStyle inherited,
+  ) {
+    final presentation =
+        (_attr(element, 'role') ?? '').trim().toLowerCase() == 'presentation';
+    final alt = _attr(element, 'alt');
+    if (!presentation && alt != null && alt.trim().isNotEmpty) return null;
+    final properties = styles.cascadedProperties(element);
+    final height = _inlineEmLength(
+      properties['height'] ?? _attr(element, 'height'),
+    );
+    if (height == null || height < 0.25 || height > 3.0) return null;
+    final src = (_attr(element, 'src') ?? _attr(element, 'href'))?.trim();
+    if (src == null || src.isEmpty) return null;
+    return InlineImageRun(
+      image: ImageBlock(
+        href: resolvePackageHref(baseDir, src),
+        alt: alt ?? '',
+        style: _imageStyleFor(element),
+      ),
+      sizeScale: height * inherited.sizeScale,
+      presentation: presentation,
     );
   }
 
@@ -2421,6 +2523,9 @@ TextStyle _copyTextStyle(
   TextStyle base, {
   bool? bold,
   bool? italic,
+  bool? emphasis,
+  bool? alternateVoice,
+  bool? citation,
   bool? underline,
   bool? strikethrough,
   double? sizeScale,
@@ -2432,6 +2537,9 @@ TextStyle _copyTextStyle(
   return TextStyle(
     bold: bold ?? base.bold,
     italic: italic ?? base.italic,
+    emphasis: emphasis ?? base.emphasis,
+    alternateVoice: alternateVoice ?? base.alternateVoice,
+    citation: citation ?? base.citation,
     underline: underline ?? base.underline,
     strikethrough: strikethrough ?? base.strikethrough,
     sizeScale: sizeScale ?? base.sizeScale,
@@ -2581,6 +2689,11 @@ class _InlineCollector {
     final normalized = latex.trim();
     if (normalized.isEmpty) return;
     content.add(MathInline(normalized, display: display, sizeScale: sizeScale));
+    _lastWasSpace = false;
+  }
+
+  void pushImage(InlineImageRun image) {
+    content.add(image);
     _lastWasSpace = false;
   }
 
@@ -2930,6 +3043,16 @@ double? _cssScale(String? value) {
     return parsed == null ? null : parsed / _baseFontSize;
   }
   return null;
+}
+
+double? _inlineEmLength(String? value) {
+  if (value == null) return null;
+  final normalized = value.trim().toLowerCase();
+  if (!normalized.endsWith('em') || normalized.endsWith('rem')) return null;
+  final parsed = double.tryParse(
+    normalized.substring(0, normalized.length - 2).trim(),
+  );
+  return parsed?.isFinite == true ? parsed : null;
 }
 
 /// Line-height value → multiplier of the natural line height.

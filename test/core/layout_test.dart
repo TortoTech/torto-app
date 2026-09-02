@@ -206,6 +206,44 @@ void main() {
     _disposeAll(pages);
   });
 
+  test('heading inline image reserves an intrinsic-ratio placeholder', () {
+    final heading = TextBlock(
+      kind: TextBlockKind.heading,
+      headingLevel: 2,
+      nodeId: 'heading',
+      inlines: const [
+        InlineImageRun(
+          image: ImageBlock(href: 'img/chapter-icon.png'),
+          sizeScale: 1,
+          presentation: true,
+        ),
+        TextRun('Chapter title'),
+      ],
+      source: SourceRange(
+        start: const SourceAnchor(spine: 0, node: 'heading', textOffset: 0),
+        end: const SourceAnchor(spine: 0, node: 'heading', textOffset: 13),
+      ),
+    );
+    final pages = engine.paginate(
+      _section([heading]),
+      _viewport,
+      _style(),
+      imageSizeResolver: (_) => const ui.Size(200, 100),
+    );
+    final placement = pages.single.items.whereType<TextPlacement>().single;
+    expect(placement.inlineImages, hasLength(1));
+    expect(pages.single.items.whereType<ImagePlacement>(), isEmpty);
+    final inlineImage = placement.inlineImages.single;
+    final boxes = placement.paragraph.getBoxesForRange(
+      inlineImage.start,
+      inlineImage.end,
+    );
+    expect(boxes, isNotEmpty);
+    expect(boxes.single.bottom - boxes.single.top, closeTo(14, 1));
+    expect(boxes.single.right - boxes.single.left, closeTo(28, 1));
+    _disposeAll(pages);
+  });
+
   test('image taller than a page scales down to fit', () {
     final pages = engine.paginate(
       _section([const ImageBlock(href: 'img/tall.png')]),
@@ -880,6 +918,31 @@ void main() {
     expect(quote.underline, isFalse);
     expect(heading.italic, isFalse);
     expect(heading.underline, isFalse);
+  });
+
+  test('unified semantic emphasis follows CJK and Latin scripts', () {
+    const emphasis = TextStyle(italic: true, emphasis: true);
+    const citation = TextStyle(italic: true, citation: true);
+    final mixed = LayoutEngine.debugResolvedSemanticSegments(
+      '强调 Rolling Stone',
+      emphasis,
+      writingSystem: WritingSystem.cjk,
+    );
+    expect(mixed.first.text.trim(), '强调');
+    expect(mixed.first.bold, isTrue);
+    expect(mixed.first.italic, isFalse);
+    expect(mixed.last.text, contains('Rolling Stone'));
+    expect(mixed.last.bold, isFalse);
+    expect(mixed.last.italic, isTrue);
+
+    final cited = LayoutEngine.debugResolvedSemanticSegments(
+      '《滚石》 Rolling Stone',
+      citation,
+      writingSystem: WritingSystem.cjk,
+    );
+    expect(cited.first.bold, isFalse);
+    expect(cited.first.italic, isFalse);
+    expect(cited.last.italic, isTrue);
   });
 
   test('unified typesetting justifies ordinary body paragraphs', () {

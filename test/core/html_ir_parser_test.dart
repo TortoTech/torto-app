@@ -582,6 +582,71 @@ void main() {
       expect(runs[3].style.bold, isFalse);
     });
 
+    test('keeps em-sized presentation images inline with heading text', () {
+      final section = parseSection('''
+        <style>
+          img.height-1em { height: 1em; vertical-align: middle; }
+        </style>
+        <h2><img alt="" class="height-1em" role="presentation"
+          src="../images/chapter-icon.jpg"/>Chapter title</h2>
+      ''');
+
+      expect(section.blocks, hasLength(1));
+      final heading = section.blocks.single as TextBlock;
+      expect(heading.kind, TextBlockKind.heading);
+      expect(heading.headingLevel, 2);
+      expect(heading.inlines, hasLength(2));
+      final image = heading.inlines.first as InlineImageRun;
+      final text = heading.inlines.last as TextRun;
+      expect(image.image.href, 'OPS/images/chapter-icon.jpg');
+      expect(image.presentation, isTrue);
+      expect(image.sizeScale, text.style.sizeScale);
+      expect(text.text, 'Chapter title');
+      expect(section.blocks.whereType<ImageBlock>(), isEmpty);
+    });
+
+    test('meaningful heading images remain block-level illustrations', () {
+      final section = parseSection(
+        '<h2><img alt="Diagram" style="height:1em" '
+        'src="../images/diagram.jpg"/>Chapter title</h2>',
+      );
+
+      expect(section.blocks, hasLength(2));
+      expect(section.blocks.first, isA<TextBlock>());
+      expect(section.blocks.last, isA<ImageBlock>());
+    });
+
+    test('cite em and i keep distinct semantic roles', () {
+      final section = parseSection(
+        '<p><cite>Work</cite> <em>stress</em> <i>term</i> '
+        '<span style="font-style: italic">visual</span></p>',
+      );
+      final runs = textBlock(section, 0).inlines.whereType<TextRun>().toList();
+      TextRun byText(String value) =>
+          runs.firstWhere((run) => run.text.trim() == value);
+
+      expect(byText('Work').style.citation, isTrue);
+      expect(byText('Work').style.emphasis, isFalse);
+      expect(byText('stress').style.emphasis, isTrue);
+      expect(byText('stress').style.alternateVoice, isFalse);
+      expect(byText('term').style.alternateVoice, isTrue);
+      expect(byText('term').style.citation, isFalse);
+      expect(byText('visual').style.italic, isTrue);
+      expect(byText('visual').style.emphasis, isFalse);
+      expect(byText('visual').style.alternateVoice, isFalse);
+      expect(byText('visual').style.citation, isFalse);
+    });
+
+    test('a cite quote attribution keeps citation semantics', () {
+      final section = parseSection(
+        '<blockquote><p>Quoted prose.</p><cite>The source</cite></blockquote>',
+      );
+      final quote = section.blocks.single as QuoteBlock;
+      final run = quote.attribution!.inlines.whereType<TextRun>().single;
+      expect(run.style.citation, isTrue);
+      expect(run.style.italic, isTrue);
+    });
+
     test('u/ins/s/del/sup/sub', () {
       final section = parseSection(
         '<p><u>u</u><ins>i</ins><s>s</s><del>d</del>x<sup>2</sup>y<sub>n</sub></p>',
@@ -688,6 +753,25 @@ void main() {
       );
       expect(reference.style.linkRole, LinkRole.footnoteReference);
       expect(backlink.style.linkRole, LinkRole.footnoteBacklink);
+    });
+
+    test('split reference anchor hides an image-bearing footnote', () {
+      final section = parseSection('''
+        <h1>Chapter<a id="ref-1"/><a href="#note-1"><sup>*</sup></a></h1>
+        <p>Chapter content.</p>
+        <div><p id="note-1"><a href="#ref-1"><sup>*</sup></a>Footnote text.<br/>
+          <img alt="diagram" src="../images/diagram.jpg"/></p></div>
+      ''');
+
+      final heading = section.blocks.whereType<TextBlock>().first;
+      final reference = heading.inlines.whereType<TextRun>().firstWhere(
+        (run) => run.style.linkRole == LinkRole.footnoteReference,
+      );
+      expect(reference.link, 'OPS/text/ch1.xhtml#note-1');
+      final note = section.blocks.whereType<NoteBlock>().single;
+      expect(note.kind, NoteBlockKind.definition);
+      expect(note.blocks.whereType<ImageBlock>(), isNotEmpty);
+      expect(section.blocks.whereType<ImageBlock>(), isEmpty);
     });
 
     test('classifies supported inline footnote classes', () {

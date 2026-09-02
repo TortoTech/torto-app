@@ -39,6 +39,26 @@ class TranslationBookSource implements BookSource {
     int sectionIndex,
     List<BlockTranslation> translations,
   ) async {
+    await validateBatch(sectionIndex, translations);
+    final values = _sections.putIfAbsent(sectionIndex, () => {});
+    for (final translation in translations) {
+      if (translation.text.trim().isEmpty) continue;
+      final stored = values.putIfAbsent(
+        translation.blockIndex,
+        _StoredBlockTranslation.new,
+      );
+      if (translation.segmentIndex == null) {
+        stored.whole = translation.text;
+      } else {
+        stored.segments[translation.segmentIndex!] = translation.text;
+      }
+    }
+  }
+
+  Future<void> validateBatch(
+    int sectionIndex,
+    List<BlockTranslation> translations,
+  ) async {
     final section = await inner.parseSection(sectionIndex);
     for (final translation in translations) {
       final original = _segmentInlines(
@@ -54,19 +74,6 @@ class TranslationBookSource implements BookSource {
         original,
         language: targetLanguageCode,
       );
-    }
-    final values = _sections.putIfAbsent(sectionIndex, () => {});
-    for (final translation in translations) {
-      if (translation.text.trim().isEmpty) continue;
-      final stored = values.putIfAbsent(
-        translation.blockIndex,
-        _StoredBlockTranslation.new,
-      );
-      if (translation.segmentIndex == null) {
-        stored.whole = translation.text;
-      } else {
-        stored.segments[translation.segmentIndex!] = translation.text;
-      }
     }
   }
 
@@ -115,8 +122,9 @@ class TranslationBookSource implements BookSource {
           blocks.add(_translatedTable(block, translation));
         case FigureBlock():
           blocks.add(_translatedFigure(block, translation));
-        case NoteBlock() ||
-            ImageBlock() ||
+        case NoteBlock():
+          blocks.add(_translatedNote(block, translation));
+        case ImageBlock() ||
             SeparatorBlock() ||
             PageBreakBlock() ||
             LineBreakBlock():
@@ -168,8 +176,22 @@ class TranslationBookSource implements BookSource {
           for (var index = 0; index < block.captions.length; index++) {
             _appendInput(inputs, blockIndex, index, block.captions[index]);
           }
-        case NoteBlock() ||
-            ImageBlock() ||
+        case NoteBlock():
+          final segments = _noteTranslationSegments(block);
+          for (var index = 0; index < segments.length; index++) {
+            final segment = segments[index];
+            final text = TranslationMarkupCodec.encode(segment.inlines);
+            if (text.trim().isEmpty || segment.nodeId.isEmpty) continue;
+            inputs.add(
+              TranslationBlockInput(
+                blockIndex: blockIndex,
+                segmentIndex: index,
+                nodeId: segment.nodeId,
+                text: text,
+              ),
+            );
+          }
+        case ImageBlock() ||
             SeparatorBlock() ||
             PageBreakBlock() ||
             LineBreakBlock():
@@ -329,6 +351,88 @@ class TranslationBookSource implements BookSource {
     );
   }
 
+  NoteBlock _translatedNote(
+    NoteBlock note,
+    _StoredBlockTranslation translation,
+  ) {
+    var segmentIndex = 0;
+
+    List<Inline> translateInlines(List<Inline> original) {
+      final value = translation.segments[segmentIndex++];
+      if (value == null) return original;
+      final translated = TranslationMarkupCodec.decode(
+        value,
+        original,
+        language: targetLanguageCode,
+      );
+      return mode == TranslationMode.replace
+          ? translated
+          : [...original, const BreakInline(), ...translated];
+    }
+
+    TextBlock translateText(TextBlock block) =>
+        _copyText(block, inlines: translateInlines(block.inlines));
+
+    late Block Function(Block block) translateBlock;
+    translateBlock = (block) => switch (block) {
+      TextBlock() => translateText(block),
+      QuoteBlock(:final body, :final attribution, :final source) => QuoteBlock(
+        body: body.map(translateText).toList(growable: false),
+        attribution: attribution == null ? null : translateText(attribution),
+        source: source,
+      ),
+      TableBlock(:final rows, :final style, :final source) => TableBlock(
+        rows: [
+          for (final row in rows)
+            TableRow([
+              for (final cell in row.cells)
+                TableCell(
+                  inlines: translateInlines(cell.inlines),
+                  header: cell.header,
+                  columnSpan: cell.columnSpan,
+                  rowSpan: cell.rowSpan,
+                  authoredAlignment: cell.authoredAlignment,
+                  style: cell.style,
+                  source: cell.source,
+                  nodeId: cell.nodeId,
+                ),
+            ]),
+        ],
+        style: style,
+        source: source,
+      ),
+      FigureBlock(
+        :final images,
+        :final captions,
+        :final captionPosition,
+        :final style,
+        :final source,
+      ) =>
+        FigureBlock(
+          images: images,
+          captions: captions.map(translateText).toList(growable: false),
+          captionPosition: captionPosition,
+          style: style,
+          source: source,
+        ),
+      NoteBlock(:final kind, :final blocks, :final source) => NoteBlock(
+        kind: kind,
+        blocks: blocks.map(translateBlock).toList(growable: false),
+        source: source,
+      ),
+      ImageBlock() ||
+      SeparatorBlock() ||
+      PageBreakBlock() ||
+      LineBreakBlock() => block,
+    };
+
+    return NoteBlock(
+      kind: note.kind,
+      blocks: note.blocks.map(translateBlock).toList(growable: false),
+      source: note.source,
+    );
+  }
+
   static List<Inline>? _segmentInlines(
     Section section,
     int blockIndex,
@@ -349,8 +453,47 @@ class TranslationBookSource implements BookSource {
             ?.inlines,
       FigureBlock() when segmentIndex != null =>
         block.captions.elementAtOrNull(segmentIndex)?.inlines,
+      NoteBlock() when segmentIndex != null => _noteTranslationSegments(
+        block,
+      ).elementAtOrNull(segmentIndex)?.inlines,
       _ => null,
     };
+  }
+
+  static List<({List<Inline> inlines, String nodeId})> _noteTranslationSegments(
+    NoteBlock note,
+  ) {
+    final output = <({List<Inline> inlines, String nodeId})>[];
+
+    void addText(TextBlock block) {
+      output.add((inlines: block.inlines, nodeId: block.nodeId));
+    }
+
+    void visit(Block block) {
+      switch (block) {
+        case TextBlock():
+          addText(block);
+        case QuoteBlock(:final body, :final attribution):
+          body.forEach(addText);
+          if (attribution != null) addText(attribution);
+        case TableBlock(:final rows):
+          for (final cell in rows.expand((row) => row.cells)) {
+            output.add((inlines: cell.inlines, nodeId: cell.nodeId));
+          }
+        case FigureBlock(:final captions):
+          captions.forEach(addText);
+        case NoteBlock(:final blocks):
+          blocks.forEach(visit);
+        case ImageBlock() ||
+            SeparatorBlock() ||
+            PageBreakBlock() ||
+            LineBreakBlock():
+          break;
+      }
+    }
+
+    note.blocks.forEach(visit);
+    return output;
   }
 
   static TextBlock _withReducedBottomMargin(TextBlock block) => _copyText(

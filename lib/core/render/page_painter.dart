@@ -122,6 +122,7 @@ class PagePainter extends CustomPainter {
     // inner rules visibly darker than the table outline. Build the union of
     // all horizontal and vertical edges and submit it as one path instead.
     _paintTableGrid(canvas, tableCells, resolvedForeground.withAlpha(96));
+    _paintInlineImages(canvas, page.items, imageResolver);
     _paintFootnoteIcons(canvas, page.items, footnoteIconColor(background));
   }
 
@@ -137,6 +138,59 @@ class PagePainter extends CustomPainter {
 Color footnoteIconColor(Color background) => background.computeLuminance() < 0.5
     ? const Color(0xFF60A5FA)
     : const Color(0xFF2563EB);
+
+void _paintInlineImages(
+  Canvas canvas,
+  List<PageItem> items,
+  ui.Image? Function(String href) imageResolver,
+) {
+  for (final item in items) {
+    final ui.Paragraph paragraph;
+    final List<InlineImageRange> images;
+    final ui.Offset paragraphOffset;
+    final ui.Rect clip;
+    switch (item) {
+      case TextPlacement():
+        paragraph = item.paragraph;
+        images = item.inlineImages;
+        paragraphOffset = ui.Offset(item.x, item.y - item.sliceTop);
+        clip = ui.Rect.fromLTWH(item.x, item.y, item.width, item.sliceHeight);
+      case TableCellPlacement():
+        paragraph = item.paragraph;
+        images = item.inlineImages;
+        paragraphOffset = ui.Offset(
+          item.rect.left + item.padding,
+          item.rect.top + item.padding,
+        );
+        clip = item.rect.deflate(item.padding);
+      default:
+        continue;
+    }
+    for (final inlineImage in images) {
+      final image = imageResolver(inlineImage.href);
+      if (image == null) continue;
+      final boxes = paragraph.getBoxesForRange(
+        inlineImage.start,
+        inlineImage.end,
+      );
+      if (boxes.isEmpty) continue;
+      final box = boxes.first;
+      final destination = ui.Rect.fromLTRB(
+        paragraphOffset.dx + box.left,
+        paragraphOffset.dy + box.top,
+        paragraphOffset.dx + box.right,
+        paragraphOffset.dy + box.bottom,
+      ).intersect(clip);
+      if (destination.isEmpty) continue;
+      canvas.drawImageRect(
+        image,
+        ui.Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
+        destination,
+        Paint(),
+      );
+    }
+  }
+}
 
 void _paintFootnoteIcons(Canvas canvas, List<PageItem> items, Color color) {
   for (final item in items) {

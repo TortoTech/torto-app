@@ -151,8 +151,9 @@ class _AiProvidersPageState extends State<AiProvidersPage> {
 
 class AiProviderEditPage extends StatefulWidget {
   final AiProviderConfig provider;
+  final OpenAiCompatibleClient? client;
 
-  const AiProviderEditPage({super.key, required this.provider});
+  const AiProviderEditPage({super.key, required this.provider, this.client});
 
   @override
   State<AiProviderEditPage> createState() => _AiProviderEditPageState();
@@ -169,27 +170,43 @@ class _AiProviderEditPageState extends State<AiProviderEditPage> {
   late final TextEditingController _apiKey = TextEditingController(
     text: widget.provider.apiKey,
   );
-  late final TextEditingController _models = TextEditingController(
-    text: widget.provider.models.join(', '),
-  );
+  late final OpenAiCompatibleClient _client =
+      widget.client ?? OpenAiCompatibleClient();
+  late final bool _ownsClient = widget.client == null;
+  late final List<String> _selectedModels = [...widget.provider.models];
+  List<String> _availableModels = const [];
   bool _loadingModels = false;
+  String? _modelsError;
+  Timer? _modelFetchDebounce;
+  int _modelFetchGeneration = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _baseUrl.addListener(_onProviderEndpointChanged);
+    _apiKey.addListener(_onProviderEndpointChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _scheduleModelFetch(immediate: true);
+    });
+  }
 
   @override
   void dispose() {
+    _modelFetchDebounce?.cancel();
+    _baseUrl.removeListener(_onProviderEndpointChanged);
+    _apiKey.removeListener(_onProviderEndpointChanged);
     _name.dispose();
     _baseUrl.dispose();
     _apiKey.dispose();
-    _models.dispose();
+    if (_ownsClient) _client.close();
     super.dispose();
   }
 
   AiProviderConfig get _value {
-    final models = _models.text
-        .split(RegExp(r'[,\n]'))
-        .map((model) => model.trim())
-        .where((model) => model.isNotEmpty)
-        .toSet()
-        .toList();
+    final models = _selectedModels.toSet().toList()
+      ..sort(
+        (left, right) => left.toLowerCase().compareTo(right.toLowerCase()),
+      );
     return widget.provider.copyWith(
       kind: _kind,
       name: _name.text.trim(),
@@ -199,35 +216,216 @@ class _AiProviderEditPageState extends State<AiProviderEditPage> {
     );
   }
 
-  Future<void> _fetchModels() async {
-    setState(() => _loadingModels = true);
-    final client = OpenAiCompatibleClient();
+  void _onProviderEndpointChanged() => _scheduleModelFetch();
+
+  void _scheduleModelFetch({bool immediate = false}) {
+    _modelFetchDebounce?.cancel();
+    final generation = ++_modelFetchGeneration;
+    final hasUrl = _baseUrl.text.trim().isNotEmpty;
+    setState(() {
+      _modelsError = null;
+      _availableModels = const [];
+      if (!hasUrl) {
+        _loadingModels = false;
+      }
+    });
+    if (!hasUrl) return;
+    if (immediate) {
+      unawaited(_fetchModels(generation));
+    } else {
+      _modelFetchDebounce = Timer(
+        const Duration(milliseconds: 500),
+        () => unawaited(_fetchModels(generation)),
+      );
+    }
+  }
+
+  void _refreshModels() {
+    _modelFetchDebounce?.cancel();
+    final generation = ++_modelFetchGeneration;
+    unawaited(_fetchModels(generation));
+  }
+
+  Future<void> _fetchModels(int generation) async {
+    if (_baseUrl.text.trim().isEmpty) return;
+    if (mounted) {
+      setState(() {
+        _loadingModels = true;
+        _modelsError = null;
+      });
+    }
     try {
-      final models = await client.fetchModels(_value);
-      if (!mounted) return;
-      setState(() => _models.text = models.join(', '));
+      final models = await _client.fetchModels(_value);
+      if (!mounted || generation != _modelFetchGeneration) return;
+      setState(() => _availableModels = models);
     } catch (error) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.toString())));
+      if (!mounted || generation != _modelFetchGeneration) return;
+      setState(() => _modelsError = error.toString());
     } finally {
-      client.close();
-      if (mounted) setState(() => _loadingModels = false);
+      if (mounted && generation == _modelFetchGeneration) {
+        setState(() => _loadingModels = false);
+      }
     }
   }
 
   void _selectKind(AiProviderKind? value) {
     if (value == null) return;
     final oldLabel = _kind.label;
+    final baseUrl = value.defaultBaseUrl;
     setState(() {
       _kind = value;
-      final baseUrl = value.defaultBaseUrl;
-      if (baseUrl != null) _baseUrl.text = baseUrl;
       if (_name.text.trim().isEmpty || _name.text == oldLabel) {
         _name.text = value.label;
       }
     });
+    if (baseUrl != null && _baseUrl.text != baseUrl) {
+      _baseUrl.text = baseUrl;
+    } else {
+      _scheduleModelFetch();
+    }
+  }
+
+  List<String> get _modelOptions {
+    final values = <String>{..._availableModels, ..._selectedModels}.toList();
+    values.sort(
+      (left, right) => left.toLowerCase().compareTo(right.toLowerCase()),
+    );
+    return values;
+  }
+
+  Future<void> _showModelSelector() async {
+    final l10n = context.l10n;
+    final search = TextEditingController();
+    final custom = TextEditingController();
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          final query = search.text.trim().toLowerCase();
+          final options = _modelOptions
+              .where((model) => model.toLowerCase().contains(query))
+              .toList(growable: false);
+
+          void update(VoidCallback change) {
+            if (!mounted) return;
+            setState(change);
+            setSheetState(() {});
+          }
+
+          void addCustomModel() {
+            final model = custom.text.trim();
+            if (model.isEmpty) return;
+            update(() {
+              if (!_availableModels.contains(model)) {
+                _availableModels = [..._availableModels, model];
+              }
+              if (!_selectedModels.contains(model)) {
+                _selectedModels.add(model);
+              }
+              custom.clear();
+            });
+          }
+
+          return DraggableScrollableSheet(
+            expand: false,
+            initialChildSize: 0.72,
+            minChildSize: 0.45,
+            maxChildSize: 0.92,
+            builder: (context, scrollController) => SafeArea(
+              child: Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 16, 12, 8),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            l10n.text('选择模型', 'Select models'),
+                            style: Theme.of(context).textTheme.titleLarge,
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () => Navigator.pop(sheetContext),
+                          child: Text(l10n.text('完成', 'Done')),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: TextField(
+                      controller: search,
+                      decoration: InputDecoration(
+                        prefixIcon: const Icon(Icons.search),
+                        hintText: l10n.text('搜索模型', 'Search models'),
+                      ),
+                      onChanged: (_) => setSheetState(() {}),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: custom,
+                            decoration: InputDecoration(
+                              hintText: l10n.text(
+                                '手动添加模型 ID',
+                                'Add a model ID manually',
+                              ),
+                            ),
+                            onSubmitted: (_) => addCustomModel(),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.add),
+                          tooltip: l10n.text('添加模型', 'Add model'),
+                          onPressed: addCustomModel,
+                        ),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child: options.isEmpty
+                        ? Center(
+                            child: Text(
+                              l10n.text('没有匹配的模型', 'No matching models'),
+                            ),
+                          )
+                        : ListView.builder(
+                            controller: scrollController,
+                            itemCount: options.length,
+                            itemBuilder: (context, index) {
+                              final model = options[index];
+                              final selected = _selectedModels.contains(model);
+                              return CheckboxListTile(
+                                value: selected,
+                                title: Text(model),
+                                controlAffinity:
+                                    ListTileControlAffinity.leading,
+                                onChanged:
+                                    selected && _selectedModels.length == 1
+                                    ? null
+                                    : (_) => update(() {
+                                        selected
+                                            ? _selectedModels.remove(model)
+                                            : _selectedModels.add(model);
+                                      }),
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+    search.dispose();
+    custom.dispose();
   }
 
   @override
@@ -280,28 +478,46 @@ class _AiProviderEditPageState extends State<AiProviderEditPage> {
             decoration: const InputDecoration(labelText: 'API Key'),
           ),
           const SizedBox(height: 16),
-          TextField(
-            controller: _models,
-            minLines: 1,
-            maxLines: 4,
-            decoration: InputDecoration(
-              labelText: l10n.text('模型', 'Models'),
-              helperText: l10n.text(
-                '使用逗号分隔多个模型',
-                'Separate models with commas',
+          InkWell(
+            borderRadius: BorderRadius.circular(4),
+            onTap: _showModelSelector,
+            child: InputDecorator(
+              decoration: InputDecoration(
+                labelText: l10n.text('模型', 'Models'),
+                suffixIcon: _loadingModels
+                    ? const Padding(
+                        padding: EdgeInsets.all(12),
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : IconButton(
+                        icon: const Icon(Icons.refresh),
+                        tooltip: l10n.text('刷新模型', 'Refresh models'),
+                        onPressed: _baseUrl.text.trim().isEmpty
+                            ? null
+                            : _refreshModels,
+                      ),
               ),
-              suffixIcon: _loadingModels
-                  ? const Padding(
-                      padding: EdgeInsets.all(12),
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : IconButton(
-                      icon: const Icon(Icons.refresh),
-                      tooltip: l10n.text('从接口获取模型', 'Fetch models'),
-                      onPressed: _fetchModels,
-                    ),
+              child: Text(
+                _selectedModels.length == 1
+                    ? _selectedModels.single
+                    : l10n.text(
+                        '已选择 ${_selectedModels.length} 个模型',
+                        '${_selectedModels.length} models selected',
+                      ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
             ),
           ),
+          if (_modelsError != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              _modelsError!,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.error,
+              ),
+            ),
+          ],
           const SizedBox(height: 20),
           Text(
             l10n.text(
