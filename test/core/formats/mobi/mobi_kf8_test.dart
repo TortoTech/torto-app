@@ -33,7 +33,8 @@ void main() {
   });
 
   test('normalizes MOBI HTML and embedded images', () {
-    const body = '<a id="chapter-start"></a>'
+    const body =
+        '<a id="chapter-start"></a>'
         '<h1 aid="kindle-heading">Title</h1>'
         '<p>Hello &amp; world</p>'
         '<img recindex="00001">';
@@ -80,10 +81,7 @@ void main() {
         print('SKIP: ${file.path} not found');
         return;
       }
-      final source = await openMobi(
-        await file.readAsBytes(),
-        name,
-      );
+      final source = await openMobi(await file.readAsBytes(), name);
       final book = source.book;
       // ignore: avoid_print
       print(
@@ -174,17 +172,26 @@ Uint8List _mobi6Fixture() {
   putU32(112, 0xffffffff); // no HUFF
   putU32(128, 0x40); // EXTH present
   putU32(244, 0xffffffff); // no NCX
-  recordZero.buffer
-      .asUint8List()
-      .setRange(exthOffset, exthOffset + exth.length, exth);
   recordZero.buffer.asUint8List().setRange(
-        titleOffset,
-        titleOffset + title.length,
-        title,
-      );
+    exthOffset,
+    exthOffset + exth.length,
+    exth,
+  );
+  recordZero.buffer.asUint8List().setRange(
+    titleOffset,
+    titleOffset + title.length,
+    title,
+  );
 
   final cover = Uint8List.fromList([
-    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+    0x89,
+    0x50,
+    0x4E,
+    0x47,
+    0x0D,
+    0x0A,
+    0x1A,
+    0x0A,
   ]);
   final records = [
     recordZero.buffer.asUint8List(),
@@ -210,8 +217,8 @@ Uint8List _mobi6Fixture() {
 }
 
 Uint8List _exth(List<(int, List<int>)> entries) {
-  final length = 12 +
-      entries.fold<int>(0, (sum, entry) => sum + 8 + entry.$2.length);
+  final length =
+      12 + entries.fold<int>(0, (sum, entry) => sum + 8 + entry.$2.length);
   final padded = (length + 3) & ~3;
   final output = Uint8List(padded);
   final view = ByteData.view(output.buffer);

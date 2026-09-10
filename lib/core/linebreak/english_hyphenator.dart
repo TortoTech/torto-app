@@ -26,12 +26,14 @@ class HyphenationSpan {
   final int end;
   final String? language;
   final bool suppress;
+  final HyphenationMode mode;
 
   const HyphenationSpan({
     required this.start,
     required this.end,
     this.language,
     this.suppress = false,
+    this.mode = HyphenationMode.auto,
   });
 }
 
@@ -195,6 +197,14 @@ final class EnglishHyphenator implements ParagraphHyphenator {
     final fallback = localeForLanguageTag(publicationLanguage);
     final paragraphCanUseFallback = _looksPredominantlyEnglish(text);
     final breaks = <int>{};
+    for (final span in spans) {
+      if (span.suppress || span.mode == HyphenationMode.none) continue;
+      final start = span.start.clamp(0, text.length);
+      final end = span.end.clamp(start, text.length);
+      for (var offset = start; offset < end; offset++) {
+        if (text.codeUnitAt(offset) == 0x00ad) breaks.add(offset + 1);
+      }
+    }
     var spanIndex = 0;
 
     for (final match in _asciiEnglishWord.allMatches(text)) {
@@ -215,7 +225,9 @@ final class EnglishHyphenator implements ParagraphHyphenator {
           current++;
           continue;
         }
-        if (span.start > coveredUntil || span.suppress) {
+        if (span.start > coveredUntil ||
+            span.suppress ||
+            span.mode != HyphenationMode.auto) {
           eligible = false;
           break;
         }

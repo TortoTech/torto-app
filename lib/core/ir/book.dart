@@ -166,12 +166,13 @@ class TocEntry {
 }
 
 class SpineItem {
+  final SpineItemId id;
   final int index;
 
   /// Root-relative path of the section document within the package.
   final String href;
 
-  const SpineItem({required this.index, required this.href});
+  const SpineItem({required this.id, required this.index, required this.href});
 }
 
 class Book {
@@ -192,16 +193,19 @@ class Book {
   });
 
   int get sectionCount => spine.length;
+  int indexOfSpine(SpineItemId id) => spine.indexWhere((item) => item.id == id);
 }
 
 /// One spine section's parsed content.
 class Section {
+  final SpineItemId id;
   final int spineIndex;
   final String href;
   final List<Block> blocks;
   final List<SectionAnchor> anchors;
 
   const Section({
+    required this.id,
     required this.spineIndex,
     required this.href,
     required this.blocks,

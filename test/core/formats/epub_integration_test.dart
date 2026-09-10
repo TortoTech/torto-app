@@ -46,9 +46,10 @@ void main() {
       final failureRate = failures / book.spine.length;
       // ignore: avoid_print
       print(
-          '${entry.key}: sections=${book.spine.length} failures=$failures '
-          '(${100 * failureRate}% ) blocks=$totalBlocks toc=${book.toc.length} '
-          'title="${book.metadata.title}"');
+        '${entry.key}: sections=${book.spine.length} failures=$failures '
+        '(${100 * failureRate}% ) blocks=$totalBlocks toc=${book.toc.length} '
+        'title="${book.metadata.title}"',
+      );
       expect(failureRate, lessThan(0.10));
       final minBlocks = entry.value;
       if (minBlocks != null) {

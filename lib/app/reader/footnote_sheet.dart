@@ -1,7 +1,13 @@
+import 'dart:ui' as ui;
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
+import '../../core/ir/book.dart';
+import '../../core/layout/layout_types.dart';
 import '../../core/linebreak/english_hyphenator.dart';
 import '../../core/linebreak/paragraph_optimizer.dart';
+import '../../core/linebreak/measurement.dart';
 import '../../core/linebreak/unicode_line_breaker.dart';
 
 /// Shows one reader footnote as a full-window-width bottom sheet.
@@ -11,6 +17,8 @@ Future<void> showReaderFootnoteSheet(
   required Color background,
   required Color foreground,
   String publicationLanguage = '',
+  WritingSystem writingSystem = WritingSystem.unknown,
+  ReaderTypography typography = const ReaderTypography(),
 }) async {
   await EnglishHyphenator.instance.ensureLoadedForLanguage(publicationLanguage);
   if (!context.mounted) return;
@@ -52,6 +60,8 @@ Future<void> showReaderFootnoteSheet(
         text: text,
         foreground: foreground,
         publicationLanguage: publicationLanguage,
+        writingSystem: writingSystem,
+        typography: typography,
       ),
     ),
   );
@@ -61,34 +71,55 @@ class ReaderFootnoteSheet extends StatelessWidget {
   final String text;
   final Color foreground;
   final String publicationLanguage;
+  final WritingSystem writingSystem;
+  final ReaderTypography typography;
 
   const ReaderFootnoteSheet({
     super.key,
     required this.text,
     required this.foreground,
     this.publicationLanguage = '',
+    this.writingSystem = WritingSystem.unknown,
+    this.typography = const ReaderTypography(),
   });
 
   @override
-  Widget build(BuildContext context) => SafeArea(
-    top: false,
-    child: SizedBox(
-      width: double.infinity,
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.fromLTRB(24, 4, 24, 28),
-        child: OptimizedJustifiedText(
-          text,
-          publicationLanguage: publicationLanguage,
-          style: TextStyle(
-            color: foreground,
-            fontFamily: 'sans-serif',
-            fontSize: 17,
-            height: 1.55,
+  Widget build(BuildContext context) {
+    final latinFont = typography.latinFontFor(writingSystem);
+    final cjkFont = typography.cjkFontFor(writingSystem);
+    return SafeArea(
+      top: false,
+      child: SizedBox(
+        width: double.infinity,
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(24, 4, 24, 28),
+          child: OptimizedJustifiedText(
+            text,
+            publicationLanguage: publicationLanguage,
+            style: TextStyle(
+              color: foreground,
+              fontFamily: latinFont.family,
+              fontFamilyFallback: [cjkFont.family],
+              fontWeight:
+                  FontWeight.values[((typography.fontWeight / 100).round() - 1)
+                      .clamp(0, 8)],
+              fontVariations: latinFont == ReaderLatinFont.literata
+                  ? [
+                      ui.FontVariation(
+                        'wght',
+                        typography.fontWeight.toDouble(),
+                      ),
+                      const ui.FontVariation('opsz', 12.75),
+                    ]
+                  : null,
+              fontSize: 17,
+              height: 1.55,
+            ),
           ),
         ),
       ),
-    ),
-  );
+    );
+  }
 }
 
 /// Plain-text adapter for the same whole-paragraph optimizer used by the
@@ -154,7 +185,7 @@ class _OptimizedParagraphText extends StatelessWidget {
       if (!width.isFinite || width <= 0) return const SizedBox.shrink();
       final span = _optimizedTextSpan(
         text,
-        style,
+        DefaultTextStyle.of(context).style.merge(style),
         width,
         MediaQuery.textScalerOf(context),
         publicationLanguage,
@@ -181,13 +212,35 @@ TextSpan? _optimizedTextSpan(
   String publicationLanguage,
   ParagraphHyphenator hyphenator,
 ) {
+  final hyphenationBreaks = hyphenator.breakOpportunities(
+    text: text,
+    spans: [HyphenationSpan(start: 0, end: text.length)],
+    publicationLanguage: publicationLanguage,
+  );
+  final legalBreaks = Icu4xLineBreaker.instance.breakOpportunities(text);
+  final measurementBreaks = {...legalBreaks, ...hyphenationBreaks};
   final ranges = <({int start, int end})>[];
   var offset = 0;
+  int? groupedStart;
+  void flushGroup() {
+    if (groupedStart != null && groupedStart! < offset) {
+      ranges.add((start: groupedStart!, end: offset));
+    }
+    groupedStart = null;
+  }
+
   for (final grapheme in text.characters) {
     final start = offset;
+    if (requiresStandaloneMeasurement(grapheme)) {
+      flushGroup();
+      ranges.add((start: start, end: start + grapheme.length));
+    } else {
+      groupedStart ??= start;
+    }
     offset += grapheme.length;
-    ranges.add((start: start, end: offset));
+    if (measurementBreaks.contains(offset)) flushGroup();
   }
+  flushGroup();
   if (ranges.isEmpty) return null;
 
   final measurement = TextPainter(
@@ -229,11 +282,6 @@ TextSpan? _optimizedTextSpan(
   }
   measurement.dispose();
 
-  final hyphenationBreaks = hyphenator.breakOpportunities(
-    text: text,
-    spans: [HyphenationSpan(start: 0, end: text.length)],
-    publicationLanguage: publicationLanguage,
-  );
   final hyphenPainter = TextPainter(
     text: TextSpan(text: '\u2010', style: style),
     textDirection: TextDirection.ltr,
@@ -246,16 +294,19 @@ TextSpan? _optimizedTextSpan(
   final plan = const ParagraphOptimizer().plan(
     text: text,
     clusters: clusters,
-    legalBreaks: Icu4xLineBreaker.instance.breakOpportunities(text),
+    legalBreaks: legalBreaks,
     hyphenBreaks: {
       for (final offset in hyphenationBreaks)
         if (hyphenWidth.isFinite && hyphenWidth > 0) offset: hyphenWidth,
     },
-    lineWidth: width,
+    lineWidth: math.max(
+      1.0,
+      width - math.min(1.0, textScaler.scale(style.fontSize ?? 17) * 0.05),
+    ),
     firstLineIndent: 0,
     defaultEm: textScaler.scale(style.fontSize ?? 17),
   );
-  if (plan == null || plan.lines.length < 2) return null;
+  if (plan == null) return null;
 
   final children = <InlineSpan>[];
   for (var lineIndex = 0; lineIndex < plan.lines.length; lineIndex++) {
@@ -276,10 +327,20 @@ TextSpan? _optimizedTextSpan(
         plain.write(value);
       } else {
         flushPlain();
+        // A measured Latin word is one shaping unit. Apply the trailing
+        // adjustment once, rather than once per letter in that word.
+        final last = value.characters.last;
+        if (value.length > last.length) {
+          children.add(
+            TextSpan(text: value.substring(0, value.length - last.length)),
+          );
+        }
         children.add(
           TextSpan(
-            text: value,
-            style: TextStyle(letterSpacing: adjustment),
+            text: last,
+            style: TextStyle(
+              letterSpacing: (style.letterSpacing ?? 0) + adjustment,
+            ),
           ),
         );
       }

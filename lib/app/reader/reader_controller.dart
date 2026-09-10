@@ -8,6 +8,9 @@ import 'package:flutter/foundation.dart';
 import '../../core/formats/formats.dart';
 import '../../core/html_ir/package_path.dart';
 import '../../core/ir/ir.dart';
+import '../../core/ir/text_index.dart';
+import '../sync/sync_models.dart';
+import 'annotations_repository.dart';
 import '../../core/layout/layout_engine.dart';
 import '../../core/layout/layout_types.dart';
 import '../../core/linebreak/english_hyphenator.dart';
@@ -32,6 +35,157 @@ enum ReaderTranslationStatus { off, translating, on, error }
 /// sections (prev/current/next cached), page navigation, image decoding,
 /// and progress persistence.
 class ReaderController extends ChangeNotifier {
+  AnnotationsRepository? _annotationsRepository;
+  List<AnnotationState> annotations = [];
+  Future<void> loadAnnotations() async {
+    if (_resourceSource == null) return;
+    _annotationsRepository ??= await AnnotationsRepository.open();
+    annotations = await _annotationsRepository!.list(_resourceSource!.book.id);
+    (int, int, int) order(AnnotationState annotation) {
+      if (annotation.ranges.isEmpty) return (1 << 30, 0, 0);
+      final anchor = annotation.ranges.first.start;
+      final index = _resourceSource!.book.indexOfSpine(anchor.spine);
+      return (
+        index < 0 ? 1 << 30 : index,
+        int.tryParse(anchor.node.replaceFirst('n', '')) ?? 0,
+        anchor.textOffset,
+      );
+    }
+
+    annotations.sort((a, b) {
+      final left = order(a), right = order(b);
+      final spine = left.$1.compareTo(right.$1);
+      if (spine != 0) return spine;
+      final node = left.$2.compareTo(right.$2);
+      return node == 0 ? left.$3.compareTo(right.$3) : node;
+    });
+    notifyListeners();
+  }
+
+  Future<List<BookTextNode>> textNodes(
+    int spine, {
+    bool displayed = false,
+  }) async => sectionTextNodes(
+    await (displayed ? _source! : _resourceSource!).parseSection(spine),
+    includeNotes: true,
+  ).toList();
+  Future<void> saveAnnotation(
+    List<SourceRange> ranges,
+    String quote, {
+    String? note,
+    AnnotationState? previous,
+    bool delete = false,
+  }) async {
+    if (_resourceSource == null) return;
+    _annotationsRepository ??= await AnnotationsRepository.open();
+    final canonical = previous?.ranges ?? ranges;
+    if (previous == null) {
+      for (final range in canonical) {
+        final index = _resourceSource!.book.indexOfSpine(range.start.spine);
+        if (index < 0) throw StateError('Unknown source section');
+        final nodes = await textNodes(index);
+        final node = nodes.firstWhere(
+          (n) => n.source.start.node == range.start.node,
+        );
+        if (!node.selectable ||
+            range.end.spine != range.start.spine ||
+            range.end.node != range.start.node) {
+          throw StateError('This source text cannot be anchored');
+        }
+        sourceSlice(node.text, range.start.textOffset, range.end.textOffset);
+        if (translationEnabled &&
+            (range.start.textOffset != node.source.start.textOffset ||
+                range.end.textOffset != node.source.end.textOffset)) {
+          throw StateError(
+            'Translated annotations require the complete original paragraph',
+          );
+        }
+      }
+    }
+    await _annotationsRepository!.save(
+      book: _resourceSource!.book.id,
+      ranges: canonical,
+      quote: quote,
+      note: note,
+      previous: previous,
+      delete: delete,
+    );
+    await loadAnnotations();
+  }
+
+  Future<(List<SourceRange>, String)> originalParagraphSelection(
+    List<SourceRange> displayed,
+  ) => resolveOriginalParagraphSelection(_resourceSource!, displayed);
+
+  Future<List<SourceRange>?> resolveAnnotation(
+    AnnotationState annotation,
+  ) async {
+    if (_resourceSource == null) return null;
+    final quotes = <String>[];
+    try {
+      for (final range in annotation.ranges) {
+        final index = _resourceSource!.book.indexOfSpine(range.start.spine);
+        if (index < 0 ||
+            range.start.spine != range.end.spine ||
+            range.start.node != range.end.node) {
+          return null;
+        }
+        final node = (await textNodes(
+          index,
+        )).firstWhere((n) => n.source.start.node == range.start.node);
+        quotes.add(
+          sourceSlice(node.text, range.start.textOffset, range.end.textOffset),
+        );
+      }
+      String normalize(String text) =>
+          text.replaceAll(RegExp(r'\s+'), ' ').trim();
+      if (normalize(quotes.join('\n')) == normalize(annotation.quote)) {
+        return annotation.ranges;
+      }
+    } catch (_) {
+      /* Never paint a guessed location. */
+    }
+    if (annotation.ranges.length == 1 && annotation.quote.isNotEmpty) {
+      final anchor = annotation.ranges.first.start;
+      final index = _resourceSource!.book.indexOfSpine(anchor.spine);
+      if (index < 0) return null;
+      final matches = <SourceRange>[];
+      for (final node in await textNodes(index)) {
+        for (final (start, end) in sourceMatches(node.text, annotation.quote)) {
+          matches.add(
+            SourceRange(
+              start: SourceAnchor(
+                spine: anchor.spine,
+                node: node.source.start.node,
+                textOffset: start,
+              ),
+              end: SourceAnchor(
+                spine: anchor.spine,
+                node: node.source.start.node,
+                textOffset: end,
+              ),
+            ),
+          );
+        }
+      }
+      if (matches.length == 1) return matches;
+    }
+    return null;
+  }
+
+  Future<bool> goToTextRange(SourceRange range) async {
+    if (busy || _resourceSource == null) return false;
+    final index = _resourceSource!.book.indexOfSpine(range.start.spine);
+    if (index < 0) return false;
+    if (translationEnabled) await toggleTranslation();
+    await goToSection(index);
+    final pages = currentPages;
+    if (pages.isEmpty) return false;
+    pageIndex = _pageForAnchor(pages, range.start, 0);
+    notifyListeners();
+    return true;
+  }
+
   final ProgressStore progressStore;
   final String? titleHint;
   final String? publicationIdHint;
@@ -74,6 +228,7 @@ class ReaderController extends ChangeNotifier {
   AiSettings? _activeAiSettings;
   bool translationEnabled = false;
   bool _translationInFlight = false;
+  bool _translationRecheckPending = false;
   bool _tocTranslationInFlight = false;
   int _translationGeneration = 0;
   String? translationError;
@@ -108,6 +263,8 @@ class ReaderController extends ChangeNotifier {
   String get publicationLanguage => _style.publicationLanguage;
 
   ReaderStyle get style => _style;
+  String get statisticsBookId => _source?.book.id ?? '';
+  BookMetadata? get statisticsMetadata => _source?.book.metadata;
 
   bool _peekPreparing = false;
 
@@ -204,6 +361,16 @@ class ReaderController extends ChangeNotifier {
     var start = 0;
     if (locator != null && count > 0) {
       start = locator.position.clamp(0, count - 1);
+      final id = locator.source?.start.spine;
+      final identified = id == null ? -1 : _book.indexOfSpine(id);
+      final hrefIndex = _book.spine.indexWhere(
+        (s) => s.href == splitPackageFragment(locator.href).$1,
+      );
+      if (identified >= 0) {
+        start = identified;
+      } else if (hrefIndex >= 0) {
+        start = hrefIndex;
+      }
     }
 
     busy = true;
@@ -267,6 +434,7 @@ class ReaderController extends ChangeNotifier {
 
     final currentSection = sectionIndex;
     final progression = currentPage?.progression ?? 0.0;
+    final anchor = currentPage?.firstAnchor;
     final staleSections = Map<int, List<PageLayout>>.of(_sections);
     _sections.clear();
     _paginations.clear();
@@ -286,6 +454,8 @@ class ReaderController extends ChangeNotifier {
       sectionIndex = currentSection;
       pageIndex = pages.isEmpty
           ? 0
+          : anchor != null
+          ? _pageForAnchor(pages, anchor, progression)
           : (progression * (pages.length - 1)).round().clamp(
               0,
               pages.length - 1,
@@ -355,7 +525,12 @@ class ReaderController extends ChangeNotifier {
   }
 
   void _queueVisibleTranslation() {
-    if (!translationEnabled || _translationInFlight || busy) return;
+    if (!translationEnabled) return;
+    if (_translationInFlight || busy) {
+      _translationRecheckPending = true;
+      return;
+    }
+    _translationRecheckPending = false;
     final source = _translationSource;
     final settings = _activeAiSettings;
     final page = currentPage;
@@ -363,8 +538,10 @@ class ReaderController extends ChangeNotifier {
     final visibleNodes = <String>{};
     for (final item in page.items) {
       final nodeId = switch (item) {
-        TextPlacement(:final nodeId) => nodeId,
-        TableCellPlacement(:final nodeId) => nodeId,
+        TextPlacement(:final nodeId, :final source) =>
+          source?.start.node ?? nodeId,
+        TableCellPlacement(:final nodeId, :final source) =>
+          source?.start.node ?? nodeId,
         _ => '',
       };
       if (nodeId.isNotEmpty) visibleNodes.add(nodeId);
@@ -427,7 +604,10 @@ class ReaderController extends ChangeNotifier {
         if (generation == _translationGeneration) {
           _translationInFlight = false;
           notifyListeners();
-          if (succeeded && translationEnabled) {
+          if ((succeeded ||
+                  _translationRecheckPending ||
+                  sectionIndex != visibleSection) &&
+              translationEnabled) {
             _queueVisibleTranslation();
           }
         }
@@ -568,10 +748,14 @@ class ReaderController extends ChangeNotifier {
     for (var index = 0; index < pages.length; index++) {
       for (final item in pages[index].items) {
         if (item is TextPlacement &&
-            item.nodeId == anchor.node &&
-            item.textOffsetAtStart <= anchor.textOffset) {
+            item.source?.start.spine == anchor.spine &&
+            (item.source?.start.node ?? item.nodeId) == anchor.node &&
+            item.textOffsetAtStart + (item.source?.start.textOffset ?? 0) <=
+                anchor.textOffset) {
           match = index;
-        } else if (item is TableCellPlacement && item.nodeId == anchor.node) {
+        } else if (item is TableCellPlacement &&
+            item.source?.start.spine == anchor.spine &&
+            item.nodeId == anchor.node) {
           match = index;
         }
       }
@@ -611,76 +795,19 @@ class ReaderController extends ChangeNotifier {
 
   /// Chooses the page matching [locator] within an already-paginated section.
   ///
-  /// Anchor rule: map the saved `source.start` (node id + UTF-16 offset) to
-  /// the section-wide text offset, then take the LAST page whose first text
-  /// starts at or before that offset — i.e. the page whose text range
-  /// contains (or reaches) the anchor. Falls back to
-  /// `progression × page count` when the anchor node is gone.
+  /// Match stable section/node identity and Unicode-scalar offset against the
+  /// retained page slices. Use fractional progress only when no anchor matches.
   Future<int> _restorePageIndex(int section, LocatorV1 locator) async {
     final pages = _sections[section] ?? const [];
     if (pages.isEmpty) return 0;
-
     final anchor = locator.source?.start;
-    if (anchor != null) {
-      final parsed = await _source!.parseSection(section);
-      var textStart = 0.0;
-      double? targetOffset;
-      for (final block in parsed.blocks) {
-        switch (block) {
-          case TextBlock():
-            if (block.nodeId == anchor.node) {
-              targetOffset = textStart + anchor.textOffset;
-            }
-            textStart += block.plainText.length;
-          case TableBlock():
-            for (final row in block.rows) {
-              for (final cell in row.cells) {
-                if (cell.nodeId == anchor.node) {
-                  targetOffset = textStart + anchor.textOffset;
-                }
-                textStart += cell.plainText.length;
-              }
-            }
-          case FigureBlock():
-            for (final caption in block.captions) {
-              if (caption.nodeId == anchor.node) {
-                targetOffset = textStart + anchor.textOffset;
-              }
-              textStart += caption.plainText.length;
-            }
-          default:
-            continue;
-        }
-        if (targetOffset != null) break;
-      }
-      if (targetOffset != null) {
-        var match = 0;
-        for (var i = 0; i < pages.length; i++) {
-          double? pageStart;
-          for (final item in pages[i].items) {
-            switch (item) {
-              case TextPlacement():
-                pageStart = item.sectionTextOffset + item.textOffsetAtStart;
-              case TableCellPlacement():
-                pageStart = item.sectionTextOffset;
-              default:
-                continue;
-            }
-            break;
-          }
-          if (pageStart == null) continue;
-          if (pageStart <= targetOffset + 0.5) {
-            match = i;
-          } else {
-            break;
-          }
-        }
-        return match;
-      }
+    if (anchor != null && anchor.spine == _book.spine[section].id) {
+      return _pageForAnchor(pages, anchor, locator.progression);
     }
-
-    final maxIndex = pages.length - 1;
-    return (locator.progression * maxIndex).round().clamp(0, maxIndex);
+    return (locator.progression * (pages.length - 1)).round().clamp(
+      0,
+      pages.length - 1,
+    );
   }
 
   /// Relative offset for [peekPage]: -1 = previous page, +1 = next page.
@@ -1144,7 +1271,18 @@ class ReaderController extends ChangeNotifier {
     if (book.sectionCount == 0) return;
     final page = currentPage;
     final progression = page?.progression ?? 0.0;
-    final anchor = page?.firstAnchor;
+    final displayedAnchor = page?.firstAnchor;
+    // Translation has no character-level original alignment. Persist the
+    // canonical paragraph start, never a translated-text offset as original.
+    final anchor = displayedAnchor == null
+        ? null
+        : translationEnabled
+        ? SourceAnchor(
+            spine: displayedAnchor.spine,
+            node: displayedAnchor.node,
+            textOffset: 0,
+          )
+        : displayedAnchor;
     await progressStore.save(
       LocatorV1(
         publicationId: book.id,
@@ -1312,19 +1450,19 @@ void _visitBlockText(
   void Function(String nodeId, List<Inline> inlines) visit,
 ) {
   switch (block) {
-    case TextBlock(:final nodeId, :final inlines):
-      visit(nodeId, inlines);
+    case TextBlock(:final nodeId, :final inlines, :final source):
+      visit(source?.start.node ?? nodeId, inlines);
     case QuoteBlock(:final body, :final attribution):
       for (final text in [...body, ?attribution]) {
-        visit(text.nodeId, text.inlines);
+        visit(text.source?.start.node ?? text.nodeId, text.inlines);
       }
     case TableBlock(:final rows):
       for (final cell in rows.expand((row) => row.cells)) {
-        visit(cell.nodeId, cell.inlines);
+        visit(cell.source?.start.node ?? cell.nodeId, cell.inlines);
       }
     case FigureBlock(:final captions):
       for (final caption in captions) {
-        visit(caption.nodeId, caption.inlines);
+        visit(caption.source?.start.node ?? caption.nodeId, caption.inlines);
       }
     case NoteBlock(:final blocks):
       for (final child in blocks) {
@@ -1346,7 +1484,9 @@ String? _textForSourceNodeInBlocks(List<Block> blocks, String nodeId) {
   for (final block in blocks) {
     switch (block) {
       case TextBlock():
-        if (block.nodeId == nodeId) return _readableInlineText(block.inlines);
+        if ((block.source?.start.node ?? block.nodeId) == nodeId) {
+          return _readableInlineText(block.inlines);
+        }
       case TableBlock():
         for (final row in block.rows) {
           for (final cell in row.cells) {
@@ -1355,7 +1495,7 @@ String? _textForSourceNodeInBlocks(List<Block> blocks, String nodeId) {
         }
       case FigureBlock():
         for (final caption in block.captions) {
-          if (caption.nodeId == nodeId) {
+          if ((caption.source?.start.node ?? caption.nodeId) == nodeId) {
             return _readableInlineText(caption.inlines);
           }
         }

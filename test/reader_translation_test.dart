@@ -14,8 +14,8 @@ class _FootnoteSource implements BookSource {
     id: 'footnote-book',
     metadata: BookMetadata(title: 'Footnote book'),
     spine: [
-      SpineItem(index: 0, href: 'chapter.xhtml'),
-      SpineItem(index: 1, href: 'notes.xhtml'),
+      SpineItem(id: SpineItemId.generated(0), index: 0, href: 'chapter.xhtml'),
+      SpineItem(id: SpineItemId.generated(1), index: 1, href: 'notes.xhtml'),
     ],
   );
 
@@ -27,8 +27,16 @@ class _FootnoteSource implements BookSource {
 }
 
 SourceRange _range(int spine, String node, int length) => SourceRange(
-  start: SourceAnchor(spine: spine, node: node, textOffset: 0),
-  end: SourceAnchor(spine: spine, node: node, textOffset: length),
+  start: SourceAnchor(
+    spine: SpineItemId.generated(spine),
+    node: node,
+    textOffset: 0,
+  ),
+  end: SourceAnchor(
+    spine: SpineItemId.generated(spine),
+    node: node,
+    textOffset: length,
+  ),
 );
 
 TextBlock _text(int spine, String node, String text) => TextBlock(
@@ -65,8 +73,14 @@ void main() {
       ),
     );
     final source = _FootnoteSource([
-      Section(spineIndex: 0, href: 'chapter.xhtml', blocks: [reference]),
       Section(
+        id: SpineItemId.generated(0),
+        spineIndex: 0,
+        href: 'chapter.xhtml',
+        blocks: [reference],
+      ),
+      Section(
+        id: SpineItemId.generated(1),
         spineIndex: 1,
         href: 'notes.xhtml',
         blocks: [note],

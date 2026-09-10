@@ -67,76 +67,128 @@ Map<String, List<TocHeadingHint>> collectTocHeadingHints(
 /// Promotes TOC targets that are still plain paragraphs to semantic headings.
 /// Existing h1-h6 blocks retain their authored level and styling.
 Section promoteTocHeadings(Section section, List<TocHeadingHint> hints) {
-  if (hints.isEmpty || section.blocks.isEmpty) return section;
-  List<Block>? promotedBlocks;
-
-  for (final hint in hints) {
-    int? blockIndex;
-    final fragment = hint.fragment;
-    if (fragment != null) {
-      String? targetNode;
-      for (final anchor in section.anchors) {
-        if (anchor.fragment == fragment) {
-          targetNode = anchor.source.node;
-          break;
-        }
-      }
-      if (targetNode != null) {
-        final blocks = promotedBlocks ?? section.blocks;
-        for (var index = 0; index < blocks.length; index++) {
-          final block = blocks[index];
-          if (block is TextBlock && block.source?.start.node == targetNode) {
-            blockIndex = index;
-            break;
-          }
-        }
-      }
-    } else {
-      final blocks = promotedBlocks ?? section.blocks;
-      final searchLength = blocks.length < _pathOnlyHeadingSearchBlocks
-          ? blocks.length
-          : _pathOnlyHeadingSearchBlocks;
-      for (var index = 0; index < searchLength; index++) {
-        final block = blocks[index];
-        if (block is TextBlock &&
-            (block.kind == TextBlockKind.paragraph ||
-                block.kind == TextBlockKind.heading) &&
-            _normalizeHeadingText(block.plainText) == hint.label) {
-          blockIndex = index;
-          break;
-        }
-      }
-    }
-
-    if (blockIndex == null) continue;
-    final blocks = promotedBlocks ?? section.blocks;
-    final target = blocks[blockIndex];
-    if (target is! TextBlock ||
-        target.kind != TextBlockKind.paragraph ||
-        _normalizeHeadingText(target.plainText) != hint.label) {
-      continue;
-    }
-
-    promotedBlocks ??= List<Block>.of(section.blocks);
-    promotedBlocks[blockIndex] = TextBlock(
-      kind: TextBlockKind.heading,
-      headingLevel: hint.level,
-      listOrdered: target.listOrdered,
-      listOrdinal: target.listOrdinal,
-      listDepth: target.listDepth,
-      listMarkerVisible: target.listMarkerVisible,
-      inlines: target.inlines,
-      style: target.style,
-      source: target.source,
-      nodeId: target.nodeId,
-    );
+  final blocks = List<Block>.of(section.blocks);
+  bool eligible(Block block) =>
+      block is TextBlock &&
+      (block.kind == TextBlockKind.paragraph ||
+          block.kind == TextBlockKind.heading);
+  String key(String s) =>
+      s.toLowerCase().replaceAll(RegExp(r'[\s:.\-‐‑‒–—]'), '');
+  String? ordinal(String s) {
+    s = s
+        .toLowerCase()
+        .replaceFirst(RegExp(r'^(chapter|part|book)\s*'), '')
+        .replaceAll(RegExp(r'^[\s:.\-–—]+|[\s:.\-–—]+$'), '');
+    final words = s.split(RegExp(r'[\s-]+'));
+    const numbers = {
+      'one',
+      'two',
+      'three',
+      'four',
+      'five',
+      'six',
+      'seven',
+      'eight',
+      'nine',
+      'ten',
+      'eleven',
+      'twelve',
+      'thirteen',
+      'fourteen',
+      'fifteen',
+      'sixteen',
+      'seventeen',
+      'eighteen',
+      'nineteen',
+      'twenty',
+      'thirty',
+      'forty',
+      'fifty',
+      'sixty',
+      'seventy',
+      'eighty',
+      'ninety',
+      'hundred',
+      'thousand',
+    };
+    return s.isNotEmpty &&
+            (RegExp(r'^\d+$').hasMatch(s) ||
+                s.length <= 12 && RegExp(r'^[ivxlcdm]+$').hasMatch(s) ||
+                words.every(numbers.contains))
+        ? key(s)
+        : null;
   }
 
-  if (promotedBlocks == null) return section;
+  TextBlock promote(TextBlock b, int level, bool isOrdinal) => TextBlock(
+    kind: TextBlockKind.heading,
+    headingLevel: level,
+    headingOrdinal: isOrdinal,
+    inlines: b.inlines,
+    style: b.style,
+    source: b.source,
+    nodeId: b.nodeId,
+  );
+  for (final hint in hints) {
+    final anchor = section.anchors
+        .where((a) => a.fragment == hint.fragment)
+        .firstOrNull;
+    final anchored = anchor == null
+        ? -1
+        : blocks.indexWhere(
+            (b) => b is TextBlock && b.source?.start.node == anchor.source.node,
+          );
+    final start = anchored >= 0 ? (anchored - 1).clamp(0, blocks.length) : 0;
+    final end = anchored >= 0
+        ? (anchored + 2).clamp(0, blocks.length)
+        : blocks.length.clamp(0, _pathOnlyHeadingSearchBlocks);
+    final matches = <(int, bool)>[];
+    for (var i = start; i < end; i++) {
+      if (!eligible(blocks[i])) continue;
+      final text = (blocks[i] as TextBlock).plainText;
+      if (key(text) == key(hint.label)) {
+        matches.add((i, false));
+        continue;
+      }
+      if (ordinal(text) == null ||
+          i + 1 >= blocks.length ||
+          !eligible(blocks[i + 1])) {
+        continue;
+      }
+      final title = (blocks[i + 1] as TextBlock).plainText;
+      final strippedHint = hint.label.replaceFirst(
+        RegExp(r'^(chapter|part|book)\s*', caseSensitive: false),
+        '',
+      );
+      final split = RegExp(
+        r'^([^\s:.\-–—]+)[\s:.\-–—]+(.+)$',
+      ).firstMatch(strippedHint);
+      if (key('$text $title') == key(hint.label) ||
+          split != null &&
+              ordinal(text) == key(split.group(1)!) &&
+              key(title) == key(split.group(2)!)) {
+        matches.add((i, true));
+      }
+    }
+    if (matches.length != 1) continue;
+    final (i, split) = matches.single;
+    if (split) {
+      blocks[i] = promote(blocks[i] as TextBlock, hint.level, true);
+      blocks[i + 1] = promote(blocks[i + 1] as TextBlock, hint.level, false);
+    } else if ((blocks[i] as TextBlock).kind == TextBlockKind.paragraph) {
+      blocks[i] = promote(blocks[i] as TextBlock, hint.level, false);
+    }
+  }
+  if (List.generate(
+    blocks.length,
+    (i) => identical(blocks[i], section.blocks[i]),
+  ).every((same) => same)) {
+    return section;
+  }
   return Section(
+    id: section.id,
     spineIndex: section.spineIndex,
     href: section.href,
-    blocks: promotedBlocks,
+    blocks: blocks,
     anchors: section.anchors,
   );
 }

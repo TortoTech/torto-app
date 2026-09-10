@@ -1,0 +1,20 @@
+0	chapter	n1	43686170746572204f6e65	Heading(1)
+0	chapter	n2	416c706861c2a0c2a062657461e28085f09f9880656d706861736973426f6f6b766f6963652e	Paragraph
+0	chapter	n3	416e20657069677261706820626f64792e	Blockquote
+0	chapter	n4	e28094417574686f72	QuoteAttribution
+0	chapter	n5	51756f74652066697273742e	Blockquote
+0	chapter	n6	51756f7465207365636f6e642e	Blockquote
+0	chapter	n7	4174747269627574696f6e	QuoteAttribution
+0	chapter	n8	4669727374206974656d636f6e74696e756564	ListItem { ordered: true, ordinal: 1, depth: 0, marker_visible: true }
+0	chapter	n9	4e6573746564206974656d	ListItem { ordered: false, ordinal: 1, depth: 1, marker_visible: true }
+0	chapter	n10	5365636f6e64206974656d	ListItem { ordered: true, ordinal: 2, depth: 0, marker_visible: true }
+0	chapter	n11	5465726d	DefinitionTerm { depth: 0 }
+0	chapter	n12	446566696e6974696f6e636f6e74696e75656420656e642e	DefinitionDescription { depth: 0 }
+0	chapter	n14	48656164696e67	Paragraph
+0	chapter	n15	43656c6c206f6e650a43656c6c2074776f	Paragraph
+0	chapter	n17	43617074696f6e2e	Caption
+0	chapter	n18	496e6c696e652020696d6167652e	Paragraph
+0	chapter	n21	2a2a2a	Paragraph
+0	chapter	n22	70726520207370616365730a6c696e652074776f	Preformatted
+0	chapter	n23	5265666572656e6365312e	Paragraph
+0	chapter	n24	4e6f746520626f64792e	FootnoteDefinition

@@ -6,6 +6,7 @@ import '../sync/cloud_sync_controller.dart';
 import 'about_page.dart';
 import 'ai_providers_page.dart';
 import 'app_preferences.dart';
+import 'reading_settings_page.dart';
 import 'system_settings_page.dart';
 import 'translation_settings_page.dart';
 
@@ -31,6 +32,22 @@ class SettingsPage extends StatelessWidget {
             ),
             trailing: const Icon(Icons.chevron_right),
             onTap: () => _openSystem(context),
+          ),
+          ListTile(
+            leading: const Icon(Icons.font_download_outlined),
+            title: Text(l10n.text('排版', 'Typesetting')),
+            subtitle: Text(
+              l10n.text(
+                '正文样式、语言字体与字号',
+                'Content style, language fonts and size',
+              ),
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const ReadingSettingsPage(),
+              ),
+            ),
           ),
           _section(context, l10n.text('智能功能', 'Intelligence')),
           ListTile(

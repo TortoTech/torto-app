@@ -1,4 +1,5 @@
 import 'dart:async';
+import '../statistics/statistics_store.dart';
 
 import 'package:flutter/foundation.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -105,6 +106,11 @@ class CloudSyncController extends ChangeNotifier {
           notifyListeners();
         },
       ).sync();
+      progress = const SyncProgress('Syncing reading statistics…');
+      notifyListeners();
+      final statistics = await ReadingStatisticsStore.instance();
+      await statistics.registerBooks(await libraryStore.list());
+      await statistics.sync(client);
       status = CloudSyncStatus.success;
       progress = const SyncProgress('Sync complete', 1);
       notifyListeners();

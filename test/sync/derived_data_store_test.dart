@@ -59,8 +59,8 @@ void main() {
         id: bookId,
         metadata: const BookMetadata(),
         spine: const [
-          SpineItem(index: 0, href: 'page:0'),
-          SpineItem(index: 1, href: 'page:1'),
+          SpineItem(id: SpineItemId.generated(0), index: 0, href: 'page:0'),
+          SpineItem(id: SpineItemId.generated(1), index: 1, href: 'page:1'),
         ],
       );
 

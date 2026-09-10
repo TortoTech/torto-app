@@ -28,7 +28,11 @@ class ProgressStore {
     final raw = prefs.getString('$_keyPrefix$publicationId');
     if (raw == null) return null;
     try {
-      return LocatorV1.fromJson(jsonDecode(raw) as Map<String, dynamic>);
+      final json = jsonDecode(raw) as Map<String, dynamic>;
+      // Older local anchors used a different node/whitespace contract. Keep
+      // their chapter and fractional position instead of trusting a stale node.
+      if (json['source_revision'] != 3) json.remove('source');
+      return LocatorV1.fromJson(json);
     } catch (_) {
       return null;
     }
@@ -38,7 +42,7 @@ class ProgressStore {
     final prefs = await _prefs;
     await prefs.setString(
       '$_keyPrefix${locator.publicationId}',
-      jsonEncode(locator.toJson()),
+      jsonEncode({...locator.toJson(), 'source_revision': 3}),
     );
     await markActivity(locator.publicationId, activityTimeMs: activityTimeMs);
   }
@@ -73,9 +77,9 @@ class ProgressStore {
       final raw = prefs.getString(key);
       if (raw == null) continue;
       try {
-        final locator = LocatorV1.fromJson(
-          jsonDecode(raw) as Map<String, dynamic>,
-        );
+        final json = jsonDecode(raw) as Map<String, dynamic>;
+        if (json['source_revision'] != 3) json.remove('source');
+        final locator = LocatorV1.fromJson(json);
         result[locator.publicationId] = locator;
       } catch (_) {
         // Ignore a single damaged entry without losing the remaining books.

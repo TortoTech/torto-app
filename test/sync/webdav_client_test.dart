@@ -27,7 +27,7 @@ void main() {
         client.root.toString(),
         'https://dav.example.test/account/Rebook/v1/',
       );
-      expect(requests, hasLength(8));
+      expect(requests, hasLength(9));
       expect(requests.first.method, 'MKCOL');
       expect(
         requests.first.url.toString(),

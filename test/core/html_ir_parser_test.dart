@@ -428,7 +428,7 @@ void main() {
         '<ul><li><p>first paragraph</p><p>second paragraph</p></li></ul>',
       );
       final item = textBlock(section, 0);
-      expect(item.plainText, 'first paragraph\nsecond paragraph');
+      expect(item.plainText, 'first paragraphsecond paragraph');
       expect(item.inlines.whereType<BreakInline>(), hasLength(1));
     });
 
@@ -600,6 +600,8 @@ void main() {
       final text = heading.inlines.last as TextRun;
       expect(image.image.href, 'OPS/images/chapter-icon.jpg');
       expect(image.presentation, isTrue);
+      expect(image.intrinsicSizing, isFalse);
+      expect(image.verticalAlign, InlineImageAlignment.middle);
       expect(image.sizeScale, text.style.sizeScale);
       expect(text.text, 'Chapter title');
       expect(section.blocks.whereType<ImageBlock>(), isEmpty);
@@ -607,13 +609,48 @@ void main() {
 
     test('meaningful heading images remain block-level illustrations', () {
       final section = parseSection(
-        '<h2><img alt="Diagram" style="height:1em" '
+        '<h2><img alt="Diagram" style="display:block;height:1em" '
         'src="../images/diagram.jpg"/>Chapter title</h2>',
       );
 
       expect(section.blocks, hasLength(2));
       expect(section.blocks.first, isA<TextBlock>());
       expect(section.blocks.last, isA<ImageBlock>());
+    });
+
+    test(
+      'keeps formula rasters inline from text context rather than class',
+      () {
+        final section = parseSection('''
+        <style>img.block { vertical-align: middle; }</style>
+        <p>Compare <img alt="Image" class="block" src="../images/pv.jpg"/>
+          versus <span><img alt="Image" class="block"
+          src="../images/nv.jpg"/></span> today.</p>
+      ''');
+
+        final paragraph = section.blocks.single as TextBlock;
+        final images = paragraph.inlines.whereType<InlineImageRun>().toList();
+        expect(images, hasLength(2));
+        expect(images.every((image) => image.intrinsicSizing), isTrue);
+        expect(
+          images.every(
+            (image) => image.verticalAlign == InlineImageAlignment.middle,
+          ),
+          isTrue,
+        );
+        expect(images.first.image.alt, 'Image');
+        expect(images.first.image.href, 'OPS/images/pv.jpg');
+        expect(images.last.image.href, 'OPS/images/nv.jpg');
+      },
+    );
+
+    test('keeps image-only equations as block images', () {
+      final section = parseSection(
+        '<p><img alt="Equation" height="17" width="255" '
+        'src="../images/equation.jpg"/></p>',
+      );
+      expect(section.blocks, hasLength(1));
+      expect(section.blocks.single, isA<ImageBlock>());
     });
 
     test('cite em and i keep distinct semantic roles', () {
@@ -658,6 +695,20 @@ void main() {
       expect(byText('sd').style.strikethrough, isTrue);
       expect(byText('2').style.baseline, TextBaselineShift.superscript);
       expect(byText('n').style.baseline, TextBaselineShift.subscript);
+    });
+
+    test('preserves inherited CSS hyphenation policy', () {
+      final section = parseSection('''
+        <p style="hyphens:none">disabled
+          <span style="hyphens:manual">manual</span>
+          <span style="hyphens:auto">automatic</span></p>
+      ''');
+      final runs = textBlock(section, 0).inlines.whereType<TextRun>().toList();
+      TextRun containing(String value) =>
+          runs.firstWhere((run) => run.text.contains(value));
+      expect(containing('disabled').style.hyphenation, HyphenationMode.none);
+      expect(containing('manual').style.hyphenation, HyphenationMode.manual);
+      expect(containing('automatic').style.hyphenation, HyphenationMode.auto);
     });
 
     test('links resolve root-relative and keep fragments', () {
@@ -734,7 +785,7 @@ void main() {
       expect(reference.text, '译');
       expect(reference.style.baseline, TextBaselineShift.superscript);
       expect(reference.link, 'OPS/text/ch1.xhtml#footnote-18-20');
-      expect(paragraph.plainText, contains('网站译以及'));
+      expect(paragraph.plainText, contains('网站\u00a0译以及'));
     });
 
     test('classifies legacy reciprocal footnote links', () {
@@ -974,33 +1025,52 @@ void main() {
       expect(ids, ['n0', 'n1', 'n2', 'image']);
     });
 
-    test('source ranges use UTF-16 offsets of normalized plainText', () {
-      final section = parseSection('<p>数学 🎓!</p>', spineIndex: 7);
-      final block = textBlock(section, 0);
-      expect(block.plainText, '数学 🎓!');
-      expect(block.source, isNotNull);
-      expect(
-        block.source!.start,
-        const SourceAnchor(spine: 7, node: 'n0', textOffset: 0),
-      );
-      expect(
-        block.source!.end,
-        SourceAnchor(spine: 7, node: 'n0', textOffset: block.plainText.length),
-      );
-      // 数学 (2) + space (1) + 🎓 (2 UTF-16 units) + ! (1)
-      expect(block.source!.end.textOffset, 6);
-    });
+    test(
+      'source ranges use Unicode scalar offsets of normalized plainText',
+      () {
+        final section = parseSection('<p>数学 🎓!</p>', spineIndex: 7);
+        final block = textBlock(section, 0);
+        expect(block.plainText, '数学 🎓!');
+        expect(block.source, isNotNull);
+        expect(
+          block.source!.start,
+          const SourceAnchor(
+            spine: SpineItemId.generated(7),
+            node: 'n0',
+            textOffset: 0,
+          ),
+        );
+        expect(
+          block.source!.end,
+          SourceAnchor(
+            spine: SpineItemId.generated(7),
+            node: 'n0',
+            textOffset: block.plainText.runes.length,
+          ),
+        );
+        // 数学 (2) + space (1) + 🎓 (1 scalar) + ! (1)
+        expect(block.source!.end.textOffset, 5);
+      },
+    );
 
     test('image blocks carry a zero-length source range', () {
       final section = parseSection('<img src="i.png"/>', spineIndex: 3);
       final image = section.blocks.single as ImageBlock;
       expect(
         image.source!.start,
-        const SourceAnchor(spine: 3, node: 'n0', textOffset: 0),
+        const SourceAnchor(
+          spine: SpineItemId.generated(3),
+          node: 'n0',
+          textOffset: 0,
+        ),
       );
       expect(
         image.source!.end,
-        const SourceAnchor(spine: 3, node: 'n0', textOffset: 0),
+        const SourceAnchor(
+          spine: SpineItemId.generated(3),
+          node: 'n0',
+          textOffset: 0,
+        ),
       );
     });
   });
@@ -1014,7 +1084,7 @@ void main() {
     test('HTML named entities are replaced', () {
       final section = parseSection('<p>a&nbsp;b &mdash; c</p>');
       // nbsp counts as whitespace and collapses to a plain space.
-      expect(textBlock(section, 0).plainText, 'a b — c');
+      expect(textBlock(section, 0).plainText, 'a\u00a0b — c');
     });
 
     test('UTF-8 BOM and xml declaration are handled', () {

@@ -27,7 +27,10 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('关于 Torto'), findsOneWidget);
 
-    await tester.tap(find.text('关于 Torto'));
+    final about = find.byIcon(Icons.info_outline);
+    await tester.ensureVisible(about);
+    await tester.pumpAndSettle();
+    await tester.tap(about);
     await tester.pumpAndSettle();
     expect(find.text('Torto'), findsOneWidget);
     expect(find.text('版本 1.0.0 (1)'), findsOneWidget);

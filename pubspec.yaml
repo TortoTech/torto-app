@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.2.0+2008
+version: 0.5.0+5000
 
 environment:
   sdk: ^3.11.3
@@ -105,6 +105,16 @@ flutter:
     - assets/hyphenation/hyph_en_GB.dic
     - assets/hyphenation/README_hyph_en_US.txt
     - assets/hyphenation/README_hyph_en_GB.txt
+
+  fonts:
+    - family: Literata
+      fonts:
+        - asset: assets/fonts/Literata-opsz-wght.ttf
+        - asset: assets/fonts/Literata-Italic-opsz-wght.ttf
+          style: italic
+    - family: LXGW WenKai GB Screen
+      fonts:
+        - asset: assets/fonts/LXGWWenKaiGBScreen.ttf
 
   # To add assets to your application, add an assets section, like this:
   # assets:

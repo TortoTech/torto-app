@@ -33,14 +33,14 @@ void main() {
     // Must be well-formed XML for the strict IR parser.
     final document = tryParseXmlTolerant(xhtml);
     expect(document, isNotNull);
-    final paragraph = document!.descendants
-        .whereType<XmlElement>()
-        .firstWhere((element) => element.name.local == 'p');
+    final paragraph = document!.descendants.whereType<XmlElement>().firstWhere(
+      (element) => element.name.local == 'p',
+    );
     expect(paragraph.innerText, contains('\u00A0'));
     expect(
       document.descendants.whereType<XmlElement>().any(
-            (element) => element.name.local == 'img',
-          ),
+        (element) => element.name.local == 'img',
+      ),
       isTrue,
     );
   });
@@ -78,9 +78,9 @@ void main() {
     final directory = Directory('../torto/test-data');
     if (!directory.existsSync()) return;
     final chmFile = directory.listSync().firstWhere(
-          (entity) => entity.path.toLowerCase().endsWith('.chm'),
-          orElse: () => throw StateError('no fixture'),
-        );
+      (entity) => entity.path.toLowerCase().endsWith('.chm'),
+      orElse: () => throw StateError('no fixture'),
+    );
     final source = await openChm(
       chmFile is File ? chmFile.readAsBytesSync() : Uint8List(0),
       'fixture.chm',
@@ -95,19 +95,56 @@ void main() {
     expect(source.book.toc.length, greaterThan(5));
     expect(source.book.coverHref, isNotNull);
 
+    Iterable<String> imageHrefs(Block block) sync* {
+      Iterable<String> inlineHrefs(Iterable<Inline> inlines) => inlines
+          .whereType<InlineImageRun>()
+          .map((inline) => inline.image.href);
+
+      switch (block) {
+        case TextBlock(:final inlines):
+          yield* inlineHrefs(inlines);
+        case QuoteBlock(:final body, :final attribution):
+          for (final paragraph in body) {
+            yield* inlineHrefs(paragraph.inlines);
+          }
+          if (attribution != null) {
+            yield* inlineHrefs(attribution.inlines);
+          }
+        case NoteBlock(:final blocks):
+          for (final child in blocks) {
+            yield* imageHrefs(child);
+          }
+        case TableBlock(:final rows):
+          for (final row in rows) {
+            for (final cell in row.cells) {
+              yield* inlineHrefs(cell.inlines);
+            }
+          }
+        case ImageBlock(:final href):
+          yield href;
+        case FigureBlock(:final images, :final captions):
+          yield* images.map((image) => image.href);
+          for (final caption in captions) {
+            yield* inlineHrefs(caption.inlines);
+          }
+        case SeparatorBlock(:final image):
+          if (image != null) yield image.href;
+        case PageBreakBlock() || LineBreakBlock():
+          break;
+      }
+    }
+
     var imageCount = 0;
     for (var index = 0; index < source.book.spine.length; index++) {
       final section = await source.parseSection(index);
       expect(section.blocks, isNotEmpty, reason: 'empty CHM section $index');
-      for (final block in section.blocks) {
-        if (block is ImageBlock) {
-          expect(
-            await source.resource(block.href),
-            isNotNull,
-            reason: 'missing CHM image ${block.href}',
-          );
-          imageCount++;
-        }
+      for (final href in section.blocks.expand(imageHrefs)) {
+        expect(
+          await source.resource(href),
+          isNotNull,
+          reason: 'missing CHM image $href',
+        );
+        imageCount++;
       }
     }
     expect(imageCount, greaterThan(10));

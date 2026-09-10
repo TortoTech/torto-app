@@ -15,7 +15,11 @@ void main() {
     final prefs = await SharedPreferences.getInstance();
     final store = ProgressStore(prefs);
 
-    const anchor = SourceAnchor(spine: 3, node: 'n7', textOffset: 42);
+    const anchor = SourceAnchor(
+      spine: SpineItemId.generated(3),
+      node: 'n7',
+      textOffset: 42,
+    );
     const locator = LocatorV1(
       publicationId: 'pub-1',
       href: 'OEBPS/ch3.xhtml',

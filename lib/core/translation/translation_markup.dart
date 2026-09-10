@@ -224,7 +224,11 @@ class TranslationMarkupCodec {
         .map((run) => run.style)
         .firstOrNull;
     final style = fallback ?? TextStyle.plain;
-    return TextStyle(sizeScale: style.sizeScale, color: style.color);
+    return TextStyle(
+      sizeScale: style.sizeScale,
+      color: style.color,
+      hyphenation: style.hyphenation,
+    );
   }
 
   static TextStyle _applyTag(TextStyle style, String tag) => TextStyle(
@@ -251,6 +255,7 @@ class TranslationMarkupCodec {
     inlineRole: tag == 'inlinefootnote'
         ? InlineRole.footnote
         : style.inlineRole,
+    hyphenation: style.hyphenation,
   );
 
   static void _appendText(
@@ -268,6 +273,9 @@ class TranslationMarkupCodec {
       output.add(
         TextRun(
           part,
+          displayWritingSystem: BookMetadata(
+            languages: [language],
+          ).writingSystem,
           style: style,
           link: _matchingLink(part, style, original),
           language: language,

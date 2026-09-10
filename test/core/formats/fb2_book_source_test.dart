@@ -11,7 +11,8 @@ const _coverPngBase64 =
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk'
     '+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 
-const _fb2 = '''<?xml version="1.0" encoding="UTF-8"?>
+const _fb2 =
+    '''<?xml version="1.0" encoding="UTF-8"?>
 <FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink">
   <description><title-info>
     <book-title>FB2 测试书</book-title>
@@ -31,10 +32,10 @@ const _fb2 = '''<?xml version="1.0" encoding="UTF-8"?>
 Uint8List _fb2Bytes() => Uint8List.fromList(utf8.encode(_fb2));
 
 Uint8List _fbzBytes() => ZipEncoder().encodeBytes(
-      Archive()
-        ..addFile(ArchiveFile.string('book.fb2', _fb2))
-        ..addFile(ArchiveFile.string('readme.txt', 'not a book')),
-    );
+  Archive()
+    ..addFile(ArchiveFile.string('book.fb2', _fb2))
+    ..addFile(ArchiveFile.string('readme.txt', 'not a book')),
+);
 
 void main() {
   test('converts metadata, cover, and sections', () async {
@@ -106,7 +107,9 @@ void main() {
       throwsFormatException,
     );
     final empty = Uint8List.fromList(
-      utf8.encode('<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0"/>'),
+      utf8.encode(
+        '<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0"/>',
+      ),
     );
     expect(() => openFb2(empty, 'x.fb2'), throwsFormatException);
   });

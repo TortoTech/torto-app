@@ -137,7 +137,7 @@ class StoredProgress {
   factory StoredProgress.fromJson(Map<String, dynamic> json) {
     final locator = Map<String, dynamic>.from(
       json['locator'] as Map<String, dynamic>,
-    )..remove('source');
+    );
     return StoredProgress(
       locator: LocatorV1.fromJson(locator),
       updatedAt: HybridTimestamp.fromJson(
@@ -152,7 +152,7 @@ enum VectorClockOrder { equal, before, after, concurrent }
 class AnnotationState {
   final String id;
   final String bookId;
-  final List<Map<String, dynamic>> ranges;
+  final List<SourceRange> ranges;
   final String quote;
   final String? note;
   final int createdAt;
@@ -195,7 +195,7 @@ class AnnotationState {
   Map<String, Object?> toJson() => {
     'id': id,
     'book_id': bookId,
-    'ranges': ranges,
+    'ranges': ranges.map((range) => range.toJson()).toList(),
     'quote': quote,
     if (note != null) 'note': note,
     'created_at': createdAt,
@@ -219,7 +219,7 @@ class AnnotationState {
       bookId: json['book_id'] as String,
       ranges: [
         for (final range in rangesValue)
-          Map<String, dynamic>.from(range as Map),
+          SourceRange.fromJson(Map<String, dynamic>.from(range as Map)),
       ],
       quote: json['quote'] as String? ?? '',
       note: json['note'] as String?,
@@ -251,9 +251,15 @@ class AnnotationState {
       throw const FormatException('Invalid annotation identity.');
     }
     for (final range in ranges) {
-      final start = range['start'];
-      final end = range['end'];
-      if (start is! Map || end is! Map) {
+      final start = range.start;
+      final end = range.end;
+      if (start.node.isEmpty ||
+          end.node.isEmpty ||
+          start.textOffset < 0 ||
+          end.textOffset < 0 ||
+          start.spine == end.spine &&
+              start.node == end.node &&
+              end.textOffset < start.textOffset) {
         throw const FormatException('Invalid annotation source range.');
       }
     }
@@ -283,8 +289,7 @@ String annotationConflictId(AnnotationState annotation) =>
     '${annotation.id}~conflict~${annotation.originDevice}~'
     '${annotation.updatedAt.wallTimeMs}-${annotation.updatedAt.counter}';
 
-/// Source anchors are deliberately local-only until the mobile Reading IR and
-/// desktop Unicode-scalar anchor formats are identical.
+/// Core anchors use the same stable section IDs and Unicode scalars as desktop.
 Map<String, Object?> cloudLocatorJson(LocatorV1 locator) => {
   'version': LocatorV1.currentVersion,
   'publication_id': locator.publicationId,
@@ -292,6 +297,7 @@ Map<String, Object?> cloudLocatorJson(LocatorV1 locator) => {
   'position': locator.position,
   'progression': locator.progression,
   'total_progression': locator.totalProgression,
+  if (locator.source != null) 'source': locator.source!.toJson(),
 };
 
 Map<String, Object?> _cloudHrefJson(String href) {

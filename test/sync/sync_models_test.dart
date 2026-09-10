@@ -26,8 +26,12 @@ void main() {
     expect(lookalike.cstCloudCompatibility, isFalse);
   });
 
-  test('cloud locator deliberately omits incompatible source anchors', () {
-    const anchor = SourceAnchor(spine: 2, node: 'n4', textOffset: 7);
+  test('cloud locator preserves canonical source anchors', () {
+    const anchor = SourceAnchor(
+      spine: SpineItemId.generated(2),
+      node: 'n4',
+      textOffset: 7,
+    );
     const locator = LocatorV1(
       publicationId:
           'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
@@ -42,7 +46,7 @@ void main() {
 
     expect(json['href'], {'path': 'chapter.xhtml'});
     expect(json['position'], 2);
-    expect(json, isNot(contains('source')));
+    expect(json['source'], locator.source!.toJson());
   });
 
   test('hybrid timestamp uses wall time, counter, then device id', () {
@@ -62,7 +66,7 @@ void main() {
     expect(laterCounter.compareTo(laterDevice), lessThan(0));
   });
 
-  test('desktop source anchors are ignored while reading remote progress', () {
+  test('desktop source anchors are retained while reading remote progress', () {
     final value = StoredProgress.fromJson({
       'locator': {
         'version': 1,
@@ -77,6 +81,11 @@ void main() {
             'node': 'desktop-node',
             'text_offset': 1,
           },
+          'end': {
+            'spine': 'chapter-id',
+            'node': 'desktop-node',
+            'text_offset': 1,
+          },
         },
       },
       'updated_at': {'wall_time_ms': 100, 'counter': 0, 'device_id': 'desktop'},
@@ -84,7 +93,8 @@ void main() {
 
     expect(value.locator.href, 'c1.xhtml#reading-point');
     expect(value.locator.position, 1);
-    expect(value.locator.source, isNull);
+    expect(value.locator.source!.start.spine, const SpineItemId('chapter-id'));
+    expect(value.locator.source!.start.textOffset, 1);
   });
 
   test('legacy string locator href is rejected', () {

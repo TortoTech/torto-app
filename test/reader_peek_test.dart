@@ -8,10 +8,10 @@ import 'package:torto/core/layout/layout_types.dart';
 
 void main() {
   group('ReaderController peek', () {
-    test('peekPage/canPeek resolve pages across section boundaries',
-        () async {
+    test('peekPage/canPeek resolve pages across section boundaries', () async {
       final file = File(
-          '../torto/test-data/Structured Writing Rhetoric and Process.epub');
+        '../torto/test-data/Structured Writing Rhetoric and Process.epub',
+      );
       if (!file.existsSync()) {
         // ignore: avoid_print
         print('SKIP: ${file.path} not found');
@@ -19,8 +19,8 @@ void main() {
       }
       SharedPreferences.setMockInitialValues({});
       final controller = ReaderController(
-          progressStore:
-              ProgressStore(await SharedPreferences.getInstance()));
+        progressStore: ProgressStore(await SharedPreferences.getInstance()),
+      );
       addTearDown(controller.dispose);
 
       const viewport = LayoutViewport(width: 411, height: 914);

@@ -15,7 +15,7 @@ Uint8List _cbzBytes() {
       ArchiveFile.string(
         'ComicInfo.xml',
         '<ComicInfo><Title>测试漫画</Title><Writer>甲, 乙;丙</Writer>'
-        '<LanguageISO>zh-CN</LanguageISO></ComicInfo>',
+            '<LanguageISO>zh-CN</LanguageISO></ComicInfo>',
       ),
     )
     ..addFile(ArchiveFile.string('__macosx/junk.png', 'resource fork'));
@@ -48,12 +48,8 @@ void main() {
   });
 
   test('falls back to the file name without ComicInfo', () async {
-    final archive = Archive()
-      ..addFile(ArchiveFile.string('a.bmp', 'x'));
-    final source = await openCbz(
-      ZipEncoder().encodeBytes(archive),
-      '我的漫画.cbz',
-    );
+    final archive = Archive()..addFile(ArchiveFile.string('a.bmp', 'x'));
+    final source = await openCbz(ZipEncoder().encodeBytes(archive), '我的漫画.cbz');
     expect(source.book.metadata.title, '我的漫画');
     expect(source.book.toc.first.label, 'a.bmp');
   });

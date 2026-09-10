@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:torto/app/reader/footnote_sheet.dart';
 import 'package:torto/core/linebreak/english_hyphenator.dart';
@@ -22,6 +23,70 @@ class _RecordingHyphenator implements ParagraphHyphenator {
 }
 
 void main() {
+  testWidgets(
+    'mixed footnotes keep measured widths with real fonts and text scaling',
+    (tester) async {
+      final latin = FontLoader('Literata')
+        ..addFont(rootBundle.load('assets/fonts/Literata-opsz-wght.ttf'));
+      final cjk = FontLoader('LXGW WenKai GB Screen')
+        ..addFont(rootBundle.load('assets/fonts/LXGWWenKaiGBScreen.ttf'));
+      await latin.load();
+      await cjk.load();
+      const text =
+          '比较心理学家哈里·哈洛（Harry Harlow）进行了一项实验，研究了语言与行为之间的关系。Office affinity and efficient scientific observations help explain this relationship.';
+      for (final width in [280.0, 380.0]) {
+        for (final scale in [1.0, 1.4]) {
+          await tester.pumpWidget(
+            MaterialApp(
+              home: Scaffold(
+                body: MediaQuery(
+                  data: MediaQueryData(textScaler: TextScaler.linear(scale)),
+                  child: SizedBox(
+                    width: width,
+                    child: OptimizedJustifiedText(
+                      text,
+                      style: const TextStyle(
+                        fontFamily: 'Literata',
+                        fontFamilyFallback: ['LXGW WenKai GB Screen'],
+                        fontSize: 17,
+                        height: 1.55,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          );
+          await tester.pump();
+          final widget = tester
+              .widgetList<Text>(
+                find.descendant(
+                  of: find.byType(OptimizedJustifiedText),
+                  matching: find.byType(Text),
+                ),
+              )
+              .single;
+          expect(widget.textSpan, isNotNull);
+          final painter = TextPainter(
+            text: widget.textSpan,
+            textDirection: TextDirection.ltr,
+            textScaler: TextScaler.linear(scale),
+          )..layout(maxWidth: 1000000);
+          final metrics = painter.computeLineMetrics();
+          expect(metrics.length, greaterThan(1));
+          for (final line in metrics.take(metrics.length - 1)) {
+            expect(
+              line.width,
+              closeTo(width, 2),
+              reason: 'width=$width scale=$scale',
+            );
+          }
+          expect(metrics.last.width, lessThanOrEqualTo(width + 1));
+          painter.dispose();
+        }
+      }
+    },
+  );
   testWidgets('footnote bottom sheet fills the window width', (tester) async {
     await tester.binding.setSurfaceSize(const Size(420, 800));
     addTearDown(() => tester.binding.setSurfaceSize(null));

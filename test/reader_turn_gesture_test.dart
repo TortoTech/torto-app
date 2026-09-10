@@ -6,9 +6,11 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:torto/app/reader/reader_controller.dart';
+import 'package:torto/app/reader/text_selection_layer.dart';
 import 'package:torto/app/reader/reader_page.dart';
 import 'package:torto/app/reader/reader_preferences_store.dart';
 import 'package:torto/app/settings/app_preferences.dart';
+import 'package:torto/core/ir/book.dart';
 import 'package:torto/core/layout/layout_types.dart';
 import 'package:torto/core/render/page_painter.dart';
 
@@ -80,6 +82,113 @@ class _FakeReaderController extends ReaderController {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  testWidgets(
+    'translation locks paragraph selection and restores the normal preference',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({'reader_selection_mode': 'word'});
+      final controller = _FakeReaderController()..translationEnabled = true;
+      await tester.binding.setSurfaceSize(const Size(411, 914));
+      addTearDown(() async {
+        await tester.pumpWidget(const SizedBox());
+        controller.dispose();
+        await tester.binding.setSurfaceSize(null);
+      });
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ReaderPage(file: File('unused.epub'), controller: controller),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final layer = tester.widget<ReaderSelectionLayer>(
+        find.byType(ReaderSelectionLayer),
+      );
+      expect(layer.mode, ReaderSelectionMode.paragraph);
+      expect(layer.canAnnotate, isTrue);
+      expect(layer.wholeParagraphMarks, isTrue);
+      await tester.tapAt(const Offset(205, 450));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<IconButton>(
+              find.byKey(const Key('reader-selection-button')),
+            )
+            .onPressed,
+        isNull,
+      );
+      controller.translationEnabled = false;
+      controller.notifyListeners();
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<ReaderSelectionLayer>(find.byType(ReaderSelectionLayer))
+            .mode,
+        ReaderSelectionMode.word,
+      );
+    },
+  );
+  testWidgets(
+    'completion action belongs to the end screen after the last page',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      final controller = _FakeReaderController()..pageIndex = 4;
+      await tester.binding.setSurfaceSize(const Size(411, 914));
+      addTearDown(() async {
+        await tester.pumpWidget(const SizedBox());
+        controller.dispose();
+        await tester.binding.setSurfaceSize(null);
+      });
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ReaderPage(file: File('unused.epub'), controller: controller),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('book-end-finish-button')), findsNothing);
+      await tester.tapAt(const Offset(350, 450));
+      await tester.pumpAndSettle();
+      expect(find.text('已到书籍结尾'), findsOneWidget);
+      expect(find.byKey(const Key('book-end-finish-button')), findsOneWidget);
+      await tester.tap(find.text('返回最后一页'));
+      await tester.pumpAndSettle();
+      expect(controller.pageIndex, 4);
+      expect(find.byKey(const Key('book-end-finish-button')), findsNothing);
+    },
+  );
+
+  testWidgets('reader restores the configured body font size', (tester) async {
+    final controller = _FakeReaderController();
+    SharedPreferences.setMockInitialValues({});
+    final preferences = ReaderPreferencesStore(
+      await SharedPreferences.getInstance(),
+    );
+    await preferences.saveTypography(const ReaderTypography(fontSize: 24));
+    await controller.updateStyle(
+      const ReaderStyle(
+        writingSystem: WritingSystem.cjk,
+        publicationLanguage: 'en-GB',
+      ),
+    );
+    addTearDown(() async {
+      await tester.pumpWidget(const SizedBox.shrink());
+      controller.dispose();
+    });
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ReaderPage(
+          file: File('unused.epub'),
+          controller: controller,
+          preferencesStore: preferences,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(controller.style.baseFontSize, 24);
+    expect(controller.style.typography.fontSize, 24);
+    expect(controller.style.writingSystem, WritingSystem.cjk);
+    expect(controller.style.publicationLanguage, 'en-GB');
+  });
 
   testWidgets('reader first frame inherits the dark app theme', (tester) async {
     final controller = _FakeReaderController();
@@ -325,6 +434,19 @@ void main() {
     expect(tester.widget<IconButton>(style).iconSize, 32);
     expect(tester.widget<IconButton>(theme).iconSize, 32);
     expect(tester.widget<IconButton>(theme).tooltip, '深色模式');
+    final orderedKeys = [
+      'reader-toc-button',
+      'reader-marks-button',
+      'reader-translation-button',
+      'reader-selection-button',
+      'reader-style-button',
+      'reader-theme-button',
+    ];
+    final positions = orderedKeys
+        .map((key) => tester.getCenter(find.byKey(Key(key))).dx)
+        .toList();
+    expect(positions, orderedEquals(List<double>.of(positions)..sort()));
+    expect(find.byTooltip('标记已读完'), findsNothing);
 
     await tester.tap(theme);
     await tester.pumpAndSettle();

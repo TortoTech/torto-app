@@ -5,6 +5,7 @@ import 'package:torto/core/ir/ir.dart';
 void main() {
   test('path-only hints inspect only the first eight top-level blocks', () {
     final section = Section(
+      id: SpineItemId.generated(0),
       spineIndex: 0,
       href: 'Text/chapter.xhtml',
       blocks: [

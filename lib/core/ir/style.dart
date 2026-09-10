@@ -14,6 +14,8 @@ enum LinkRole { normal, footnoteReference, footnoteBacklink }
 /// Semantic role carried by inline content independently of links.
 enum InlineRole { normal, footnote }
 
+enum HyphenationMode { none, manual, auto }
+
 /// Inline text style. All values are resolved (no relative CSS units left).
 class TextStyle {
   final bool bold;
@@ -40,6 +42,7 @@ class TextStyle {
   final TextBaselineShift baseline;
   final LinkRole linkRole;
   final InlineRole inlineRole;
+  final HyphenationMode hyphenation;
 
   const TextStyle({
     this.bold = false,
@@ -54,6 +57,7 @@ class TextStyle {
     this.baseline = TextBaselineShift.none,
     this.linkRole = LinkRole.normal,
     this.inlineRole = InlineRole.normal,
+    this.hyphenation = HyphenationMode.auto,
   });
 
   static const TextStyle plain = TextStyle();
@@ -80,6 +84,9 @@ class TextStyle {
       inlineRole: overlay.inlineRole != InlineRole.normal
           ? overlay.inlineRole
           : inlineRole,
+      hyphenation: overlay.hyphenation != HyphenationMode.auto
+          ? overlay.hyphenation
+          : hyphenation,
     );
   }
 
@@ -97,6 +104,7 @@ class TextStyle {
     TextBaselineShift? baseline,
     LinkRole? linkRole,
     InlineRole? inlineRole,
+    HyphenationMode? hyphenation,
   }) => TextStyle(
     bold: bold ?? this.bold,
     italic: italic ?? this.italic,
@@ -110,6 +118,7 @@ class TextStyle {
     baseline: baseline ?? this.baseline,
     linkRole: linkRole ?? this.linkRole,
     inlineRole: inlineRole ?? this.inlineRole,
+    hyphenation: hyphenation ?? this.hyphenation,
   );
 
   @override
@@ -126,7 +135,8 @@ class TextStyle {
       other.color == color &&
       other.baseline == baseline &&
       other.linkRole == linkRole &&
-      other.inlineRole == inlineRole;
+      other.inlineRole == inlineRole &&
+      other.hyphenation == hyphenation;
 
   @override
   int get hashCode => Object.hash(
@@ -142,6 +152,7 @@ class TextStyle {
     baseline,
     linkRole,
     inlineRole,
+    hyphenation,
   );
 }
 

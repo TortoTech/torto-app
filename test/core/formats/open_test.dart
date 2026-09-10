@@ -52,8 +52,7 @@ void main() {
     expect(await source.resource('Images/page-00001.png'), utf8.encode('page'));
   });
 
-  test('openBook rejects unknown formats and unreadable containers',
-      () async {
+  test('openBook rejects unknown formats and unreadable containers', () async {
     final bytes = Uint8List.fromList([1, 2, 3]);
     await expectLater(openBook(bytes, 'book.txt'), throwsFormatException);
     // Every supported format is detected but must be a readable container.

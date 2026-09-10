@@ -1,4 +1,6 @@
 import 'dart:async';
+import '../statistics/statistics_page.dart';
+import '../statistics/statistics_store.dart';
 
 import 'package:flutter/material.dart';
 
@@ -194,6 +196,46 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     if (_cloudSync?.settings.enabled == true) unawaited(_sync(silent: true));
   }
 
+  Future<void> _bookActions(LibraryBook book) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.bar_chart),
+              title: Text(context.l10n.text('阅读详情', 'Reading details')),
+              onTap: () => Navigator.pop(context, 'statistics'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: Text(context.l10n.text('删除书籍', 'Delete book')),
+              onTap: () => Navigator.pop(context, 'delete'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (action == 'delete') {
+      // Preserve the title and added date even for a book never opened.
+      try {
+        await (await ReadingStatisticsStore.instance()).registerBooks([book]);
+      } catch (error) {
+        debugPrint('Could not preserve book statistics: $error');
+      }
+      if (mounted) await _confirmDelete(book);
+    } else if (action == 'statistics') {
+      await Navigator.push(
+        context,
+        MaterialPageRoute<void>(
+          builder: (_) => ReadingStatisticsPage(bookId: book.id),
+        ),
+      );
+    }
+  }
+
   Future<void> _sync({bool silent = false}) async {
     final controller = _cloudSync;
     if (controller == null) return;
@@ -295,7 +337,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
             return _BookTile(
               book: book,
               onTap: () => _open(book),
-              onLongPress: () => _confirmDelete(book),
+              onLongPress: () => _bookActions(book),
             );
           },
         ),

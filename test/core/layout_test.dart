@@ -37,8 +37,12 @@ ReaderStyle _style({double fontSize = 10}) => ReaderStyle(
   marginRight: 10,
 );
 
-Section _section(List<Block> blocks) =>
-    Section(spineIndex: 0, href: 's.xhtml', blocks: blocks);
+Section _section(List<Block> blocks) => Section(
+  id: SpineItemId.generated(0),
+  spineIndex: 0,
+  href: 's.xhtml',
+  blocks: blocks,
+);
 
 TextBlock _para(
   String text, {
@@ -61,8 +65,16 @@ TextBlock _para(
   inlines: [TextRun(text)],
   style: style,
   source: SourceRange(
-    start: SourceAnchor(spine: 0, node: nodeId, textOffset: 0),
-    end: SourceAnchor(spine: 0, node: nodeId, textOffset: text.length),
+    start: SourceAnchor(
+      spine: SpineItemId.generated(0),
+      node: nodeId,
+      textOffset: 0,
+    ),
+    end: SourceAnchor(
+      spine: SpineItemId.generated(0),
+      node: nodeId,
+      textOffset: text.length,
+    ),
   ),
 );
 
@@ -96,8 +108,105 @@ void _disposeAll(List<PageLayout> pages) {
 void main() {
   const engine = LayoutEngine();
 
+  test('translated Chinese paragraph uses Chinese indentation', () {
+    final pages = engine.paginate(
+      _section([
+        TextBlock(
+          inlines: const [
+            TextRun('中文译文段落', displayWritingSystem: WritingSystem.cjk),
+          ],
+        ),
+        TextBlock(inlines: const [TextRun('English original')]),
+      ]),
+      _viewport,
+      _style(fontSize: 20).copyWith(writingSystem: WritingSystem.latin),
+    );
+    final items = pages.single.items.whereType<TextPlacement>().toList();
+    expect(
+      items[0].paragraph.getBoxesForRange(0, 1).single.toRect().width,
+      closeTo(40, .1),
+    );
+    expect(
+      items[1].paragraph.getBoxesForRange(0, 1).single.toRect().width,
+      closeTo(30, .1),
+    );
+    _disposeAll(pages);
+  });
+
+  test(
+    'superscripts and subscripts retain paint shifts and source offsets',
+    () {
+      for (final mode in TypesettingMode.values) {
+        final pages = engine.paginate(
+          _section([
+            TextBlock(
+              inlines: const [
+                TextRun('x'),
+                TextRun(
+                  '2',
+                  style: TextStyle(baseline: TextBaselineShift.superscript),
+                ),
+                TextRun(' + y'),
+                TextRun(
+                  '1',
+                  style: TextStyle(baseline: TextBaselineShift.subscript),
+                ),
+              ],
+            ),
+          ]),
+          _viewport,
+          _style(fontSize: 20).copyWith(typesettingMode: mode),
+        );
+        final item = pages.single.items.whereType<TextPlacement>().single;
+        expect(item.baselineRegions, hasLength(2));
+        expect(item.baselineRegions.first.shift, lessThan(0));
+        expect(item.baselineRegions.last.shift, greaterThan(0));
+        expect(item.displayToSource.last, 7);
+        _disposeAll(pages);
+      }
+    },
+  );
+
   test('reader style defaults to a 20 logical-pixel font size', () {
     expect(const ReaderStyle().baseFontSize, 20);
+  });
+
+  test('unified line height follows displayed writing system', () {
+    for (final entry in {
+      WritingSystem.cjk: 1.7,
+      WritingSystem.latin: 1.4,
+      WritingSystem.unknown: 1.5,
+    }.entries) {
+      final pages = engine.paginate(
+        _section([
+          TextBlock(
+            inlines: [TextRun('Text', displayWritingSystem: entry.key)],
+          ),
+        ]),
+        _viewport,
+        _style(fontSize: 20).copyWith(writingSystem: WritingSystem.latin),
+      );
+      final text = pages.single.items.whereType<TextPlacement>().single;
+      expect(text.lineMetrics.first.height, closeTo(20 * entry.value, 1));
+      _disposeAll(pages);
+    }
+  });
+
+  test('book typography applies the fixed mobile minimum font size', () {
+    expect(
+      LayoutEngine.debugResolvedFontSize(
+        const TextStyle(sizeScale: 0.25),
+        unified: false,
+      ),
+      ReaderTypography.minimumFontSize,
+    );
+    expect(
+      LayoutEngine.debugResolvedFontSize(
+        const TextStyle(sizeScale: 0.25),
+        unified: true,
+      ),
+      20,
+    );
   });
 
   test('empty section produces zero pages', () {
@@ -220,8 +329,16 @@ void main() {
         TextRun('Chapter title'),
       ],
       source: SourceRange(
-        start: const SourceAnchor(spine: 0, node: 'heading', textOffset: 0),
-        end: const SourceAnchor(spine: 0, node: 'heading', textOffset: 13),
+        start: const SourceAnchor(
+          spine: SpineItemId.generated(0),
+          node: 'heading',
+          textOffset: 0,
+        ),
+        end: const SourceAnchor(
+          spine: SpineItemId.generated(0),
+          node: 'heading',
+          textOffset: 13,
+        ),
       ),
     );
     final pages = engine.paginate(
@@ -239,8 +356,61 @@ void main() {
       inlineImage.end,
     );
     expect(boxes, isNotEmpty);
-    expect(boxes.single.bottom - boxes.single.top, closeTo(14, 1));
-    expect(boxes.single.right - boxes.single.left, closeTo(28, 1));
+    expect(inlineImage.height, closeTo(14, 1));
+    expect(inlineImage.width, closeTo(28, 1));
+    expect(boxes.single.bottom - boxes.single.top, greaterThanOrEqualTo(14));
+    _disposeAll(pages);
+  });
+
+  test('optimized prose keeps inline image boxes in the break plan', () {
+    final prose = TextBlock(
+      nodeId: 'formula-prose',
+      inlines: [
+        const TextRun(
+          'One two three four five six seven eight ',
+          language: 'en-US',
+        ),
+        const InlineImageRun(
+          image: ImageBlock(href: 'img/formula.png'),
+          sizeScale: 1,
+          intrinsicSizing: true,
+          verticalAlign: InlineImageAlignment.middle,
+        ),
+        const TextRun(
+          ' nine ten eleven twelve thirteen fourteen ',
+          language: 'en-US',
+        ),
+        const TextRun(
+          'fifteen sixteen seventeen eighteen nineteen twenty.',
+          language: 'en-US',
+        ),
+      ],
+      source: const SourceRange(
+        start: SourceAnchor(
+          spine: SpineItemId.generated(0),
+          node: 'formula-prose',
+          textOffset: 0,
+        ),
+        end: SourceAnchor(
+          spine: SpineItemId.generated(0),
+          node: 'formula-prose',
+          textOffset: 170,
+        ),
+      ),
+    );
+    final pages = const LayoutEngine().paginate(
+      _section([prose]),
+      const LayoutViewport(width: 240, height: 500),
+      _style(fontSize: 12),
+      imageSizeResolver: (_) => const ui.Size(24, 12),
+    );
+    final placement = pages.first.items.whereType<TextPlacement>().first;
+    expect(placement.inlineImages, hasLength(1));
+    final metrics = placement.paragraph.computeLineMetrics();
+    expect(
+      metrics.take(metrics.length - 1).any((line) => line.hardBreak),
+      isTrue,
+    );
     _disposeAll(pages);
   });
 
@@ -686,8 +856,16 @@ void main() {
         ),
       ],
       source: const SourceRange(
-        start: SourceAnchor(spine: 0, node: 'linked', textOffset: 0),
-        end: SourceAnchor(spine: 0, node: 'linked', textOffset: 11),
+        start: SourceAnchor(
+          spine: SpineItemId.generated(0),
+          node: 'linked',
+          textOffset: 0,
+        ),
+        end: SourceAnchor(
+          spine: SpineItemId.generated(0),
+          node: 'linked',
+          textOffset: 11,
+        ),
       ),
     );
     final pages = engine.paginate(_section([block]), _viewport, _style());
@@ -843,6 +1021,84 @@ void main() {
     _disposeAll(pages);
   });
 
+  test('table rowspan group moves together to the next page', () {
+    final table = TableBlock(
+      rows: const [
+        TableRow([
+          TableCell(
+            nodeId: 'spanned',
+            rowSpan: 2,
+            inlines: [TextRun('Shared')],
+          ),
+          TableCell(nodeId: 'a', inlines: [TextRun('A')]),
+        ]),
+        TableRow([
+          TableCell(nodeId: 'b', inlines: [TextRun('B')]),
+        ]),
+      ],
+    );
+    final pages = engine.paginate(
+      _section([
+        _para('Lead', style: const BlockStyle(marginAfter: 70)),
+        table,
+      ]),
+      const LayoutViewport(width: 300, height: 120),
+      _style().copyWith(typesettingMode: TypesettingMode.book),
+    );
+    addTearDown(() => _disposeAll(pages));
+    expect(pages.length, greaterThan(1));
+    expect(pages.first.items.whereType<TableCellPlacement>(), isEmpty);
+    final tablePage = pages.firstWhere(
+      (page) => page.items.whereType<TableCellPlacement>().isNotEmpty,
+    );
+    expect(
+      tablePage.items
+          .whereType<TableCellPlacement>()
+          .map((c) => c.nodeId)
+          .toSet(),
+      {'spanned', 'a', 'b'},
+    );
+    expect(
+      tablePage.items.whereType<TableCellPlacement>().every(
+        (c) => c.rect.bottom <= 110 + _eps,
+      ),
+      isTrue,
+    );
+  });
+
+  test(
+    'long tables break between rows without splitting or duplicating cells',
+    () {
+      final table = TableBlock(
+        rows: [
+          for (var i = 0; i < 12; i++)
+            TableRow([
+              TableCell(nodeId: 'row-$i', inlines: [TextRun('Row $i')]),
+            ]),
+        ],
+      );
+      final pages = engine.paginate(
+        _section([table]),
+        const LayoutViewport(width: 300, height: 120),
+        _style(),
+      );
+      addTearDown(() => _disposeAll(pages));
+      expect(pages.length, greaterThan(1));
+      final cells = pages
+          .expand((p) => p.items)
+          .whereType<TableCellPlacement>()
+          .toList();
+      expect(cells, hasLength(12));
+      expect(cells.map((c) => c.nodeId).toSet(), hasLength(12));
+      expect(
+        cells.every(
+          (c) => c.rect.top >= 10 - _eps && c.rect.bottom <= 110 + _eps,
+        ),
+        isTrue,
+      );
+    },
+  );
+
   test(
     'unified tables preserve authored alignment and center unspecified cells',
     () {
@@ -977,6 +1233,69 @@ void main() {
     expect(hyphenator.spans, hasLength(1));
     expect(hyphenator.spans.single.language, 'en-GB');
     _disposeAll(pages);
+  });
+
+  test(
+    'explicit breaks retain optimized CJK lines and short paragraph endings',
+    () {
+      const prose = '比较心理学家哈里·哈洛（Harry Harlow）进行了一项实验。这些研究帮助我们理解语言与行为之间的关系。';
+      final pages = engine.paginate(
+        _section([
+          TextBlock(
+            inlines: const [
+              TextRun(prose),
+              BreakInline(),
+              BreakInline(),
+              TextRun('短句。'),
+              BreakInline(),
+              TextRun(prose),
+            ],
+          ),
+        ]),
+        const LayoutViewport(width: 300, height: 2000),
+        _style(),
+      );
+      final placement = pages.first.items.whereType<TextPlacement>().single;
+      // Optimized soft wraps become explicit breaks in the rebuilt paragraph;
+      // the original short and blank paragraphs retain their natural widths.
+      expect(placement.lineMetrics.every((line) => line.hardBreak), isTrue);
+      expect(
+        placement.lineMetrics.where((line) => line.width < 50).length,
+        greaterThanOrEqualTo(2),
+      );
+      expect(
+        placement.lineMetrics
+            .where((line) => line.width > placement.width - 2)
+            .length,
+        greaterThanOrEqualTo(2),
+      );
+      _disposeAll(pages);
+    },
+  );
+
+  test('optimized layout covers desktop start-aligned semantic prose', () {
+    for (final kind in [
+      TextBlockKind.paragraph,
+      TextBlockKind.blockquote,
+      TextBlockKind.caption,
+      TextBlockKind.definitionDescription,
+    ]) {
+      final hyphenator = _RecordingHyphenator();
+      final pages = LayoutEngine(hyphenator: hyphenator).paginate(
+        _section([
+          _para(
+            _lorem(4),
+            kind: kind,
+            style: const BlockStyle(align: BlockAlign.start),
+          ),
+        ]),
+        _viewport,
+        _style().copyWith(typesettingMode: TypesettingMode.book),
+      );
+
+      expect(hyphenator.text, isNotNull, reason: '$kind was not optimized');
+      _disposeAll(pages);
+    }
   });
 
   test('optimized list body reaches hyphenator and keeps its marker', () {

@@ -1,0 +1,9 @@
+[package]
+name = "torto-mobile-parity"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rebook-formats = { path = "../../../torto/crates/formats" }
+rebook-publication = { path = "../../../torto/crates/publication" }
+rebook-html = { path = "../../../torto/crates/html" }

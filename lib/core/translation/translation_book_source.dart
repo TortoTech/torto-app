@@ -106,8 +106,6 @@ class TranslationBookSource implements BookSource {
               ..add(
                 _copyText(
                   translated,
-                  clearSource: true,
-                  nodeId: '',
                   listMarkerVisible: false,
                   style: translated.style.copyWith(
                     marginBefore: 0,
@@ -132,6 +130,7 @@ class TranslationBookSource implements BookSource {
       }
     }
     return Section(
+      id: section.id,
       spineIndex: section.spineIndex,
       href: section.href,
       blocks: blocks,
@@ -222,6 +221,7 @@ class TranslationBookSource implements BookSource {
   TextBlock _translatedText(TextBlock original, String translation) =>
       _copyText(
         original,
+        nodeId: '${original.nodeId}@translation',
         inlines: TranslationMarkupCodec.decode(
           translation,
           original.inlines,
@@ -266,8 +266,6 @@ class TranslationBookSource implements BookSource {
       _withReducedBottomMargin(original),
       _copyText(
         translated,
-        clearSource: true,
-        nodeId: '',
         listMarkerVisible: false,
         style: translated.style.copyWith(
           marginBefore: 0,
@@ -514,6 +512,7 @@ class TranslationBookSource implements BookSource {
   }) => TextBlock(
     kind: block.kind,
     headingLevel: block.headingLevel,
+    headingOrdinal: block.headingOrdinal,
     listOrdered: block.listOrdered,
     listOrdinal: block.listOrdinal,
     listDepth: block.listDepth,

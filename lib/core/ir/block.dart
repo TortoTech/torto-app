@@ -1,4 +1,7 @@
 import 'style.dart';
+import 'spine_item_id.dart';
+export 'spine_item_id.dart';
+import 'book.dart' show WritingSystem;
 
 /// A position in the book's source, independent of pagination.
 ///
@@ -7,11 +10,10 @@ import 'style.dart';
 ///
 /// [node] is a deterministic id assigned by the HTML→IR parser (document
 /// order of the block-level element within its section, e.g. "n12").
-/// [textOffset] is a UTF-16 code-unit offset into that block's normalized
-/// text. NOTE: torto uses Unicode scalar offsets and its own node-id rule;
-/// aligning both exactly ("对拍") is a planned follow-up before sync ships.
+/// [textOffset] counts Unicode scalars in normalized source text, exactly as on
+/// desktop. UTF-16 offsets exist only inside the Flutter layout adapter.
 class SourceAnchor {
-  final int spine;
+  final SpineItemId spine;
   final String node;
   final int textOffset;
 
@@ -22,16 +24,22 @@ class SourceAnchor {
   });
 
   Map<String, dynamic> toJson() => {
-    'spine': spine,
+    'spine': spine.toJson(),
     'node': node,
     'text_offset': textOffset,
   };
 
-  factory SourceAnchor.fromJson(Map<String, dynamic> json) => SourceAnchor(
-    spine: json['spine'] as int,
-    node: json['node'] as String,
-    textOffset: json['text_offset'] as int,
-  );
+  factory SourceAnchor.fromJson(Map<String, dynamic> json) {
+    final node = json['node'], offset = json['text_offset'];
+    if (node is! String || node.isEmpty || offset is! int || offset < 0) {
+      throw const FormatException('Invalid source anchor');
+    }
+    return SourceAnchor(
+      spine: SpineItemId.fromJson(json['spine']),
+      node: node,
+      textOffset: offset,
+    );
+  }
 
   @override
   bool operator ==(Object other) =>
@@ -70,6 +78,7 @@ sealed class Inline {
 }
 
 class TextRun extends Inline {
+  final WritingSystem? displayWritingSystem;
   final String text;
   final TextStyle style;
 
@@ -89,12 +98,15 @@ class TextRun extends Inline {
     this.style = TextStyle.plain,
     this.link,
     this.language,
+    this.displayWritingSystem,
   });
 }
 
 /// Explicit line break (<br>).
 class BreakInline extends Inline {
-  const BreakInline();
+  /// Mobile visual boundary which does not add a character to desktop source text.
+  final bool synthetic;
+  const BreakInline({this.synthetic = false});
 }
 
 /// TeX source retained as semantic inline content. The current Flutter
@@ -108,17 +120,32 @@ class MathInline extends Inline {
   const MathInline(this.latex, {this.display = false, this.sizeScale = 1.0});
 }
 
+enum InlineImageAlignment {
+  baseline,
+  middle,
+  textTop,
+  textBottom,
+  top,
+  bottom,
+  superscript,
+  subscript,
+}
+
 /// A small authored image that participates in the surrounding text line.
 /// Parsing creates these only for em-sized presentation images in headings;
 /// ordinary illustrations remain block-level [ImageBlock]s.
 class InlineImageRun extends Inline {
   final ImageBlock image;
   final double sizeScale;
+  final bool intrinsicSizing;
+  final InlineImageAlignment verticalAlign;
   final bool presentation;
 
   const InlineImageRun({
     required this.image,
     required this.sizeScale,
+    this.intrinsicSizing = false,
+    this.verticalAlign = InlineImageAlignment.baseline,
     this.presentation = false,
   });
 }
@@ -142,6 +169,7 @@ sealed class Block {
 }
 
 class TextBlock extends Block {
+  final bool headingOrdinal;
   final TextBlockKind kind;
 
   /// 1..6 when [kind] is [TextBlockKind.heading], else 0.
@@ -167,6 +195,7 @@ class TextBlock extends Block {
   final String nodeId;
 
   TextBlock({
+    this.headingOrdinal = false,
     this.kind = TextBlockKind.paragraph,
     this.headingLevel = 0,
     this.listOrdered = false,
@@ -186,10 +215,10 @@ class TextBlock extends Block {
       switch (inline) {
         case TextRun(:final text):
           buf.write(text);
-        case BreakInline():
-          buf.write('\n');
-        case MathInline(:final latex):
-          buf.write(latex);
+        case BreakInline(:final synthetic):
+          if (!synthetic) buf.write('\n');
+        case MathInline():
+          break;
         case InlineImageRun():
           break;
       }
@@ -207,8 +236,8 @@ class QuoteBlock extends Block {
   const QuoteBlock({required this.body, this.attribution, this.source});
 
   int get textLength =>
-      body.fold(0, (total, block) => total + block.plainText.length) +
-      (attribution?.plainText.length ?? 0);
+      body.fold(0, (total, block) => total + block.plainText.runes.length) +
+      (attribution?.plainText.runes.length ?? 0);
 }
 
 enum NoteBlockKind { definition, section }
@@ -224,7 +253,7 @@ class NoteBlock extends Block {
   int get textLength => blocks.fold(0, (total, block) {
     return total +
         switch (block) {
-          TextBlock(:final plainText) => plainText.length,
+          TextBlock(:final plainText) => plainText.runes.length,
           QuoteBlock(:final textLength) => textLength,
           NoteBlock(:final textLength) => textLength,
           TableBlock(:final textLength) => textLength,
@@ -251,7 +280,8 @@ class TableBlock extends Block {
   int get textLength => rows.fold(
     0,
     (total, row) =>
-        total + row.cells.fold(0, (sum, cell) => sum + cell.plainText.length),
+        total +
+        row.cells.fold(0, (sum, cell) => sum + cell.plainText.runes.length),
   );
 }
 
@@ -290,8 +320,8 @@ class TableCell {
           buffer.write(text);
         case BreakInline():
           buffer.write('\n');
-        case MathInline(:final latex):
-          buffer.write(latex);
+        case MathInline():
+          break;
         case InlineImageRun():
           break;
       }
@@ -339,20 +369,24 @@ class FigureBlock extends Block {
     this.source,
   });
 
-  int get textLength =>
-      captions.fold(0, (total, caption) => total + caption.plainText.length);
+  int get textLength => captions.fold(
+    0,
+    (total, caption) => total + caption.plainText.runes.length,
+  );
 }
 
 enum SeparatorKind { spacing, rule, ornament }
 
 /// A semantic, non-prose boundary retained for the active typesetting mode.
 class SeparatorBlock extends Block {
+  final TextBlock? text;
   final SeparatorKind kind;
   final bool inQuote;
   final ImageBlock? image;
   final BlockStyle style;
 
   const SeparatorBlock({
+    this.text,
     this.kind = SeparatorKind.rule,
     this.inQuote = false,
     this.image,

@@ -55,7 +55,11 @@ Future<BookSource> openPdf(
 
   final spine = [
     for (var index = 0; index < document.pageCount; index++)
-      SpineItem(index: index, href: _sectionPath(index)),
+      SpineItem(
+        index: index,
+        href: _sectionPath(index),
+        id: SpineItemId('pdf-page-${index + 1}'),
+      ),
   ];
   final toc = _promoteSingleTocRoot(
     _outlineEntries(pdf.PdfOutline.of(document).items, spine),
@@ -126,6 +130,7 @@ class PdfBookSource
   Future<Section> parseSection(int index) async {
     _checkPageIndex(index);
     return Section(
+      id: book.spine[index].id,
       spineIndex: index,
       href: book.spine[index].href,
       blocks: [

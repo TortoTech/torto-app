@@ -30,6 +30,31 @@ class PagePainter extends CustomPainter {
     this.foreground,
   });
 
+  static void _paintParagraph(
+    Canvas canvas,
+    ui.Paragraph paragraph,
+    ui.Offset origin,
+    List<TextBaselineRegion> regions,
+  ) {
+    canvas.save();
+    for (final region in regions) {
+      canvas.clipRect(
+        region.rect.shift(origin),
+        clipOp: ui.ClipOp.difference,
+        doAntiAlias: false,
+      );
+    }
+    canvas.drawParagraph(paragraph, origin);
+    canvas.restore();
+    for (final region in regions) {
+      final shiftedOrigin = origin.translate(0, region.shift);
+      canvas.save();
+      canvas.clipRect(region.rect.shift(shiftedOrigin), doAntiAlias: false);
+      canvas.drawParagraph(paragraph, shiftedOrigin);
+      canvas.restore();
+    }
+  }
+
   @override
   void paint(Canvas canvas, Size size) {
     canvas.drawRect(ui.Offset.zero & size, Paint()..color = background);
@@ -67,9 +92,11 @@ class PagePainter extends CustomPainter {
           canvas.clipRect(
             ui.Rect.fromLTWH(0, item.y, size.width, item.sliceHeight),
           );
-          canvas.drawParagraph(
+          _paintParagraph(
+            canvas,
             item.paragraph,
             ui.Offset(item.x, item.y - item.sliceTop),
+            item.baselineRegions,
           );
           canvas.restore();
         case ListMarkerPlacement():
@@ -84,12 +111,14 @@ class PagePainter extends CustomPainter {
           }
           canvas.save();
           canvas.clipRect(item.rect.deflate(item.padding));
-          canvas.drawParagraph(
+          _paintParagraph(
+            canvas,
             item.paragraph,
             ui.Offset(
               item.rect.left + item.padding,
               item.rect.top + item.padding,
             ),
+            item.baselineRegions,
           );
           canvas.restore();
         case ImagePlacement():
@@ -175,19 +204,23 @@ void _paintInlineImages(
       );
       if (boxes.isEmpty) continue;
       final box = boxes.first;
-      final destination = ui.Rect.fromLTRB(
-        paragraphOffset.dx + box.left,
-        paragraphOffset.dy + box.top,
-        paragraphOffset.dx + box.right,
-        paragraphOffset.dy + box.bottom,
-      ).intersect(clip);
-      if (destination.isEmpty) continue;
+      final boxWidth = box.right - box.left;
+      final destination = ui.Rect.fromLTWH(
+        paragraphOffset.dx + box.left + (boxWidth - inlineImage.width) / 2,
+        paragraphOffset.dy + box.top + inlineImage.paintOffsetY,
+        inlineImage.width,
+        inlineImage.height,
+      );
+      if (!destination.overlaps(clip)) continue;
+      canvas.save();
+      canvas.clipRect(clip);
       canvas.drawImageRect(
         image,
         ui.Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
         destination,
         Paint(),
       );
+      canvas.restore();
     }
   }
 }

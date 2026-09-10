@@ -81,13 +81,19 @@ class ChmBookSource implements BookSource {
     final item = book.spine[index];
     final stored = _resources[item.href.toLowerCase()];
     if (stored == null) {
-      return Section(spineIndex: index, href: item.href, blocks: const []);
+      return Section(
+        id: item.id,
+        spineIndex: index,
+        href: item.href,
+        blocks: const [],
+      );
     }
     try {
       final xhtml = htmlToXhtml(decodeChmText(stored.bytes));
       return promoteTocHeadings(
         _parser.parse(
           spineIndex: index,
+          spineId: item.id,
           href: item.href,
           xhtml: xhtml,
           basePath: packageDirname(item.href),
@@ -103,7 +109,12 @@ class ChmBookSource implements BookSource {
         _tocHeadingHints[item.href] ?? const [],
       );
     } catch (_) {
-      return Section(spineIndex: index, href: item.href, blocks: const []);
+      return Section(
+        id: item.id,
+        spineIndex: index,
+        href: item.href,
+        blocks: const [],
+      );
     }
   }
 }
@@ -146,7 +157,13 @@ Future<ChmBookSource> openChm(Uint8List bytes, String fileName) async {
         tocTitles[href.path.toLowerCase()] ??
         _storedHtmlTitle(resources[href.path.toLowerCase()]) ??
         _sectionTitleFromPath(href.path);
-    sections.add(SpineItem(index: index, href: href.path));
+    sections.add(
+      SpineItem(
+        id: SpineItemId.generated(index),
+        index: index,
+        href: href.path,
+      ),
+    );
     fallbackToc.add(TocEntry(label: title, href: href.path, spineIndex: index));
   }
   if (sections.isEmpty) {

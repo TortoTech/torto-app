@@ -188,10 +188,16 @@ class EpubBookSource implements BookSource {
     try {
       final text = _readXmlText(item.href);
       if (text == null) {
-        section = Section(spineIndex: index, href: item.href, blocks: const []);
+        section = Section(
+          id: item.id,
+          spineIndex: index,
+          href: item.href,
+          blocks: const [],
+        );
       } else {
         section = _parser.parse(
           spineIndex: index,
+          spineId: item.id,
           href: item.href,
           xhtml: text,
           basePath: packageDirname(item.href),
@@ -214,7 +220,12 @@ class EpubBookSource implements BookSource {
       );
     } catch (_) {
       // A single bad section must not kill the book.
-      section = Section(spineIndex: index, href: item.href, blocks: const []);
+      section = Section(
+        id: item.id,
+        spineIndex: index,
+        href: item.href,
+        blocks: const [],
+      );
     }
     _sectionCache[index] = section;
     return section;
@@ -575,7 +586,13 @@ class _PackageModel {
     for (final idref in spineIdrefs) {
       final item = manifest[idref];
       if (item == null) continue; // fail-soft: skip dangling references
-      spine.add(SpineItem(index: spine.length, href: item.href));
+      spine.add(
+        SpineItem(
+          id: SpineItemId(item.id),
+          index: spine.length,
+          href: item.href,
+        ),
+      );
     }
     return spine;
   }

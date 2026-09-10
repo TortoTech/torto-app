@@ -32,7 +32,142 @@ enum TypesettingMode {
 
 enum LineBreakStrategy { greedy, optimized }
 
+class ReaderLatinFont {
+  final String name;
+  final String family;
+  const ReaderLatinFont.system(String family) : name = family, family = family;
+  const ReaderLatinFont._(this.name, this.family);
+  static const literata = ReaderLatinFont._('literata', 'Literata');
+  static const systemSerif = ReaderLatinFont._('systemSerif', 'serif');
+  static const systemSansSerif = ReaderLatinFont._(
+    'systemSansSerif',
+    'sans-serif',
+  );
+  static const values = [literata, systemSerif, systemSansSerif];
+  static ReaderLatinFont parse(String value) => values.firstWhere(
+    (font) => font.name == value,
+    orElse: () => ReaderLatinFont.system(value),
+  );
+  @override
+  bool operator ==(Object other) =>
+      other is ReaderLatinFont && other.name == name;
+  @override
+  int get hashCode => name.hashCode;
+}
+
+class ReaderCjkFont {
+  final String name;
+  final String family;
+  const ReaderCjkFont.system(String family) : name = family, family = family;
+  const ReaderCjkFont._(this.name, this.family);
+  static const lxgwWenKai = ReaderCjkFont._(
+    'lxgwWenKai',
+    'LXGW WenKai GB Screen',
+  );
+  static const systemSerif = ReaderCjkFont._('systemSerif', 'serif');
+  static const systemSansSerif = ReaderCjkFont._(
+    'systemSansSerif',
+    'sans-serif',
+  );
+  static const values = [lxgwWenKai, systemSerif, systemSansSerif];
+  static ReaderCjkFont parse(String value) => values.firstWhere(
+    (font) => font.name == value,
+    orElse: () => ReaderCjkFont.system(value),
+  );
+  @override
+  bool operator ==(Object other) =>
+      other is ReaderCjkFont && other.name == name;
+  @override
+  int get hashCode => name.hashCode;
+}
+
+class ReaderTypography {
+  /// Main CJK family used by Chinese, Japanese and Korean books.
+  final ReaderCjkFont cjkPrimaryFont;
+
+  /// Latin companion for CJK books. Null follows [otherPrimaryFont].
+  final ReaderLatinFont? cjkLatinFont;
+
+  /// Main Western family used by all non-CJK books.
+  final ReaderLatinFont otherPrimaryFont;
+
+  /// CJK companion for non-CJK books. Null follows [cjkPrimaryFont].
+  final ReaderCjkFont? otherCjkFont;
+
+  /// Persisted reader size. [ReaderStyle.baseFontSize] is the resolved layout
+  /// value so low-level callers can still construct explicit test styles.
+  final double fontSize;
+  final int fontWeight;
+
+  /// Fixed mobile lower bound for publication-authored small text. This is not
+  /// user-configurable; Literata optical sizing is likewise always enabled.
+  static const double minimumFontSize = 12;
+
+  const ReaderTypography({
+    this.cjkPrimaryFont = ReaderCjkFont.lxgwWenKai,
+    this.cjkLatinFont,
+    this.otherPrimaryFont = ReaderLatinFont.literata,
+    this.otherCjkFont,
+    this.fontSize = 20,
+    this.fontWeight = 400,
+  });
+
+  ReaderTypography copyWith({
+    ReaderCjkFont? cjkPrimaryFont,
+    ReaderLatinFont? cjkLatinFont,
+    bool clearCjkLatinFont = false,
+    ReaderLatinFont? otherPrimaryFont,
+    ReaderCjkFont? otherCjkFont,
+    bool clearOtherCjkFont = false,
+    double? fontSize,
+    int? fontWeight,
+  }) => ReaderTypography(
+    cjkPrimaryFont: cjkPrimaryFont ?? this.cjkPrimaryFont,
+    cjkLatinFont: clearCjkLatinFont ? null : cjkLatinFont ?? this.cjkLatinFont,
+    otherPrimaryFont: otherPrimaryFont ?? this.otherPrimaryFont,
+    otherCjkFont: clearOtherCjkFont ? null : otherCjkFont ?? this.otherCjkFont,
+    fontSize: (fontSize ?? this.fontSize).clamp(12, 28),
+    fontWeight: (fontWeight ?? this.fontWeight).clamp(200, 900),
+  );
+
+  ReaderLatinFont latinFontFor(WritingSystem writingSystem) =>
+      writingSystem == WritingSystem.cjk
+      ? cjkLatinFont ?? otherPrimaryFont
+      : otherPrimaryFont;
+
+  ReaderCjkFont cjkFontFor(WritingSystem writingSystem) =>
+      writingSystem == WritingSystem.cjk
+      ? cjkPrimaryFont
+      : otherCjkFont ?? cjkPrimaryFont;
+
+  @override
+  bool operator ==(Object other) =>
+      other is ReaderTypography &&
+      other.cjkPrimaryFont == cjkPrimaryFont &&
+      other.cjkLatinFont == cjkLatinFont &&
+      other.otherPrimaryFont == otherPrimaryFont &&
+      other.otherCjkFont == otherCjkFont &&
+      other.fontSize == fontSize &&
+      other.fontWeight == fontWeight;
+
+  @override
+  int get hashCode => Object.hash(
+    cjkPrimaryFont,
+    cjkLatinFont,
+    otherPrimaryFont,
+    otherCjkFont,
+    fontSize,
+    fontWeight,
+  );
+}
+
 class ReaderStyle {
+  double get unifiedBodyLineHeight => switch (writingSystem) {
+    WritingSystem.cjk => 1.7,
+    WritingSystem.latin => 1.4,
+    _ => 1.5,
+  };
+
   /// Base reading font size, logical px.
   final double baseFontSize;
 
@@ -65,6 +200,7 @@ class ReaderStyle {
   /// Canonical publication language used only when a paragraph/run does not
   /// carry a nearer authored language. Empty disables language fallback.
   final String publicationLanguage;
+  final ReaderTypography typography;
 
   const ReaderStyle({
     this.baseFontSize = 20,
@@ -79,6 +215,7 @@ class ReaderStyle {
     this.lineBreakStrategy = LineBreakStrategy.optimized,
     this.writingSystem = WritingSystem.unknown,
     this.publicationLanguage = '',
+    this.typography = const ReaderTypography(),
   });
 
   /// Matches torto desktop's automatic paragraph/quote indentation profile.
@@ -101,6 +238,7 @@ class ReaderStyle {
     LineBreakStrategy? lineBreakStrategy,
     WritingSystem? writingSystem,
     String? publicationLanguage,
+    ReaderTypography? typography,
   }) => ReaderStyle(
     baseFontSize: baseFontSize ?? this.baseFontSize,
     lineHeight: lineHeight ?? this.lineHeight,
@@ -114,6 +252,7 @@ class ReaderStyle {
     lineBreakStrategy: lineBreakStrategy ?? this.lineBreakStrategy,
     writingSystem: writingSystem ?? this.writingSystem,
     publicationLanguage: publicationLanguage ?? this.publicationLanguage,
+    typography: typography ?? this.typography,
   );
 
   @override
@@ -130,7 +269,8 @@ class ReaderStyle {
       other.typesettingMode == typesettingMode &&
       other.lineBreakStrategy == lineBreakStrategy &&
       other.writingSystem == writingSystem &&
-      other.publicationLanguage == publicationLanguage;
+      other.publicationLanguage == publicationLanguage &&
+      other.typography == typography;
 
   @override
   int get hashCode => Object.hash(
@@ -146,6 +286,7 @@ class ReaderStyle {
     lineBreakStrategy,
     writingSystem,
     publicationLanguage,
+    typography,
   );
 }
 
@@ -175,8 +316,23 @@ class QuotePlacement extends PageItem {
   });
 }
 
+/// A glyph region in paragraph coordinates, painted with a vertical shift.
+/// Text remains in the retained paragraph for source mapping and selection.
+class TextBaselineRegion {
+  final ui.Rect rect;
+  final double shift;
+  const TextBaselineRegion(this.rect, this.shift);
+}
+
 /// A line slice of a shaped paragraph placed on a page.
 class TextPlacement extends PageItem {
+  final List<TextBaselineRegion> baselineRegions;
+
+  /// Display offsets include indentation placeholders and synthetic breaks.
+  /// Persisted selections must map back to normalized source text.
+  final List<int> displayToSource;
+  final int syntheticPrefixLength;
+
   /// Retained paragraph, laid out at [width]. Shared between placements when
   /// one paragraph spans several pages; disposed by [PageLayout.dispose].
   final ui.Paragraph paragraph;
@@ -201,7 +357,7 @@ class TextPlacement extends PageItem {
   /// Spine index of the section being paginated.
   final int spineIndex;
 
-  /// UTF-16 offset into the block's plainText of the first visible character
+  /// Unicode-scalar offset into the block's plainText of the first visible character
   /// on this page (synthetic list-marker prefixes are excluded).
   final int textOffsetAtStart;
 
@@ -216,7 +372,7 @@ class TextPlacement extends PageItem {
   /// Height of the visible slice on this page, logical px.
   final double sliceHeight;
 
-  /// UTF-16 offset of the start of the block's text within the whole
+  /// Unicode-scalar offset of the start of the block's text within the whole
   /// section's text. Engine-internal; used for progression computation.
   final double sectionTextOffset;
 
@@ -225,6 +381,9 @@ class TextPlacement extends PageItem {
   final List<InlineImageRange> inlineImages;
 
   const TextPlacement({
+    this.baselineRegions = const [],
+    required this.displayToSource,
+    this.syntheticPrefixLength = 0,
     required this.paragraph,
     required this.startLine,
     required this.endLine,
@@ -249,11 +408,17 @@ class InlineImageRange {
   final int start;
   final int end;
   final String href;
+  final double width;
+  final double height;
+  final double paintOffsetY;
 
   const InlineImageRange({
     required this.start,
     required this.end,
     required this.href,
+    required this.width,
+    required this.height,
+    this.paintOffsetY = 0,
   });
 }
 
@@ -303,6 +468,8 @@ class ListMarkerPlacement extends PageItem {
 /// One laid-out table cell. Borders and header fill are painted by the render
 /// stage so a table remains crisp at every device density.
 class TableCellPlacement extends PageItem {
+  final List<TextBaselineRegion> baselineRegions;
+  final List<int> displayToSource;
   final ui.Paragraph paragraph;
   final ui.Rect rect;
   final double padding;
@@ -315,6 +482,8 @@ class TableCellPlacement extends PageItem {
   final List<InlineImageRange> inlineImages;
 
   const TableCellPlacement({
+    this.baselineRegions = const [],
+    this.displayToSource = const [0],
     required this.paragraph,
     required this.rect,
     required this.padding,

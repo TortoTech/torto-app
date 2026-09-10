@@ -128,7 +128,9 @@ class DirectBookSource implements BookSource {
     for (var index = 0; index < source.sections.length; index++) {
       final section = source.sections[index];
       final href = 'Text/section-${index + 1}.xhtml';
-      spine.add(SpineItem(index: index, href: href));
+      spine.add(
+        SpineItem(id: SpineItemId.generated(index), index: index, href: href),
+      );
       contents.add(section.content);
       if (section.linear) {
         fallbackToc.add(
@@ -181,6 +183,7 @@ class DirectBookSource implements BookSource {
       HtmlSectionContent(:final html) => promoteTocHeadings(
         _parser.parse(
           spineIndex: index,
+          spineId: item.id,
           href: item.href,
           xhtml:
               '<html xmlns="http://www.w3.org/1999/xhtml">'
@@ -198,6 +201,7 @@ class DirectBookSource implements BookSource {
         _tocHeadingHints[item.href] ?? const [],
       ),
       ImageSectionContent(:final resourcePath, :final alt) => Section(
+        id: item.id,
         spineIndex: index,
         href: item.href,
         blocks: [

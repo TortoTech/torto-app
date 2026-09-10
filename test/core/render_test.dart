@@ -10,6 +10,7 @@ import 'package:torto/core/layout/layout_types.dart';
 import 'package:torto/core/render/page_painter.dart';
 
 Section _section() => Section(
+  id: SpineItemId.generated(0),
   spineIndex: 0,
   href: 's.xhtml',
   blocks: [
@@ -142,7 +143,12 @@ void main() {
       ],
     );
     final pages = const LayoutEngine().paginate(
-      Section(spineIndex: 0, href: 's.xhtml', blocks: [block]),
+      Section(
+        id: SpineItemId.generated(0),
+        spineIndex: 0,
+        href: 's.xhtml',
+        blocks: [block],
+      ),
       LayoutViewport(width: width.toDouble(), height: height.toDouble()),
       const ReaderStyle(
         baseFontSize: 10,

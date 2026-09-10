@@ -102,6 +102,7 @@ class WebDavClient {
       'books/',
       'state/',
       'derived/',
+      'statistics/',
       'tmp/',
     ];
     for (final path in collections) {

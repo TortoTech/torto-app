@@ -8,6 +8,8 @@ import 'toc_items.dart';
 /// toggles, active-row highlight, and auto-scroll to the active row when
 /// opened. Long lists are virtualized by [ListView.builder].
 class TocDrawer extends StatefulWidget {
+  final Widget? annotationsContent;
+
   /// Pre-flattened rows (document order).
   final List<TocViewItem> items;
 
@@ -18,6 +20,7 @@ class TocDrawer extends StatefulWidget {
   final void Function(TocViewItem item) onNavigate;
 
   const TocDrawer({
+    this.annotationsContent,
     super.key,
     required this.items,
     required this.activeId,
@@ -97,17 +100,41 @@ class _TocDrawerState extends State<TocDrawer> {
     final visible = _visible;
     return Drawer(
       child: SafeArea(
-        child: visible.isEmpty
-            ? Center(
-                child: Text(context.l10n.text('没有目录', 'No table of contents')),
-              )
-            : ListView.builder(
-                controller: _scroll,
-                itemCount: visible.length,
-                itemExtent: _rowHeight,
-                itemBuilder: (context, index) =>
-                    _buildRow(context, visible[index]),
+        child: DefaultTabController(
+          length: widget.annotationsContent == null ? 1 : 2,
+          child: Column(
+            children: [
+              if (widget.annotationsContent != null)
+                TabBar(
+                  tabs: [
+                    Tab(text: context.l10n.text('目录', 'Contents')),
+                    Tab(text: context.l10n.text('标记', 'Marks')),
+                  ],
+                ),
+              Expanded(
+                child: TabBarView(
+                  children: [
+                    visible.isEmpty
+                        ? Center(
+                            child: Text(
+                              context.l10n.text('没有目录', 'No table of contents'),
+                            ),
+                          )
+                        : ListView.builder(
+                            controller: _scroll,
+                            itemCount: visible.length,
+                            itemExtent: _rowHeight,
+                            itemBuilder: (context, index) =>
+                                _buildRow(context, visible[index]),
+                          ),
+                    if (widget.annotationsContent != null)
+                      widget.annotationsContent!,
+                  ],
+                ),
               ),
+            ],
+          ),
+        ),
       ),
     );
   }

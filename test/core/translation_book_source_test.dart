@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:torto/core/ir/ir.dart';
+import 'package:torto/core/ir/text_index.dart';
 import 'package:torto/core/translation/translation_book_source.dart';
 import 'package:torto/core/translation/translation_markup.dart';
 import 'package:torto/core/translation/translation_models.dart';
@@ -15,7 +16,9 @@ class _Source implements BookSource {
   final Book book = const Book(
     id: 'book',
     metadata: BookMetadata(title: 'Book'),
-    spine: [SpineItem(index: 0, href: 'chapter.xhtml')],
+    spine: [
+      SpineItem(id: SpineItemId.generated(0), index: 0, href: 'chapter.xhtml'),
+    ],
   );
 
   @override
@@ -35,12 +38,61 @@ TextBlock _text(
   nodeId: node,
   inlines: inlines ?? [TextRun(value)],
   source: SourceRange(
-    start: SourceAnchor(spine: 0, node: node, textOffset: 0),
-    end: SourceAnchor(spine: 0, node: node, textOffset: value.length),
+    start: SourceAnchor(
+      spine: SpineItemId.generated(0),
+      node: node,
+      textOffset: 0,
+    ),
+    end: SourceAnchor(
+      spine: SpineItemId.generated(0),
+      node: node,
+      textOffset: value.length,
+    ),
   ),
 );
 
 void main() {
+  test(
+    'bilingual paragraphs share original anchors but retain distinct display identities',
+    () async {
+      final paragraph = _text('Original paragraph.', 'n0');
+      final original = _Source(
+        Section(
+          id: const SpineItemId.generated(0),
+          spineIndex: 0,
+          href: 'chapter.xhtml',
+          blocks: [paragraph],
+        ),
+      );
+      final source = TranslationBookSource(
+        original,
+        mode: TranslationMode.bilingual,
+      );
+      await source.storeBatch(0, [
+        const BlockTranslation(blockIndex: 0, text: '长度不同的译文段落。'),
+      ]);
+      source.enabled = true;
+      final nodes = sectionTextNodes(await source.parseSection(0)).toList();
+      expect(nodes, hasLength(2));
+      expect(nodes.map((n) => n.displayId).toSet(), hasLength(2));
+      expect(nodes.last.source.start, paragraph.source!.start);
+      final selected = SourceRange(
+        start: nodes.last.source.start,
+        end: SourceAnchor(
+          spine: nodes.last.source.start.spine,
+          node: 'n0',
+          textOffset: 999,
+        ),
+      );
+      final (ranges, quote) = await resolveOriginalParagraphSelection(
+        original,
+        [selected, selected],
+      );
+      expect(ranges, hasLength(1));
+      expect(ranges.single.toJson(), paragraph.source!.toJson());
+      expect(quote, 'Original paragraph.');
+    },
+  );
   test('protected inline styles and formulas round-trip through markup', () {
     const link = 'chapter.xhtml#note';
     const original = <Inline>[
@@ -131,6 +183,7 @@ void main() {
         captions: [_text('Caption', 'caption', kind: TextBlockKind.caption)],
       );
       final section = Section(
+        id: SpineItemId.generated(0),
         spineIndex: 0,
         href: 'chapter.xhtml',
         blocks: [paragraph, quote, table, figure],
@@ -178,7 +231,14 @@ void main() {
       inlines: const [TextRun('Second item')],
     );
     final source = TranslationBookSource(
-      _Source(Section(spineIndex: 0, href: 'chapter.xhtml', blocks: [list])),
+      _Source(
+        Section(
+          id: SpineItemId.generated(0),
+          spineIndex: 0,
+          href: 'chapter.xhtml',
+          blocks: [list],
+        ),
+      ),
       mode: TranslationMode.bilingual,
     );
     await source.storeBatch(0, [
@@ -201,7 +261,14 @@ void main() {
       ],
     );
     final source = TranslationBookSource(
-      _Source(Section(spineIndex: 0, href: 'chapter.xhtml', blocks: [note])),
+      _Source(
+        Section(
+          id: SpineItemId.generated(0),
+          spineIndex: 0,
+          href: 'chapter.xhtml',
+          blocks: [note],
+        ),
+      ),
     );
 
     final inputs = await source.untranslatedBlocksForNodes(0, {

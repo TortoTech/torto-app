@@ -1,5 +1,15 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:shared_preferences/shared_preferences.dart';
+import '../../core/ir/text_index.dart';
+import '../sync/sync_models.dart';
+import 'text_selection_layer.dart';
+import 'book_search_page.dart';
+import '../statistics/reading_tracker.dart';
+import '../statistics/statistics_store.dart';
+import '../statistics/statistics_model.dart';
+import '../settings/reading_settings_page.dart';
+import 'system_reader_fonts.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -40,7 +50,520 @@ enum _TurnPhase { idle, dragging, animating }
 
 enum _TurnDirection { previous, next }
 
-class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
+class _ReaderPageState extends State<ReaderPage>
+    with TickerProviderStateMixin, WidgetsBindingObserver {
+  final _selectionKey = GlobalKey<ReaderSelectionLayerState>();
+  bool _selecting = false;
+  bool _showBookEnd = false;
+  bool _completionSaving = false;
+  bool _completionMarked = false;
+
+  void _openBookEnd() {
+    if (!mounted) return;
+    setState(() {
+      _showBookEnd = true;
+      _overlayVisible = false;
+    });
+    _tickStatistics();
+  }
+
+  Future<void> _nextPageOrEnd(ReaderController controller) async {
+    if (!controller.canPeek(1)) {
+      _openBookEnd();
+      return;
+    }
+    final before = (controller.sectionIndex, controller.pageIndex);
+    await controller.nextPage();
+    if (before == (controller.sectionIndex, controller.pageIndex) &&
+        !controller.canPeek(1)) {
+      _openBookEnd();
+    }
+    _schedulePeekPreparation();
+  }
+
+  ReaderSelectionMode _selectionMode = ReaderSelectionMode.free;
+  PageLayout? _interactionPage;
+  List<BookTextNode> _interactionNodes = [];
+  List<ReaderPaintMark> _marks = [];
+  BookSearchChoice? _searchChoice;
+  int _searchIndex = 0;
+  Future<void> _loadInteraction(PageLayout page) async {
+    try {
+      final controller = _controller!;
+      if (controller.statisticsBookId.isEmpty) return;
+      final nodes = await controller.textNodes(
+        controller.sectionIndex,
+        displayed: true,
+      );
+      final visibleIds =
+          page.items.whereType<TextPlacement>().map((t) => t.nodeId).toSet()
+            ..addAll(
+              page.items.whereType<TableCellPlacement>().map((t) => t.nodeId),
+            );
+      final marks = <ReaderPaintMark>[];
+      if (!mounted || _interactionPage != page) return;
+      setState(
+        () => _interactionNodes = nodes
+            .where((n) => visibleIds.contains(n.displayId))
+            .toList(),
+      );
+      {
+        await controller.loadAnnotations();
+        for (final annotation in controller.annotations) {
+          final ranges = await controller.resolveAnnotation(annotation);
+          if (ranges != null) {
+            for (final range in ranges) {
+              marks.add(
+                ReaderPaintMark(range, const Color(0x55E4B948), annotation.id),
+              );
+            }
+          }
+        }
+      }
+      if (_searchChoice != null) {
+        marks.add(
+          ReaderPaintMark(
+            _searchChoice!.matches[_searchIndex].range,
+            const Color(0x7791BDF5),
+          ),
+        );
+      }
+      if (!mounted || _interactionPage != page) return;
+      setState(() {
+        _interactionNodes = nodes
+            .where((n) => visibleIds.contains(n.displayId))
+            .toList();
+        _marks = marks;
+      });
+    } catch (error) {
+      debugPrint('Could not load text interactions: $error');
+    }
+  }
+
+  Future<void> _chooseSelectionMode() async {
+    if (_controller?.translationEnabled == true) return;
+    final mode = await showModalBottomSheet<ReaderSelectionMode>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final entry in {
+              ReaderSelectionMode.free: context.l10n.text('自由', 'Free'),
+              ReaderSelectionMode.word: context.l10n.text('单词', 'Word'),
+              ReaderSelectionMode.sentence: context.l10n.text('句子', 'Sentence'),
+              ReaderSelectionMode.paragraph: context.l10n.text(
+                '段落',
+                'Paragraph',
+              ),
+            }.entries)
+              ListTile(
+                title: Text(entry.value),
+                selected: entry.key == _selectionMode,
+                trailing: entry.key == _selectionMode
+                    ? const Icon(Icons.check)
+                    : null,
+                onTap: () => Navigator.pop(context, entry.key),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (mode == null || !mounted) return;
+    setState(() => _selectionMode = mode);
+    await (await SharedPreferences.getInstance()).setString(
+      'reader_selection_mode',
+      mode.name,
+    );
+  }
+
+  Future<void> _searchBook() async {
+    final choice = await Navigator.push<BookSearchChoice>(
+      context,
+      MaterialPageRoute(builder: (_) => BookSearchPage(file: widget.file)),
+    );
+    if (!mounted || choice == null || choice.matches.isEmpty) return;
+    _searchChoice = choice;
+    _searchIndex = choice.index;
+    await _jumpSearch();
+  }
+
+  Future<void> _jumpSearch() async {
+    final result = _searchChoice!.matches[_searchIndex];
+    await _controller!.goToTextRange(result.range);
+    if (mounted) {
+      setState(() {
+        _interactionPage = null;
+        _overlayVisible = false;
+      });
+    }
+  }
+
+  Future<void> _saveSelection(
+    ReaderSelection selection,
+    bool withNote, {
+    AnnotationState? existing,
+  }) async {
+    if (existing == null && _controller?.translationEnabled == true) {
+      try {
+        final (ranges, quote) = await _controller!.originalParagraphSelection(
+          selection.ranges,
+        );
+        if (!mounted) return;
+        selection = ReaderSelection(ranges, quote);
+      } catch (_) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                context.l10n.text(
+                  '无法定位对应原文段落',
+                  'Could not locate the original paragraph',
+                ),
+              ),
+            ),
+          );
+        }
+        return;
+      }
+    }
+    String? note = existing?.note;
+    if (withNote) {
+      final editor = TextEditingController(text: note);
+      note = await showModalBottomSheet<String>(
+        context: context,
+        isScrollControlled: true,
+        builder: (context) => SafeArea(
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(
+              20,
+              20,
+              20,
+              MediaQuery.viewInsetsOf(context).bottom + 20,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  selection.quote,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: editor,
+                  autofocus: true,
+                  minLines: 3,
+                  maxLines: 6,
+                  decoration: InputDecoration(
+                    hintText: context.l10n.text('写下批注', 'Write a note'),
+                  ),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(context, editor.text),
+                  child: Text(context.l10n.text('保存', 'Save')),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+      // The closing route may still be animating with its TextField attached.
+      Future<void>.delayed(const Duration(milliseconds: 400), editor.dispose);
+      if (note == null) return;
+    }
+    try {
+      await _controller!.saveAnnotation(
+        selection.ranges,
+        selection.quote,
+        note: note,
+        previous: existing,
+      );
+      _selectionKey.currentState?.clear();
+      if (mounted) setState(() => _interactionPage = null);
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              context.l10n.text(
+                '无法保存此处标记，请重试',
+                'Could not save this mark. Try again.',
+              ),
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _annotationActions(String id) async {
+    final annotation = _controller!.annotations.firstWhere((a) => a.id == id);
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) => SafeArea(
+        child: SingleChildScrollView(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(annotation.quote),
+                if (annotation.note != null)
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Text(annotation.note!),
+                  ),
+                ListTile(
+                  title: Text(context.l10n.text('编辑批注', 'Edit note')),
+                  onTap: () => Navigator.pop(context, 'edit'),
+                ),
+                ListTile(
+                  title: Text(context.l10n.text('删除标记', 'Delete mark')),
+                  onTap: () => Navigator.pop(context, 'delete'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (action == 'edit') {
+      await _saveSelection(
+        ReaderSelection(const [], annotation.quote),
+        true,
+        existing: annotation,
+      );
+    }
+    if (action == 'delete') {
+      try {
+        await _controller!.saveAnnotation(
+          const [],
+          annotation.quote,
+          previous: annotation,
+          delete: true,
+        );
+        if (mounted) setState(() => _interactionPage = null);
+      } catch (_) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                context.l10n.text('删除失败，请重试', 'Could not delete. Try again.'),
+              ),
+            ),
+          );
+        }
+      }
+    }
+  }
+
+  Future<void> _showAnnotations() async {
+    try {
+      await _controller!.loadAnnotations();
+    } catch (_) {
+      return;
+    }
+    if (!mounted) return;
+    final annotations = List<AnnotationState>.of(_controller!.annotations);
+    final selected = await showModalBottomSheet<AnnotationState>(
+      context: context,
+      isScrollControlled: true,
+      builder: (context) => SafeArea(
+        child: SizedBox(
+          height: MediaQuery.sizeOf(context).height * .75,
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(context.l10n.text('高亮与批注', 'Highlights and notes')),
+              ),
+              if (annotations.isEmpty)
+                Text(
+                  context.l10n.text(
+                    '长按正文添加高亮或批注',
+                    'Long-press text to add highlights or notes',
+                  ),
+                ),
+              Expanded(
+                child: ListView.builder(
+                  itemCount: annotations.length,
+                  itemBuilder: (context, i) {
+                    final annotation = annotations[i];
+                    return ListTile(
+                      title: Text(
+                        annotation.quote,
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      subtitle: annotation.note == null
+                          ? null
+                          : Text(annotation.note!, maxLines: 2),
+                      trailing: annotation.conflictOf == null
+                          ? null
+                          : const Icon(Icons.merge_type),
+                      onTap: () => Navigator.pop(context, annotation),
+                      onLongPress: () {
+                        Navigator.pop(context);
+                        _annotationActions(annotation.id);
+                      },
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (selected == null) return;
+    final ranges = await _controller!.resolveAnnotation(selected);
+    if (!mounted) return;
+    if (ranges == null || ranges.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            context.l10n.text('此标记暂无法定位', 'This mark cannot be located yet'),
+          ),
+        ),
+      );
+      await _annotationActions(selected.id);
+    } else {
+      await _controller!.goToTextRange(ranges.first);
+      if (mounted) {
+        setState(() {
+          _interactionPage = null;
+          _overlayVisible = false;
+        });
+      }
+    }
+  }
+
+  ReadingTracker? _readingTracker;
+  Timer? _statisticsTimer;
+  final Stopwatch _statisticsClock = Stopwatch();
+  bool _statisticsForeground = true;
+  bool _statisticsFootnote = false;
+  bool _statisticsDrawer = false;
+  final List<Map<String, dynamic>> _statisticsPending = [];
+  bool _statisticsWriting = false;
+  ReadingStatisticsStore? _statisticsStore;
+  String _statisticsBookId = '';
+
+  Future<void> _startStatistics(ReaderController controller) async {
+    if (controller.statisticsBookId.isEmpty || _readingTracker != null) return;
+    try {
+      final store = await ReadingStatisticsStore.instance();
+      if (!mounted) return;
+      _statisticsStore = store;
+      _statisticsBookId = controller.statisticsBookId;
+      final metadata = controller.statisticsMetadata!;
+      final known = aggregateStatistics(await store.events());
+      if (!known.containsKey(_statisticsBookId)) {
+        await store.record(_statisticsBookId, 'Metadata', {
+          'title': metadata.title,
+          'authors': metadata.authors.join(', '),
+          'added': 0,
+        });
+      }
+      if (!mounted) return;
+      _statisticsClock.start();
+      _readingTracker = ReadingTracker((data) {
+        _statisticsPending.add(data);
+        unawaited(_writeStatistics());
+      });
+      _tickStatistics(activity: true);
+      _statisticsTimer = Timer.periodic(
+        const Duration(seconds: 1),
+        (_) => _tickStatistics(),
+      );
+    } catch (error) {
+      debugPrint('Could not start reading statistics: $error');
+    }
+  }
+
+  Future<void> _writeStatistics() async {
+    if (_statisticsWriting || _statisticsStore == null) return;
+    _statisticsWriting = true;
+    try {
+      while (_statisticsPending.isNotEmpty) {
+        await _statisticsStore!.record(
+          _statisticsBookId,
+          'Reading',
+          _statisticsPending.first,
+        );
+        _statisticsPending.removeAt(0);
+      }
+    } catch (error) {
+      debugPrint('Could not save reading statistics: $error');
+    } finally {
+      _statisticsWriting = false;
+    }
+  }
+
+  void _tickStatistics({bool activity = false, bool closing = false}) {
+    final now = DateTime.now();
+    final controller = _controller;
+    _readingTracker?.tick(
+      monotonicMs: _statisticsClock.elapsedMilliseconds,
+      wallMs: now.millisecondsSinceEpoch,
+      offsetSeconds: now.timeZoneOffset.inSeconds,
+      eligible:
+          !closing &&
+          mounted &&
+          !_showBookEnd &&
+          _statisticsForeground &&
+          !_statisticsDrawer &&
+          (ModalRoute.of(context)?.isCurrent == true || _statisticsFootnote) &&
+          controller?.currentPage != null &&
+          controller?.busy == false,
+      activity: activity,
+      progress: controller?.totalProgression ?? 0,
+    );
+    if (_statisticsPending.isNotEmpty) unawaited(_writeStatistics());
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _statisticsForeground = state == AppLifecycleState.resumed;
+    _tickStatistics(activity: _statisticsForeground);
+  }
+
+  Future<void> _markFinished() async {
+    if (_completionSaving || _completionMarked) return;
+    final id = _controller?.statisticsBookId ?? '';
+    if (id.isEmpty) return;
+    setState(() => _completionSaving = true);
+    _readingTracker?.flush();
+    try {
+      final store = await ReadingStatisticsStore.instance();
+      await _writeStatistics();
+      await store.setStatus(id, ReadingStatus.finished, dayKey(DateTime.now()));
+      if (mounted) {
+        setState(() => _completionMarked = true);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(context.l10n.text('已标记为读完', 'Marked as finished')),
+          ),
+        );
+      }
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              context.l10n.text('保存失败，请重试', 'Could not save. Try again.'),
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _completionSaving = false);
+    }
+  }
+
   static const ReaderStyle _baseStyle = ReaderStyle(
     baseFontSize: 20,
     lineHeight: 1.5,
@@ -94,6 +617,20 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
+    SharedPreferences.getInstance().then((prefs) {
+      if (mounted) {
+        setState(
+          () => _selectionMode = ReaderSelectionMode.values.firstWhere(
+            (m) => m.name == prefs.getString('reader_selection_mode'),
+            orElse: () => ReaderSelectionMode.free,
+          ),
+        );
+      }
+    });
+    WidgetsBinding.instance.addObserver(this);
+    _statisticsForeground =
+        WidgetsBinding.instance.lifecycleState == null ||
+        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
     _preferencesStore = widget.preferencesStore ?? ReaderPreferencesStore();
   }
 
@@ -123,8 +660,13 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
         if (mounted) setState(() {});
         await _restorePreferences();
         if (!mounted) return;
+        _style = _style.copyWith(
+          writingSystem: controller.style.writingSystem,
+          publicationLanguage: controller.style.publicationLanguage,
+        );
         _applySystemUiStyle();
         await controller.updateStyle(_style);
+        unawaited(_startStatistics(controller));
         if (!mounted) return;
         setState(() {});
         _schedulePeekPreparation();
@@ -139,6 +681,8 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
         if (!mounted) return;
         _applySystemUiStyle();
         await controller.open(widget.file, viewport, _style);
+        unawaited(_startStatistics(controller));
+        _style = controller.style;
         // open() may finish before the ListenableBuilder below ever
         // entered the tree (the first build returns the plain spinner),
         // so its notifyListeners() reached no one. Rebuild to swap in
@@ -166,12 +710,27 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     final appPreferences = AppPreferencesScope.maybeOf(context);
     final inheritedDarkMode = Theme.of(context).brightness == Brightness.dark;
     final modeFuture = _preferencesStore.loadTypesettingMode();
+    final typographyFuture = _preferencesStore.loadTypography();
     final mode = await modeFuture;
+    final typography = await typographyFuture;
+    await SystemReaderFonts.instance.load([
+      typography.cjkPrimaryFont.family,
+      typography.otherPrimaryFont.family,
+      if (typography.cjkLatinFont != null) typography.cjkLatinFont!.family,
+      if (typography.otherCjkFont != null) typography.otherCjkFont!.family,
+    ]);
     final darkMode = appPreferences == null
         ? await _preferencesStore.loadDarkMode()
         : inheritedDarkMode;
     _darkMode = darkMode;
-    _style = _themedStyle(_baseStyle.copyWith(typesettingMode: mode), darkMode);
+    _style = _themedStyle(
+      _baseStyle.copyWith(
+        baseFontSize: typography.fontSize,
+        typesettingMode: mode,
+        typography: typography,
+      ),
+      darkMode,
+    );
   }
 
   static ReaderStyle _themedStyle(ReaderStyle style, bool darkMode) =>
@@ -186,6 +745,10 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
 
   @override
   void dispose() {
+    _tickStatistics(closing: true);
+    _readingTracker?.flush();
+    _statisticsTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
     _peekTimer?.cancel();
     _turnAnimation?.dispose();
     if (_ownsController) _controller?.dispose();
@@ -207,6 +770,15 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
   }
 
   void _handleTap(TapUpDetails details, double width) {
+    if (_selecting) {
+      _selectionKey.currentState?.clear();
+      return;
+    }
+    final mark = _selectionKey.currentState?.markAt(details.localPosition);
+    if (mark != null) {
+      _annotationActions(mark);
+      return;
+    }
     final controller = _controller;
     if (controller == null ||
         controller.busy ||
@@ -224,7 +796,7 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
       controller.prevPage().then((_) => _schedulePeekPreparation());
     } else if (fraction > 0.8) {
       if (_overlayVisible) setState(() => _overlayVisible = false);
-      controller.nextPage().then((_) => _schedulePeekPreparation());
+      _nextPageOrEnd(controller);
     } else {
       setState(() => _overlayVisible = !_overlayVisible);
     }
@@ -253,13 +825,21 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
         );
         return;
       }
-      await showReaderFootnoteSheet(
-        context,
-        text: note.text,
-        background: _chromeBackground,
-        foreground: _chromeForeground,
-        publicationLanguage: controller.publicationLanguage,
-      );
+      _statisticsFootnote = true;
+      try {
+        await showReaderFootnoteSheet(
+          context,
+          text: note.text,
+          background: _chromeBackground,
+          foreground: _chromeForeground,
+          publicationLanguage: controller.publicationLanguage,
+          writingSystem: controller.style.writingSystem,
+          typography: controller.style.typography,
+        );
+      } finally {
+        _statisticsFootnote = false;
+        if (mounted) _tickStatistics(activity: true);
+      }
       return;
     }
 
@@ -281,6 +861,7 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
   // ---- Drag-driven page turning -------------------------------------------
 
   void _onDragStart(DragStartDetails _, ReaderController controller) {
+    if (_selecting) return;
     final continuingRapidTurn = _turnPhase == _TurnPhase.animating;
     if (continuingRapidTurn) {
       // Complete the stable endpoint first, then let this pointer sequence
@@ -361,6 +942,13 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     final expectedVelocitySign = direction == _TurnDirection.next ? -1.0 : 1.0;
     final fling = velocity.abs() > 350 && velocity.sign == expectedVelocitySign;
     final draggedFar = _dragExtent.abs() > width * 0.25;
+    if (!hasTarget &&
+        direction == _TurnDirection.next &&
+        (fling || draggedFar)) {
+      _resetTurn();
+      _openBookEnd();
+      return;
+    }
     _animateTurn(hasTarget && (fling || draggedFar), controller, width);
   }
 
@@ -433,7 +1021,7 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
       return;
     }
     final turn = direction == _TurnDirection.next
-        ? controller.nextPage()
+        ? _nextPageOrEnd(controller)
         : controller.prevPage();
     unawaited(
       turn.whenComplete(() {
@@ -536,41 +1124,54 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
       value: systemOverlay,
       child: Theme(
         data: _readerThemeData(Theme.of(context), background, foreground),
-        child: Scaffold(
-          key: _scaffoldKey,
-          backgroundColor: background,
-          drawer: _buildDrawer(),
-          body: Stack(
-            children: [
-              Positioned.fill(
-                child: SafeArea(
-                  child: LayoutBuilder(
-                    builder: (context, constraints) {
-                      var controller = _controller;
-                      if (controller == null) {
-                        _startOpen(
-                          LayoutViewport(
-                            width: constraints.maxWidth,
-                            height: constraints.maxHeight,
-                          ),
+        child: PopScope(
+          canPop: !_selecting && !_showBookEnd,
+          onPopInvokedWithResult: (didPop, result) {
+            if (!didPop && _selecting) _selectionKey.currentState?.clear();
+            if (!didPop && _showBookEnd) setState(() => _showBookEnd = false);
+          },
+          child: Scaffold(
+            onDrawerChanged: (open) {
+              _statisticsDrawer = open;
+              _tickStatistics(activity: !open);
+            },
+            key: _scaffoldKey,
+            backgroundColor: background,
+            drawer: _buildDrawer(),
+            body: Stack(
+              children: [
+                Positioned.fill(
+                  child: SafeArea(
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        var controller = _controller;
+                        if (controller == null) {
+                          _startOpen(
+                            LayoutViewport(
+                              width: constraints.maxWidth,
+                              height: constraints.maxHeight,
+                            ),
+                          );
+                          controller = _controller;
+                          return const Center(
+                            child: CircularProgressIndicator(),
+                          );
+                        }
+                        return ListenableBuilder(
+                          listenable: controller,
+                          builder: (context, _) =>
+                              _buildReader(controller!, constraints),
                         );
-                        controller = _controller;
-                        return const Center(child: CircularProgressIndicator());
-                      }
-                      return ListenableBuilder(
-                        listenable: controller,
-                        builder: (context, _) =>
-                            _buildReader(controller!, constraints),
-                      );
-                    },
+                      },
+                    ),
                   ),
                 ),
-              ),
-              if (_overlayVisible) ...[
-                _buildReaderHeader(),
-                _buildReaderFooter(),
+                if (_overlayVisible) ...[
+                  _buildReaderHeader(),
+                  _buildReaderFooter(),
+                ],
               ],
-            ],
+            ),
           ),
         ),
       ),
@@ -651,11 +1252,34 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
                 tooltip: context.l10n.text('返回书架', 'Back to library'),
                 onPressed: () => Navigator.of(context).maybePop(),
               ),
+              const Spacer(),
+              IconButton(
+                onPressed: _searchBook,
+                icon: Icon(Icons.search, color: _chromeForeground),
+                tooltip: context.l10n.text('搜索', 'Search'),
+              ),
             ],
           ),
         ),
       ),
     ),
+  );
+
+  Widget _footerButton(
+    String key,
+    IconData icon,
+    String label,
+    VoidCallback? action,
+  ) => IconButton(
+    key: Key(key),
+    iconSize: 32,
+    constraints: BoxConstraints.tightFor(
+      width: MediaQuery.sizeOf(context).width < 384 ? 48 : 64,
+      height: 56,
+    ),
+    icon: Icon(icon, color: _chromeForeground),
+    tooltip: label,
+    onPressed: action,
   );
 
   Widget _buildReaderFooter() => Positioned(
@@ -672,50 +1296,49 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
         child: SizedBox(
           height: 56,
           child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
-              IconButton(
-                key: const Key('reader-toc-button'),
-                iconSize: 32,
-                constraints: const BoxConstraints.tightFor(
-                  width: 64,
-                  height: 56,
-                ),
-                icon: Icon(
-                  Icons.format_list_bulleted,
-                  color: _chromeForeground,
-                ),
-                tooltip: context.l10n.text('目录', 'Contents'),
-                onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+              _footerButton(
+                'reader-toc-button',
+                Icons.format_list_bulleted,
+                context.l10n.text('目录', 'Contents'),
+                () => _scaffoldKey.currentState?.openDrawer(),
               ),
-              IconButton(
-                key: const Key('reader-style-button'),
-                iconSize: 32,
-                constraints: const BoxConstraints.tightFor(
-                  width: 64,
-                  height: 56,
-                ),
-                icon: Icon(Icons.text_format, color: _chromeForeground),
-                tooltip: context.l10n.text('版式', 'Typesetting'),
-                onPressed: _showTypesettingSheet,
+              _footerButton(
+                'reader-marks-button',
+                Icons.bookmarks_outlined,
+                context.l10n.text('批注与高亮', 'Notes and highlights'),
+                _showAnnotations,
               ),
               _buildTranslationButton(),
-              IconButton(
-                key: const Key('reader-theme-button'),
-                iconSize: 32,
-                constraints: const BoxConstraints.tightFor(
-                  width: 64,
-                  height: 56,
-                ),
-                icon: Icon(
-                  _darkMode
-                      ? Icons.light_mode_outlined
-                      : Icons.dark_mode_outlined,
-                  color: _chromeForeground,
-                ),
-                tooltip: _darkMode
+              _footerButton(
+                'reader-selection-button',
+                Icons.select_all,
+                _controller?.translationEnabled == true
+                    ? context.l10n.text(
+                        '翻译模式固定按段落选择',
+                        'Translation uses paragraph selection',
+                      )
+                    : context.l10n.text('文字选择模式', 'Text selection mode'),
+                _controller?.translationEnabled == true
+                    ? null
+                    : _chooseSelectionMode,
+              ),
+              _footerButton(
+                'reader-style-button',
+                Icons.text_format,
+                context.l10n.text('字体排版', 'Typography'),
+                _showTypesettingSheet,
+              ),
+              _footerButton(
+                'reader-theme-button',
+                _darkMode
+                    ? Icons.light_mode_outlined
+                    : Icons.dark_mode_outlined,
+                _darkMode
                     ? context.l10n.text('浅色模式', 'Light mode')
                     : context.l10n.text('深色模式', 'Dark mode'),
-                onPressed: _toggleColorMode,
+                _toggleColorMode,
               ),
             ],
           ),
@@ -763,6 +1386,7 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     final controller = _controller;
     if (controller == null) return;
     final changed = await controller.toggleTranslation();
+    if (mounted && changed) setState(() => _interactionPage = null);
     if (!mounted || changed || controller.translationError == null) return;
     final error = controller.translationError!;
     final localizedError = _localizedTranslationError(error);
@@ -857,6 +1481,15 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
+                ListTile(
+                  leading: const Icon(Icons.text_fields),
+                  title: Text(context.l10n.text('字体与字号', 'Fonts and size')),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () {
+                    Navigator.of(sheetContext).pop();
+                    _openReadingSettings();
+                  },
+                ),
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                   child: Text(
@@ -906,6 +1539,31 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
     _schedulePeekPreparation();
   }
 
+  Future<void> _openReadingSettings() async {
+    final controller = _controller;
+    if (controller == null) return;
+    final saved = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => ReadingSettingsPage(store: _preferencesStore),
+      ),
+    );
+    if (saved != true || !mounted) return;
+    final typography = await _preferencesStore.loadTypography();
+    final mode = await _preferencesStore.loadTypesettingMode();
+    if (!mounted) return;
+    final next = controller.style.copyWith(
+      typography: typography,
+      baseFontSize: typography.fontSize,
+      typesettingMode: mode,
+    );
+    setState(() {
+      _style = next;
+      _overlayVisible = false;
+    });
+    await controller.updateStyle(next);
+    _schedulePeekPreparation();
+  }
+
   Widget _typesettingChoice(
     BuildContext context,
     TypesettingMode mode,
@@ -933,6 +1591,59 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
       builder: (context, _) {
         final items = flattenToc(controller.toc);
         return TocDrawer(
+          annotationsContent: controller.annotations.isEmpty
+              ? Center(
+                  child: Text(
+                    context.l10n.text(
+                      '长按正文添加标记',
+                      'Long-press text to add marks',
+                    ),
+                  ),
+                )
+              : ListView(
+                  children: [
+                    for (final annotation in controller.annotations)
+                      ListTile(
+                        title: Text(
+                          annotation.quote,
+                          maxLines: 3,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        subtitle: annotation.note == null
+                            ? null
+                            : Text(annotation.note!, maxLines: 2),
+                        trailing: annotation.conflictOf == null
+                            ? null
+                            : const Icon(Icons.merge_type),
+                        onTap: () async {
+                          Navigator.of(context).pop();
+                          final ranges = await controller.resolveAnnotation(
+                            annotation,
+                          );
+                          if (!mounted || !context.mounted) return;
+                          if (ranges == null || ranges.isEmpty) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text(
+                                  context.l10n.text(
+                                    '此标记暂无法定位',
+                                    'This mark cannot be located yet',
+                                  ),
+                                ),
+                              ),
+                            );
+                            _annotationActions(annotation.id);
+                          } else {
+                            await controller.goToTextRange(ranges.first);
+                          }
+                        },
+                        onLongPress: () {
+                          Navigator.of(context).pop();
+                          _annotationActions(annotation.id);
+                        },
+                      ),
+                  ],
+                ),
           items: items,
           activeId: activeTocId(items, controller.sectionIndex),
           onNavigate: (item) {
@@ -947,34 +1658,174 @@ class _ReaderPageState extends State<ReaderPage> with TickerProviderStateMixin {
   }
 
   Widget _buildReader(ReaderController controller, BoxConstraints constraints) {
+    if (_showBookEnd) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.auto_stories_outlined,
+                size: 48,
+                color: _chromeForeground,
+              ),
+              const SizedBox(height: 20),
+              Text(
+                context.l10n.text('已到书籍结尾', 'End of book'),
+                style: Theme.of(context).textTheme.headlineSmall,
+              ),
+              const SizedBox(height: 12),
+              Text(
+                controller.title,
+                textAlign: TextAlign.center,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+              const SizedBox(height: 28),
+              FilledButton.icon(
+                key: const Key('book-end-finish-button'),
+                onPressed: _completionSaving || _completionMarked
+                    ? null
+                    : _markFinished,
+                icon: Icon(
+                  _completionMarked ? Icons.check_circle : Icons.task_alt,
+                ),
+                label: Text(
+                  _completionMarked
+                      ? context.l10n.text('已读完', 'Finished')
+                      : context.l10n.text('标记已读完', 'Mark as finished'),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextButton(
+                onPressed: () => setState(() => _showBookEnd = false),
+                child: Text(context.l10n.text('返回最后一页', 'Back to last page')),
+              ),
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: Text(context.l10n.text('返回书架', 'Back to library')),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
     final page = controller.currentPage;
+    if (page != null && _interactionPage != page) {
+      _interactionPage = page;
+      _interactionNodes = [];
+      _marks = [];
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _loadInteraction(page);
+      });
+    }
     final width = constraints.maxWidth;
     return Stack(
       children: [
         Positioned.fill(
-          child: GestureDetector(
-            behavior: HitTestBehavior.opaque,
-            onTapUp: (details) => _handleTap(details, width),
-            onHorizontalDragStart: (details) =>
-                _onDragStart(details, controller),
-            onHorizontalDragUpdate: (details) =>
-                _onDragUpdate(details, controller, width),
-            onHorizontalDragEnd: (details) =>
-                _onDragEnd(details, controller, width),
-            onHorizontalDragCancel: () => _onDragCancel(controller, width),
-            child: _turnDirection != null
-                ? _buildTurnScene(controller, width)
-                : (page == null
-                      ? const SizedBox.expand()
-                      : PageWidget(
-                          page: page,
-                          imageResolver: controller.resolveImage,
-                          background: _background,
-                          foreground: _foreground,
-                        )),
+          child: Listener(
+            onPointerDown: (_) => _tickStatistics(activity: true),
+            onPointerSignal: (_) => _tickStatistics(activity: true),
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTapUp: _selecting
+                  ? null
+                  : (details) => _handleTap(details, width),
+              onHorizontalDragStart: _selecting
+                  ? null
+                  : (details) => _onDragStart(details, controller),
+              onHorizontalDragUpdate: _selecting
+                  ? null
+                  : (details) => _onDragUpdate(details, controller, width),
+              onHorizontalDragEnd: _selecting
+                  ? null
+                  : (details) => _onDragEnd(details, controller, width),
+              onHorizontalDragCancel: _selecting
+                  ? null
+                  : () => _onDragCancel(controller, width),
+              child: _turnDirection != null
+                  ? _buildTurnScene(controller, width)
+                  : (page == null
+                        ? const SizedBox.expand()
+                        : ReaderSelectionLayer(
+                            key: _selectionKey,
+                            page: page,
+                            nodes: _interactionNodes,
+                            mode: controller.translationEnabled
+                                ? ReaderSelectionMode.paragraph
+                                : _selectionMode,
+                            marks: _marks,
+                            wholeParagraphMarks: controller.translationEnabled,
+                            onSelecting: (value) {
+                              if (mounted && value != _selecting) {
+                                setState(() {
+                                  _selecting = value;
+                                  if (value) _overlayVisible = false;
+                                });
+                              }
+                            },
+                            onSave: _saveSelection,
+                            onMarkTap: _annotationActions,
+                            child: PageWidget(
+                              page: page,
+                              imageResolver: controller.resolveImage,
+                              background: _background,
+                              foreground: _foreground,
+                            ),
+                          )),
+            ),
           ),
         ),
         if (controller.busy) const Center(child: CircularProgressIndicator()),
+        if (_searchChoice != null && !_selecting)
+          Positioned(
+            top: 0,
+            left: 16,
+            right: 16,
+            child: SafeArea(
+              child: Material(
+                borderRadius: BorderRadius.circular(12),
+                child: Row(
+                  children: [
+                    IconButton(
+                      onPressed: _searchIndex > 0 && !controller.busy
+                          ? () {
+                              _searchIndex--;
+                              _jumpSearch();
+                            }
+                          : null,
+                      icon: const Icon(Icons.chevron_left),
+                    ),
+                    Expanded(
+                      child: Text(
+                        '${_searchIndex + 1} / ${_searchChoice!.matches.length}',
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                    IconButton(
+                      onPressed:
+                          _searchIndex + 1 < _searchChoice!.matches.length &&
+                              !controller.busy
+                          ? () {
+                              _searchIndex++;
+                              _jumpSearch();
+                            }
+                          : null,
+                      icon: const Icon(Icons.chevron_right),
+                    ),
+                    IconButton(
+                      onPressed: () => setState(() {
+                        _searchChoice = null;
+                        _interactionPage = null;
+                      }),
+                      icon: const Icon(Icons.close),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
       ],
     );
   }

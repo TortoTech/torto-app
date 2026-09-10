@@ -26,6 +26,7 @@ class OptimizedLine {
   final double adjustmentRatio;
   final double badness;
   final bool hyphenated;
+  final bool paragraphEnd;
 
   const OptimizedLine({
     required this.startCluster,
@@ -34,6 +35,7 @@ class OptimizedLine {
     required this.adjustmentRatio,
     required this.badness,
     this.hyphenated = false,
+    this.paragraphEnd = false,
   });
 }
 
@@ -146,7 +148,7 @@ class ParagraphOptimizer {
         lineWidth <= 0 ||
         !defaultEm.isFinite ||
         defaultEm <= 0 ||
-        !_supportedLtrProse(text)) {
+        !_supportedLtrProse(text.replaceAll(RegExp(r'[\r\n]'), ''))) {
       return null;
     }
     var expected = 0;
@@ -163,6 +165,84 @@ class ParagraphOptimizer {
       expected = cluster.end;
     }
     if (expected != text.length) return null;
+
+    if (text.contains(RegExp(r'[\r\n]'))) {
+      final lines = <OptimizedLine>[];
+      final adjustments = List<double>.filled(clusters.length, 0);
+      var start = 0;
+      for (var end = 0; end <= clusters.length; end++) {
+        final atEnd = end == clusters.length;
+        if (!atEnd &&
+            !text
+                .substring(clusters[end].start, clusters[end].end)
+                .contains(RegExp(r'[\r\n]'))) {
+          continue;
+        }
+        final from = start < clusters.length
+            ? clusters[start].start
+            : text.length;
+        final to = atEnd ? text.length : clusters[end].start;
+        final segment = text.substring(from, to);
+        if (segment.trim().isEmpty) {
+          lines.add(
+            OptimizedLine(
+              startCluster: start,
+              endCluster: atEnd ? end : end + 1,
+              naturalWidth: 0,
+              adjustmentRatio: 0,
+              badness: 0,
+              paragraphEnd: true,
+            ),
+          );
+        } else {
+          final part = plan(
+            text: segment,
+            clusters: [
+              for (final cluster in clusters.sublist(start, end))
+                MeasuredCluster(
+                  start: cluster.start - from,
+                  end: cluster.end - from,
+                  advance: cluster.advance,
+                  em: cluster.em,
+                  ordinaryBaseline: cluster.ordinaryBaseline,
+                  footnoteReference: cluster.footnoteReference,
+                ),
+            ],
+            legalBreaks: {
+              for (final boundary in legalBreaks)
+                if (boundary > from && boundary <= to) boundary - from,
+            },
+            hyphenBreaks: {
+              for (final entry in hyphenBreaks.entries)
+                if (entry.key > from && entry.key < to)
+                  entry.key - from: entry.value,
+            },
+            lineWidth: lineWidth,
+            firstLineIndent: start == 0 ? firstLineIndent : 0,
+            defaultEm: defaultEm,
+          );
+          if (part == null) return null;
+          adjustments.setRange(start, end, part.adjustments);
+          for (var index = 0; index < part.lines.length; index++) {
+            final line = part.lines[index];
+            final last = index + 1 == part.lines.length;
+            lines.add(
+              OptimizedLine(
+                startCluster: start + line.startCluster,
+                endCluster: start + line.endCluster + (last && !atEnd ? 1 : 0),
+                naturalWidth: line.naturalWidth,
+                adjustmentRatio: line.adjustmentRatio,
+                badness: line.badness,
+                hyphenated: line.hyphenated,
+                paragraphEnd: last,
+              ),
+            );
+          }
+        }
+        start = end + 1;
+      }
+      return ParagraphPlan(lines: lines, adjustments: adjustments);
+    }
 
     final items = <_Item>[];
     for (var index = 0; index < clusters.length; index++) {
@@ -328,6 +408,7 @@ class ParagraphOptimizer {
             adjustmentRatio: line.ratio,
             badness: line.badness,
             hyphenated: line.hyphenated,
+            paragraphEnd: line.last,
           ),
       ],
       adjustments: adjustments,
@@ -495,9 +576,13 @@ class ParagraphOptimizer {
     }
     final remainder = line.difference - stretchAmount;
     if (remainder > _epsilon && line.justifiable > 0) {
-      final perBoundary = remainder / line.justifiable;
+      final spaces = items
+          .sublist(line.start, line.measuredEnd)
+          .where((item) => item.stretch > _epsilon)
+          .length;
+      final perBoundary = remainder / (line.justifiable + spaces);
       for (var index = line.start; index + 1 < line.measuredEnd; index++) {
-        if (items[index].justifiableAfter) {
+        if (items[index].justifiableAfter || items[index].stretch > _epsilon) {
           adjustments[index] += perBoundary;
         }
       }

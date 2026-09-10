@@ -80,7 +80,10 @@ class _HomePageState extends State<HomePage> {
         index: _selectedIndex,
         children: [
           library,
-          ProfilePage(cloudSyncController: _cloudSync),
+          ProfilePage(
+            cloudSyncController: _cloudSync,
+            active: _selectedIndex == 1,
+          ),
         ],
       ),
       bottomNavigationBar: NavigationBar(

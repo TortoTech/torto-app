@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:torto/core/ir/ir.dart';
 import 'package:torto/core/linebreak/english_hyphenator.dart';
 
 void main() {
@@ -85,6 +86,44 @@ void main() {
         publicationLanguage: 'en-US',
       ),
       {5, 9},
+    );
+  });
+
+  test('manual mode uses soft hyphens and none suppresses all breaks', () {
+    final hyphenator = EnglishHyphenator.forTesting({
+      EnglishHyphenationLocale.enUs: (_) => const [2, 6],
+    });
+    const text = 'hy\u00adphenation';
+
+    expect(
+      hyphenator.breakOpportunities(
+        text: text,
+        spans: const [
+          HyphenationSpan(
+            start: 0,
+            end: text.length,
+            language: 'en-US',
+            mode: HyphenationMode.manual,
+          ),
+        ],
+        publicationLanguage: 'en-US',
+      ),
+      {3},
+    );
+    expect(
+      hyphenator.breakOpportunities(
+        text: text,
+        spans: const [
+          HyphenationSpan(
+            start: 0,
+            end: text.length,
+            language: 'en-US',
+            mode: HyphenationMode.none,
+          ),
+        ],
+        publicationLanguage: 'en-US',
+      ),
+      isEmpty,
     );
   });
 }
