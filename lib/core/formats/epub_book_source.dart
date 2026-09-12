@@ -134,9 +134,33 @@ class EpubBookSource implements BookSource {
   static Future<EpubBookSource> fromFileInBackground(
     String path, {
     String? publicationIdHint,
+    LocatorV1? initialLocator,
   }) => Isolate.run(() async {
     final bytes = await File(path).readAsBytes();
-    return fromBytes(bytes, publicationIdHint: publicationIdHint);
+    final source = await fromBytes(bytes, publicationIdHint: publicationIdHint);
+    // Returning the parsed IR with the archive avoids running the initial
+    // chapter's XHTML/CSS parsing on the UI isolate during route entry.
+    final count = source.book.sectionCount;
+    if (count > 0) {
+      var start = initialLocator?.position.clamp(0, count - 1) ?? 0;
+      if (initialLocator != null) {
+        final id = initialLocator.source?.start.spine;
+        final identified = id == null ? -1 : source.book.indexOfSpine(id);
+        final href = splitPackageFragment(initialLocator.href).$1;
+        final byHref = source.book.spine.indexWhere(
+          (item) => item.href == href,
+        );
+        if (identified >= 0) {
+          start = identified;
+        } else if (byHref >= 0) {
+          start = byHref;
+        }
+      }
+      for (var i = start; i < count; i++) {
+        if ((await source.parseSection(i)).blocks.isNotEmpty) break;
+      }
+    }
+    return source;
   });
 
   /// Opens already-loaded EPUB bytes outside the UI isolate. A transferable

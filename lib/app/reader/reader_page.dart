@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui' show FrameTiming;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../core/ir/text_index.dart';
 import '../sync/sync_models.dart';
@@ -34,12 +35,16 @@ class ReaderPage extends StatefulWidget {
   /// Injectable for tests; a fresh controller is created when omitted.
   final ReaderController? controller;
   final ReaderPreferencesStore? preferencesStore;
+  final ReadingStatisticsStore? statisticsStore;
+  final Stopwatch? openingStopwatch;
 
   const ReaderPage({
     super.key,
     required this.file,
     this.controller,
     this.preferencesStore,
+    this.statisticsStore,
+    this.openingStopwatch,
   });
 
   @override
@@ -55,8 +60,30 @@ class _ReaderPageState extends State<ReaderPage>
   final _selectionKey = GlobalKey<ReaderSelectionLayerState>();
   bool _selecting = false;
   bool _showBookEnd = false;
+  double _readerWidth = 0;
   bool _completionSaving = false;
   bool _completionMarked = false;
+  bool _completionStatusLoading = false;
+
+  Future<void> _refreshCompletionStatus() async {
+    final id = _controller?.statisticsBookId ?? '';
+    if (id.isEmpty || _completionStatusLoading) return;
+    setState(() => _completionStatusLoading = true);
+    try {
+      final store =
+          widget.statisticsStore ?? await ReadingStatisticsStore.instance();
+      final known = aggregateStatistics(await store.events());
+      if (mounted) {
+        setState(
+          () => _completionMarked = known[id]?.status == ReadingStatus.finished,
+        );
+      }
+    } catch (error) {
+      debugPrint('Could not read completion state: $error');
+    } finally {
+      if (mounted) setState(() => _completionStatusLoading = false);
+    }
+  }
 
   void _openBookEnd() {
     if (!mounted) return;
@@ -65,6 +92,7 @@ class _ReaderPageState extends State<ReaderPage>
       _overlayVisible = false;
     });
     _tickStatistics();
+    unawaited(_refreshCompletionStatus());
   }
 
   Future<void> _nextPageOrEnd(ReaderController controller) async {
@@ -76,7 +104,11 @@ class _ReaderPageState extends State<ReaderPage>
     await controller.nextPage();
     if (before == (controller.sectionIndex, controller.pageIndex) &&
         !controller.canPeek(1)) {
-      _openBookEnd();
+      if (_turnPhase == _TurnPhase.idle && _readerWidth > 0 && mounted) {
+        _animateBoundaryTap(controller, _readerWidth, _TurnDirection.next);
+      } else {
+        _openBookEnd();
+      }
     }
     _schedulePeekPreparation();
   }
@@ -110,6 +142,7 @@ class _ReaderPageState extends State<ReaderPage>
       {
         await controller.loadAnnotations();
         for (final annotation in controller.annotations) {
+          if (!mounted || _interactionPage != page) return;
           final ranges = await controller.resolveAnnotation(annotation);
           if (ranges != null) {
             for (final range in ranges) {
@@ -455,12 +488,19 @@ class _ReaderPageState extends State<ReaderPage>
   Future<void> _startStatistics(ReaderController controller) async {
     if (controller.statisticsBookId.isEmpty || _readingTracker != null) return;
     try {
-      final store = await ReadingStatisticsStore.instance();
+      final store =
+          widget.statisticsStore ?? await ReadingStatisticsStore.instance();
       if (!mounted) return;
       _statisticsStore = store;
       _statisticsBookId = controller.statisticsBookId;
       final metadata = controller.statisticsMetadata!;
       final known = aggregateStatistics(await store.events());
+      if (mounted) {
+        setState(
+          () => _completionMarked =
+              known[_statisticsBookId]?.status == ReadingStatus.finished,
+        );
+      }
       if (!known.containsKey(_statisticsBookId)) {
         await store.record(_statisticsBookId, 'Metadata', {
           'title': metadata.title,
@@ -538,7 +578,8 @@ class _ReaderPageState extends State<ReaderPage>
     setState(() => _completionSaving = true);
     _readingTracker?.flush();
     try {
-      final store = await ReadingStatisticsStore.instance();
+      final store =
+          widget.statisticsStore ?? await ReadingStatisticsStore.instance();
       await _writeStatistics();
       await store.setStatus(id, ReadingStatus.finished, dayKey(DateTime.now()));
       if (mounted) {
@@ -599,6 +640,8 @@ class _ReaderPageState extends State<ReaderPage>
 
   _TurnPhase _turnPhase = _TurnPhase.idle;
   _TurnDirection? _turnDirection;
+  bool _turnFromBookEnd = false;
+  bool _turnToBookEnd = false;
 
   /// Finger travel and its rendered counterpart. Keeping these separate
   /// avoids repeatedly damping an already-damped value at book boundaries.
@@ -617,6 +660,7 @@ class _ReaderPageState extends State<ReaderPage>
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addTimingsCallback(_logSlowReaderFrames);
     SharedPreferences.getInstance().then((prefs) {
       if (mounted) {
         setState(
@@ -653,8 +697,11 @@ class _ReaderPageState extends State<ReaderPage>
     final controller = widget.controller ?? ReaderController();
     _controller = controller;
     _ownsController = widget.controller == null;
+    controller.setReaderVisible(true);
     if (controller.opened) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
+        final firstFrameMs = widget.openingStopwatch?.elapsedMilliseconds;
+        final restoreWatch = Stopwatch()..start();
         // An injected, already-open controller can render immediately while
         // the persisted presentation preferences are being restored.
         if (mounted) setState(() {});
@@ -666,10 +713,14 @@ class _ReaderPageState extends State<ReaderPage>
         );
         _applySystemUiStyle();
         await controller.updateStyle(_style);
+        await controller.restoreSavedPosition();
         unawaited(_startStatistics(controller));
         if (!mounted) return;
         setState(() {});
         _schedulePeekPreparation();
+        debugPrint(
+          'TortoReader warm_open first_frame_ms=$firstFrameMs restore_ms=${restoreWatch.elapsedMilliseconds}',
+        );
       });
       return;
     }
@@ -677,18 +728,26 @@ class _ReaderPageState extends State<ReaderPage>
     _opening = true;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       try {
+        final openingWatch = Stopwatch()..start();
         await _restorePreferences();
+        final preferencesMilliseconds = openingWatch.elapsedMilliseconds;
         if (!mounted) return;
         _applySystemUiStyle();
         await controller.open(widget.file, viewport, _style);
-        unawaited(_startStatistics(controller));
         _style = controller.style;
         // open() may finish before the ListenableBuilder below ever
         // entered the tree (the first build returns the plain spinner),
         // so its notifyListeners() reached no one. Rebuild to swap in
         // the real reader now that a controller exists.
         if (mounted) setState(() {});
-        _schedulePeekPreparation();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          debugPrint(
+            'TortoReader first_page preferences_ms=$preferencesMilliseconds elapsed_ms=${openingWatch.elapsedMilliseconds}',
+          );
+          unawaited(_startStatistics(controller));
+          _schedulePeekPreparation();
+        });
       } catch (error, stackTrace) {
         debugPrint('Could not open ${widget.file.path}: $error\n$stackTrace');
         if (!mounted) return;
@@ -745,15 +804,32 @@ class _ReaderPageState extends State<ReaderPage>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeTimingsCallback(_logSlowReaderFrames);
     _tickStatistics(closing: true);
     _readingTracker?.flush();
     _statisticsTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _peekTimer?.cancel();
     _turnAnimation?.dispose();
-    if (_ownsController) _controller?.dispose();
+    if (_ownsController) {
+      _controller?.dispose();
+    } else {
+      _controller?.setReaderVisible(false);
+    }
     SystemChrome.setSystemUIOverlayStyle(_systemUiStyle(darkMode: false));
     super.dispose();
+  }
+
+  void _logSlowReaderFrames(List<FrameTiming> timings) {
+    if (_controller == null) return;
+    for (final timing in timings) {
+      if (timing.buildDuration.inMilliseconds >= 32 ||
+          timing.rasterDuration.inMilliseconds >= 32) {
+        debugPrint(
+          'TortoReader slow_frame build_ms=${timing.buildDuration.inMilliseconds} raster_ms=${timing.rasterDuration.inMilliseconds} turn=${_turnPhase.name} opening=${_controller?.opened != true} translated=${_controller?.translationEnabled}',
+        );
+      }
+    }
   }
 
   /// Schedules adjacent-section pagination for the next event-loop turn, so
@@ -781,8 +857,16 @@ class _ReaderPageState extends State<ReaderPage>
     }
     final controller = _controller;
     if (controller == null ||
+        !controller.opened ||
         controller.busy ||
         _turnPhase != _TurnPhase.idle) {
+      return;
+    }
+    final fraction = details.localPosition.dx / width;
+    if (_showBookEnd) {
+      if (fraction < .2) {
+        _animateBoundaryTap(controller, width, _TurnDirection.previous);
+      }
       return;
     }
     final link = controller.currentPage?.linkAt(details.localPosition);
@@ -790,13 +874,16 @@ class _ReaderPageState extends State<ReaderPage>
       unawaited(_activateLink(controller, link));
       return;
     }
-    final fraction = details.localPosition.dx / width;
     if (fraction < 0.2) {
       if (_overlayVisible) setState(() => _overlayVisible = false);
       controller.prevPage().then((_) => _schedulePeekPreparation());
     } else if (fraction > 0.8) {
       if (_overlayVisible) setState(() => _overlayVisible = false);
-      _nextPageOrEnd(controller);
+      if (!controller.canPeek(1)) {
+        _animateBoundaryTap(controller, width, _TurnDirection.next);
+      } else {
+        _nextPageOrEnd(controller);
+      }
     } else {
       setState(() => _overlayVisible = !_overlayVisible);
     }
@@ -860,8 +947,29 @@ class _ReaderPageState extends State<ReaderPage>
 
   // ---- Drag-driven page turning -------------------------------------------
 
+  void _animateBoundaryTap(
+    ReaderController controller,
+    double width,
+    _TurnDirection direction,
+  ) {
+    _onDragStart(DragStartDetails(), controller);
+    if (_turnPhase != _TurnPhase.dragging) return;
+    _turnDirection = direction;
+    _turnToBookEnd =
+        !_turnFromBookEnd &&
+        direction == _TurnDirection.next &&
+        !controller.canPeek(1);
+    _animateTurn(true, controller, width);
+  }
+
+  bool _turnHasTarget(ReaderController controller) {
+    if (_turnFromBookEnd) return _turnDirection == _TurnDirection.previous;
+    if (_turnToBookEnd) return controller.currentPage != null;
+    return controller.canPeek(_turnDirection == _TurnDirection.next ? 1 : -1);
+  }
+
   void _onDragStart(DragStartDetails _, ReaderController controller) {
-    if (_selecting) return;
+    if (_selecting || !controller.opened) return;
     final continuingRapidTurn = _turnPhase == _TurnPhase.animating;
     if (continuingRapidTurn) {
       // Complete the stable endpoint first, then let this pointer sequence
@@ -869,13 +977,15 @@ class _ReaderPageState extends State<ReaderPage>
       // readers perceive every other swipe as lost.
       _finishTurn(controller);
     }
-    if ((!continuingRapidTurn && controller.busy) ||
-        _turnPhase != _TurnPhase.idle) {
+    if (controller.busy || _turnPhase != _TurnPhase.idle) {
       return;
     }
     _peekTimer?.cancel();
     setState(() {
       _turnPhase = _TurnPhase.dragging;
+      controller.setPageTurnActive(true);
+      _turnFromBookEnd = _showBookEnd;
+      _turnToBookEnd = false;
       _turnDirection = null;
       _dragExtent = 0;
       _visualOffset = 0;
@@ -894,6 +1004,10 @@ class _ReaderPageState extends State<ReaderPage>
       _turnDirection = delta > 0
           ? _TurnDirection.previous
           : _TurnDirection.next;
+      _turnToBookEnd =
+          !_turnFromBookEnd &&
+          _turnDirection == _TurnDirection.next &&
+          !controller.canPeek(1);
     }
     final direction = _turnDirection;
     if (direction == null) return;
@@ -906,7 +1020,10 @@ class _ReaderPageState extends State<ReaderPage>
         : extent.clamp(0, width).toDouble();
 
     final pageOffset = direction == _TurnDirection.next ? 1 : -1;
-    final targetReady = controller.peekPage(pageOffset) != null;
+    final targetReady =
+        _turnToBookEnd ||
+        (_turnFromBookEnd && direction == _TurnDirection.previous) ||
+        (!_turnFromBookEnd && controller.peekPage(pageOffset) != null);
     final rendered = targetReady ? extent : _rubberBand(extent, width);
     if (extent == _dragExtent && rendered == _visualOffset) return;
     setState(() {
@@ -937,19 +1054,17 @@ class _ReaderPageState extends State<ReaderPage>
       return;
     }
     final velocity = details.primaryVelocity ?? 0;
-    final pageOffset = direction == _TurnDirection.next ? 1 : -1;
-    final hasTarget = controller.canPeek(pageOffset);
+    final hasTarget = _turnHasTarget(controller);
     final expectedVelocitySign = direction == _TurnDirection.next ? -1.0 : 1.0;
     final fling = velocity.abs() > 350 && velocity.sign == expectedVelocitySign;
     final draggedFar = _dragExtent.abs() > width * 0.25;
-    if (!hasTarget &&
-        direction == _TurnDirection.next &&
-        (fling || draggedFar)) {
-      _resetTurn();
-      _openBookEnd();
-      return;
-    }
-    _animateTurn(hasTarget && (fling || draggedFar), controller, width);
+    final reversingFling =
+        velocity.abs() > 350 && velocity.sign != expectedVelocitySign;
+    _animateTurn(
+      hasTarget && !reversingFling && (fling || draggedFar),
+      controller,
+      width,
+    );
   }
 
   void _onDragCancel(ReaderController controller, double width) {
@@ -966,7 +1081,15 @@ class _ReaderPageState extends State<ReaderPage>
       return;
     }
     final from = _visualOffset;
-    final to = commit
+    // Never animate the current page away to reveal a blank, unprepared
+    // chapter. Settle it first and let navigation finish loading underneath.
+    final previewReady =
+        _turnToBookEnd ||
+        (_turnFromBookEnd && direction == _TurnDirection.previous) ||
+        (!_turnFromBookEnd &&
+            controller.peekPage(direction == _TurnDirection.next ? 1 : -1) !=
+                null);
+    final to = commit && previewReady
         ? (direction == _TurnDirection.next ? -width : width)
         : 0.0;
     _animationCommits = commit;
@@ -1001,6 +1124,8 @@ class _ReaderPageState extends State<ReaderPage>
   void _finishTurn(ReaderController controller) {
     final committed = _animationCommits;
     final direction = _turnDirection;
+    final fromBookEnd = _turnFromBookEnd;
+    final toBookEnd = _turnToBookEnd;
     final animation = _turnAnimation;
     _turnAnimation = null;
     animation?.dispose();
@@ -1014,15 +1139,29 @@ class _ReaderPageState extends State<ReaderPage>
     _animationFrom = 0;
     _animationTo = 0;
     _animationCommits = false;
+    _turnFromBookEnd = _turnToBookEnd = false;
 
     if (!committed || direction == null) {
+      controller.setPageTurnActive(false);
       if (mounted) setState(() {});
+      _schedulePeekPreparation();
+      return;
+    }
+    if (fromBookEnd || toBookEnd) {
+      setState(() {
+        _showBookEnd = toBookEnd;
+        _overlayVisible = false;
+      });
+      controller.setPageTurnActive(false);
+      _tickStatistics(activity: !toBookEnd);
+      if (toBookEnd) unawaited(_refreshCompletionStatus());
       _schedulePeekPreparation();
       return;
     }
     final turn = direction == _TurnDirection.next
         ? _nextPageOrEnd(controller)
         : controller.prevPage();
+    controller.setPageTurnActive(false);
     unawaited(
       turn.whenComplete(() {
         if (mounted) setState(() {});
@@ -1034,6 +1173,7 @@ class _ReaderPageState extends State<ReaderPage>
   void _resetTurn() {
     _turnAnimation?.dispose();
     _turnAnimation = null;
+    _controller?.setPageTurnActive(false);
     if (!mounted) return;
     setState(() {
       _turnPhase = _TurnPhase.idle;
@@ -1043,6 +1183,7 @@ class _ReaderPageState extends State<ReaderPage>
       _animationFrom = 0;
       _animationTo = 0;
       _animationCommits = false;
+      _turnFromBookEnd = _turnToBookEnd = false;
     });
     _schedulePeekPreparation();
   }
@@ -1077,7 +1218,17 @@ class _ReaderPageState extends State<ReaderPage>
             foreground: _foreground,
           );
 
-    Widget ridingPage(PageLayout? layout, double left) => Positioned(
+    final currentWidget = _turnFromBookEnd
+        ? IgnorePointer(child: _buildBookEndContent(controller))
+        : page(current);
+    final neighbourWidget = _turnToBookEnd
+        ? IgnorePointer(child: _buildBookEndContent(controller))
+        : _turnFromBookEnd && direction == _TurnDirection.previous
+        ? page(current)
+        : page(neighbour);
+
+    Widget ridingPage(Widget content, double left) => Positioned(
+      key: const Key('reader-turn-moving-page'),
       left: left,
       top: 0,
       bottom: 0,
@@ -1092,7 +1243,7 @@ class _ReaderPageState extends State<ReaderPage>
             ),
           ],
         ),
-        child: page(layout),
+        child: content,
       ),
     );
 
@@ -1100,8 +1251,8 @@ class _ReaderPageState extends State<ReaderPage>
       return Stack(
         clipBehavior: Clip.hardEdge,
         children: [
-          Positioned.fill(child: page(current)),
-          ridingPage(neighbour, -width + offset),
+          Positioned.fill(child: currentWidget),
+          ridingPage(neighbourWidget, -width + offset),
         ],
       );
     }
@@ -1109,8 +1260,8 @@ class _ReaderPageState extends State<ReaderPage>
     return Stack(
       clipBehavior: Clip.hardEdge,
       children: [
-        Positioned.fill(child: page(neighbour)),
-        ridingPage(current, offset),
+        Positioned.fill(child: neighbourWidget),
+        ridingPage(currentWidget, offset),
       ],
     );
   }
@@ -1128,7 +1279,11 @@ class _ReaderPageState extends State<ReaderPage>
           canPop: !_selecting && !_showBookEnd,
           onPopInvokedWithResult: (didPop, result) {
             if (!didPop && _selecting) _selectionKey.currentState?.clear();
-            if (!didPop && _showBookEnd) setState(() => _showBookEnd = false);
+            if (!didPop && _showBookEnd) {
+              _resetTurn();
+              setState(() => _showBookEnd = false);
+              _tickStatistics(activity: true);
+            }
           },
           child: Scaffold(
             onDrawerChanged: (open) {
@@ -1153,12 +1308,14 @@ class _ReaderPageState extends State<ReaderPage>
                             ),
                           );
                           controller = _controller;
-                          return const Center(
-                            child: CircularProgressIndicator(),
-                          );
+                          if (controller?.opened != true) {
+                            return const Center(
+                              child: CircularProgressIndicator(),
+                            );
+                          }
                         }
                         return ListenableBuilder(
-                          listenable: controller,
+                          listenable: controller!,
                           builder: (context, _) =>
                               _buildReader(controller!, constraints),
                         );
@@ -1657,9 +1814,11 @@ class _ReaderPageState extends State<ReaderPage>
     );
   }
 
-  Widget _buildReader(ReaderController controller, BoxConstraints constraints) {
-    if (_showBookEnd) {
-      return Center(
+  Widget _buildBookEndContent(ReaderController controller) {
+    return ColoredBox(
+      key: const Key('book-end-swipe'),
+      color: _background,
+      child: Center(
         child: Padding(
           padding: const EdgeInsets.all(32),
           child: Column(
@@ -1685,7 +1844,10 @@ class _ReaderPageState extends State<ReaderPage>
               const SizedBox(height: 28),
               FilledButton.icon(
                 key: const Key('book-end-finish-button'),
-                onPressed: _completionSaving || _completionMarked
+                onPressed:
+                    _completionSaving ||
+                        _completionMarked ||
+                        _completionStatusLoading
                     ? null
                     : _markFinished,
                 icon: Icon(
@@ -1694,14 +1856,10 @@ class _ReaderPageState extends State<ReaderPage>
                 label: Text(
                   _completionMarked
                       ? context.l10n.text('已读完', 'Finished')
-                      : context.l10n.text('标记已读完', 'Mark as finished'),
+                      : context.l10n.text('标记读完', 'Mark as finished'),
                 ),
               ),
               const SizedBox(height: 12),
-              TextButton(
-                onPressed: () => setState(() => _showBookEnd = false),
-                child: Text(context.l10n.text('返回最后一页', 'Back to last page')),
-              ),
               TextButton(
                 onPressed: () => Navigator.of(context).pop(),
                 child: Text(context.l10n.text('返回书架', 'Back to library')),
@@ -1709,8 +1867,12 @@ class _ReaderPageState extends State<ReaderPage>
             ],
           ),
         ),
-      );
-    }
+      ),
+    );
+  }
+
+  Widget _buildReader(ReaderController controller, BoxConstraints constraints) {
+    _readerWidth = constraints.maxWidth;
     final page = controller.currentPage;
     if (page != null && _interactionPage != page) {
       _interactionPage = page;
@@ -1728,6 +1890,7 @@ class _ReaderPageState extends State<ReaderPage>
             onPointerDown: (_) => _tickStatistics(activity: true),
             onPointerSignal: (_) => _tickStatistics(activity: true),
             child: GestureDetector(
+              key: const Key('reader-page-gesture'),
               behavior: HitTestBehavior.opaque,
               onTapUp: _selecting
                   ? null
@@ -1746,6 +1909,8 @@ class _ReaderPageState extends State<ReaderPage>
                   : () => _onDragCancel(controller, width),
               child: _turnDirection != null
                   ? _buildTurnScene(controller, width)
+                  : _showBookEnd
+                  ? _buildBookEndContent(controller)
                   : (page == null
                         ? const SizedBox.expand()
                         : ReaderSelectionLayer(
@@ -1761,6 +1926,7 @@ class _ReaderPageState extends State<ReaderPage>
                               if (mounted && value != _selecting) {
                                 setState(() {
                                   _selecting = value;
+                                  controller.setPageTurnActive(value);
                                   if (value) _overlayVisible = false;
                                 });
                               }
@@ -1777,7 +1943,8 @@ class _ReaderPageState extends State<ReaderPage>
             ),
           ),
         ),
-        if (controller.busy) const Center(child: CircularProgressIndicator()),
+        if (controller.busy || !controller.opened)
+          const Center(child: CircularProgressIndicator()),
         if (_searchChoice != null && !_selecting)
           Positioned(
             top: 0,

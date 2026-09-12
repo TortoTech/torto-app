@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:crypto/crypto.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:uuid/uuid.dart';
@@ -45,6 +46,11 @@ class ReadingStatisticsStore {
             'CREATE TABLE events(id TEXT PRIMARY KEY, device TEXT NOT NULL, at INTEGER NOT NULL, json TEXT NOT NULL)',
           );
           await db.execute('CREATE INDEX events_device ON events(device, at)');
+        },
+        onOpen: (db) async {
+          await db.execute(
+            'CREATE TABLE IF NOT EXISTS sync_applied (key TEXT PRIMARY KEY, digest TEXT NOT NULL)',
+          );
         },
       ),
     );
@@ -121,13 +127,24 @@ class ReadingStatisticsStore {
       });
   Future<void> clear(String book) => record(book, 'Clear', {});
   Future<void> sync(WebDavClient webdav) async {
-    for (final file in await webdav.listJsonFiles('statistics/')) {
+    final files = await webdav.listJsonFiles('statistics/');
+    for (final file in files) {
       if (file.contains('/') || file.contains('\\')) continue;
       final object = await webdav.getOptional('statistics/$file');
       if (object == null) continue;
       if (object.bytes.length > 32 * 1024 * 1024) {
         throw const FormatException('Statistics shard too large');
       }
+      final digest = sha256.convert(object.bytes).toString();
+      // Keep acknowledgments with the events they describe, so recreating
+      // this database cannot leave stale acknowledgments in the sync store.
+      final appliedKey = '${webdav.accountKey}:$file';
+      final applied = await database.query(
+        'sync_applied',
+        where: 'key = ?',
+        whereArgs: [appliedKey],
+      );
+      if (applied.isNotEmpty && applied.single['digest'] == digest) continue;
       final json = jsonDecode(utf8.decode(object.bytes));
       if (json is! Map ||
           json['version'] != 1 ||
@@ -142,6 +159,10 @@ class ReadingStatisticsStore {
             )
             .toList(),
       );
+      await database.insert('sync_applied', {
+        'key': appliedKey,
+        'digest': digest,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
     }
     final shards = <String, List<Map<String, Object?>>>{};
     for (final e in await events()) {
@@ -152,7 +173,11 @@ class ReadingStatisticsStore {
       shards.putIfAbsent(month, () => []).add(e.toJson());
     }
     for (final shard in shards.entries) {
-      await webdav.putMutableJson('statistics/$device-${shard.key}.json', {
+      final file = '$device-${shard.key}.json';
+      if (!files.contains(file)) {
+        await webdav.invalidatePublished('statistics/$file');
+      }
+      await webdav.putMutableJson('statistics/$file', {
         'version': 1,
         'events': shard.value,
       });

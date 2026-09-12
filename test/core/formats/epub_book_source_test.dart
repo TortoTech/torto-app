@@ -144,6 +144,35 @@ void main() {
     expect((await source.parseSection(0)).blocks, isNotEmpty);
   });
 
+  test(
+    'background opening prepares the saved href before returning to the UI',
+    () async {
+      final directory = await Directory.systemTemp.createTemp(
+        'torto-epub-restore-',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      final file = await File(
+        '${directory.path}/book.epub',
+      ).writeAsBytes(_buildEpub());
+      final source = await EpubBookSource.fromFileInBackground(
+        file.path,
+        publicationIdHint: 'restore-book',
+        initialLocator: const LocatorV1(
+          publicationId: 'restore-book',
+          position: 0,
+          href: 'OPS/text/ch 2.xhtml',
+          progression: 0,
+        ),
+      );
+      // Mutating the input after the worker returns must not change the already
+      // prepared chapter. This also verifies href wins over stale position=0.
+      final input = await source.resource('OPS/text/ch 2.xhtml');
+      expect(input, isNotNull);
+      input!.fillRange(0, input.length, 32);
+      expect((await source.parseSection(1)).blocks, isNotEmpty);
+    },
+  );
+
   test('cover-image property wins over meta cover', () async {
     final opf = _opf.replaceAll(
       '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',

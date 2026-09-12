@@ -190,8 +190,16 @@ bool _isSemanticOpeningPunctuation(int? rune) => const {
 
 class LayoutEngine {
   final ParagraphHyphenator? hyphenator;
+  @visibleForTesting
+  final bool cacheHyphenMeasurements;
+  @visibleForTesting
+  final void Function()? onHyphenMeasurement;
 
-  const LayoutEngine({this.hyphenator});
+  const LayoutEngine({
+    this.hyphenator,
+    this.cacheHyphenMeasurements = true,
+    this.onHyphenMeasurement,
+  });
 
   @visibleForTesting
   static double debugResolvedFontSize(
@@ -275,9 +283,68 @@ class LayoutEngine {
     String? coverHref,
     RenditionLayout renditionLayout = RenditionLayout.reflowable,
   }) {
-    if (section.blocks.isEmpty) return const [];
+    List<PageLayout> result = const [];
+    for (final _ in _paginateSteps(
+      section,
+      viewport,
+      style,
+      (pages) => result = pages,
+      imageSizeResolver: imageSizeResolver,
+      coverHref: coverHref,
+      renditionLayout: renditionLayout,
+    )) {}
+    return result;
+  }
+
+  /// Uses the identical layout path, yielding between blocks so input and
+  /// frames can run. Retained dart:ui paragraphs stay on the UI isolate.
+  Future<List<PageLayout>> paginateAsync(
+    Section section,
+    LayoutViewport viewport,
+    ReaderStyle style, {
+    ui.Size? Function(String href)? imageSizeResolver,
+    String? coverHref,
+    RenditionLayout renditionLayout = RenditionLayout.reflowable,
+    Duration timeSlice = const Duration(milliseconds: 4),
+    bool Function()? shouldPause,
+  }) async {
+    List<PageLayout> result = const [];
+    final steps = _paginateSteps(
+      section,
+      viewport,
+      style,
+      (pages) => result = pages,
+      imageSizeResolver: imageSizeResolver,
+      coverHref: coverHref,
+      renditionLayout: renditionLayout,
+    ).iterator;
+    final slice = Stopwatch()..start();
+    while (true) {
+      while (shouldPause?.call() == true) {
+        await Future<void>.delayed(const Duration(milliseconds: 16));
+        slice.reset();
+      }
+      if (!steps.moveNext()) break;
+      if (slice.elapsedMicroseconds >= timeSlice.inMicroseconds) {
+        await Future<void>.delayed(Duration.zero);
+        slice.reset();
+      }
+    }
+    return result;
+  }
+
+  Iterable<int> _paginateSteps(
+    Section section,
+    LayoutViewport viewport,
+    ReaderStyle style,
+    void Function(List<PageLayout>) complete, {
+    ui.Size? Function(String href)? imageSizeResolver,
+    String? coverHref,
+    RenditionLayout renditionLayout = RenditionLayout.reflowable,
+  }) sync* {
+    if (section.blocks.isEmpty) return;
     final flowBlocks = _collectFlowBlocks(section.blocks, style);
-    if (flowBlocks.isEmpty) return const [];
+    if (flowBlocks.isEmpty) return;
 
     final contentLeft = style.marginLeft;
     final contentTop = style.marginTop;
@@ -341,6 +408,7 @@ class LayoutEngine {
           textStartOf[caption] ?? 0,
         );
         blockIndex += 2;
+        yield blockIndex;
         continue;
       }
       switch (block) {
@@ -354,8 +422,8 @@ class LayoutEngine {
             textStartOf[block] ?? 0,
             imageSizeResolver: imageSizeResolver,
           );
-          if (prepared == null) continue;
-          paginator.pushText(prepared);
+
+          if (prepared != null) paginator.pushText(prepared);
         case ImageBlock():
           _pushImage(
             paginator,
@@ -426,10 +494,11 @@ class LayoutEngine {
           throw StateError('Unexpected note block in the layout flow.');
       }
       blockIndex++;
+      yield blockIndex;
     }
 
     final rawPages = paginator.finish();
-    if (rawPages.isEmpty) return const [];
+    if (rawPages.isEmpty) return;
 
     final pages = <PageLayout>[];
     final disposalPool = ParagraphDisposalPool();
@@ -481,7 +550,7 @@ class LayoutEngine {
         ),
       );
     }
-    return pages;
+    complete(pages);
   }
 
   static List<Block> _collectFlowBlocks(List<Block> blocks, ReaderStyle style) {
@@ -1398,6 +1467,9 @@ class LayoutEngine {
     }
     measurement.dispose();
     final hyphenBreakWidths = <int, double>{};
+    // A discretionary hyphen has the same advance at every break inside one
+    // styled run. Do not shape the identical glyph once per candidate offset.
+    final hyphenAdvances = <_SourceRunSlice, double>{};
     var hyphenSliceIndex = 0;
     final orderedHyphenBreaks = hyphenationBreaks.toList()..sort();
     for (final offset in orderedHyphenBreaks) {
@@ -1408,20 +1480,25 @@ class LayoutEngine {
       }
       final slice = slices[hyphenSliceIndex];
       if (offset <= slice.start || offset > slice.end) continue;
-      final advance = _measureDiscretionaryHyphen(
-        slice: slice,
-        unified: unified,
-        blockScale: blockScale,
-        baseSize: baseSize,
-        lineHeight: lineHeight,
-        foreground: foreground,
-        fontFamily: fontFamily,
-        fontFamilyFallback: fontFamilyFallback,
-        typography: typography,
-        isHeading: isHeading,
-        isQuote: isQuote,
-        isDefinitionTerm: block.kind == TextBlockKind.definitionTerm,
-      );
+      var advance = cacheHyphenMeasurements ? hyphenAdvances[slice] : null;
+      if (advance == null) {
+        onHyphenMeasurement?.call();
+        advance = _measureDiscretionaryHyphen(
+          slice: slice,
+          unified: unified,
+          blockScale: blockScale,
+          baseSize: baseSize,
+          lineHeight: lineHeight,
+          foreground: foreground,
+          fontFamily: fontFamily,
+          fontFamilyFallback: fontFamilyFallback,
+          typography: typography,
+          isHeading: isHeading,
+          isQuote: isQuote,
+          isDefinitionTerm: block.kind == TextBlockKind.definitionTerm,
+        );
+        if (cacheHyphenMeasurements) hyphenAdvances[slice] = advance;
+      }
       if (advance.isFinite && advance > 0) {
         hyphenBreakWidths[offset] = advance;
       }

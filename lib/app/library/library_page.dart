@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import '../progress_store.dart';
 import '../reader/reader_page.dart';
 import '../reader/reader_controller.dart';
+import '../reader/reader_session_cache.dart';
 import '../sync/cloud_sync_controller.dart';
 import '../../l10n/app_localizations.dart';
 import 'library_store.dart';
@@ -39,6 +40,10 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   bool _ownsCloudSync = false;
   CloudSyncStatus? _lastCloudStatus;
   ReaderController? _activeReader;
+  final _readerCache = ReaderSessionCache();
+  Timer? _syncTimer;
+  Timer? _readingSyncDebounce;
+  bool _foreground = true;
 
   /// Null while the first load is in flight.
   List<LibraryBook>? _books;
@@ -47,6 +52,14 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _syncTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+      if (!_foreground ||
+          _cloudSync?.settings.enabled != true ||
+          _cloudSync?.status == CloudSyncStatus.syncing) {
+        return;
+      }
+      unawaited(_flushAndSyncReading());
+    });
     _refresh();
     _cloudSync = widget.cloudSyncController;
     _cloudSync?.addListener(_onCloudSyncChanged);
@@ -82,6 +95,24 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     }
   }
 
+  void _onReaderChanged() {
+    if (_activeReader?.opened != true || _activeReader?.busy == true) return;
+    _readingSyncDebounce?.cancel();
+    _readingSyncDebounce = Timer(const Duration(seconds: 2), () {
+      if (!_foreground || _cloudSync?.settings.enabled != true) return;
+      unawaited(_flushAndSyncReading());
+    });
+  }
+
+  Future<void> _flushAndSyncReading() async {
+    try {
+      await _activeReader?.flushProgress();
+      if (mounted && _foreground) await _sync(silent: true, readingOnly: true);
+    } catch (error) {
+      debugPrint('Could not flush reading changes: $error');
+    }
+  }
+
   void _onCloudSyncChanged() {
     final status = _cloudSync?.status;
     final completed =
@@ -94,6 +125,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    _foreground = state == AppLifecycleState.resumed;
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused ||
         state == AppLifecycleState.detached) {
@@ -101,7 +133,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       if (reader != null) unawaited(reader.flushProgress());
     } else if (state == AppLifecycleState.resumed &&
         _cloudSync?.settings.enabled == true) {
-      unawaited(_sync(silent: true));
+      unawaited(_sync(silent: true, readingOnly: true));
     }
   }
 
@@ -165,6 +197,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
       ),
     );
     if (confirmed == true) {
+      _readerCache.invalidate(book.id);
       await _cloudSync?.markBookRemoved(book.id);
       await _store.delete(book.file);
       await _refresh();
@@ -173,27 +206,57 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   }
 
   Future<void> _open(LibraryBook book) async {
-    await _progressStore.markActivity(book.id);
-    if (!mounted) return;
-    final controller = ReaderController(
-      progressStore: _progressStore,
-      titleHint: book.title,
-      publicationIdHint: book.id,
+    if (!mounted || _activeReader != null) return;
+    final openingWatch = Stopwatch()..start();
+    // Enter the route immediately; persistence must not hold the shelf tap.
+    unawaited(
+      _progressStore.markActivity(book.id).catchError((Object error) {
+        debugPrint('Could not record book activity: $error');
+      }),
     );
+    final view = View.of(context);
+    final displayKey = (
+      view.physicalSize,
+      view.devicePixelRatio,
+      view.padding.top,
+      view.padding.bottom,
+    );
+    final controller =
+        _readerCache.take(book, displayKey: displayKey) ??
+        ReaderController(
+          progressStore: _progressStore,
+          titleHint: book.title,
+          publicationIdHint: book.id,
+        );
     _activeReader = controller;
+    controller.addListener(_onReaderChanged);
+    final route = MaterialPageRoute<void>(
+      builder: (_) => ReaderPage(
+        file: book.file,
+        controller: controller,
+        openingStopwatch: openingWatch,
+      ),
+    );
     try {
-      await Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => ReaderPage(file: book.file, controller: controller),
-        ),
-      );
+      await Navigator.of(context).push(route);
+      // The route result arrives before its exit animation has finished.
+      // Retained paragraphs must outlive that final rendered frame.
+      await route.completed;
       await controller.flushProgress();
     } finally {
+      _readingSyncDebounce?.cancel();
+      controller.removeListener(_onReaderChanged);
       _activeReader = null;
-      controller.dispose();
+      if (mounted) {
+        _readerCache.keep(book, controller, displayKey: displayKey);
+      } else {
+        controller.dispose();
+      }
     }
     await _refresh();
-    if (_cloudSync?.settings.enabled == true) unawaited(_sync(silent: true));
+    if (_cloudSync?.settings.enabled == true) {
+      unawaited(_sync(silent: true, readingOnly: true));
+    }
   }
 
   Future<void> _bookActions(LibraryBook book) async {
@@ -236,24 +299,12 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _sync({bool silent = false}) async {
+  Future<void> _sync({bool silent = false, bool readingOnly = false}) async {
     final controller = _cloudSync;
     if (controller == null) return;
     try {
-      final report = await controller.sync();
+      await controller.sync(force: !silent, readingOnly: readingOnly);
       await _refresh();
-      if (!mounted || silent) return;
-      final message = report.changed
-          ? context.l10n.text(
-              '同步完成：上传 ${report.uploadedBooks} 本，下载 ${report.downloadedBooks} 本，合并 ${report.mergedProgress + report.mergedAnnotations} 项阅读数据。',
-              'Sync complete: ${report.uploadedBooks} uploaded, '
-                  '${report.downloadedBooks} downloaded, '
-                  '${report.mergedProgress + report.mergedAnnotations} reading updates.',
-            )
-          : context.l10n.text('已是最新状态。', 'Everything is up to date.');
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(message)));
     } catch (error) {
       try {
         await _refresh();
@@ -273,7 +324,13 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
   }
 
   @override
+  void didHaveMemoryPressure() => _readerCache.clear();
+
+  @override
   void dispose() {
+    _readerCache.clear();
+    _syncTimer?.cancel();
+    _readingSyncDebounce?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     final cloud = _cloudSync;
     cloud?.removeListener(_onCloudSyncChanged);

@@ -53,6 +53,39 @@ TextBlock _text(
 
 void main() {
   test(
+    'translation structures are reused until the batch or display mode changes',
+    () async {
+      final original = _Source(
+        Section(
+          id: const SpineItemId.generated(0),
+          spineIndex: 0,
+          href: 'chapter.xhtml',
+          blocks: [_text('Original paragraph.', 'n0')],
+        ),
+      );
+      final source = TranslationBookSource(original);
+      final firstInputs = await source.untranslatedBlocksForNodes(0, {'n0'});
+      final secondInputs = await source.untranslatedBlocksForNodes(0, {'n0'});
+      expect(identical(firstInputs.single, secondInputs.single), isTrue);
+      await source.storeBatch(0, const [
+        BlockTranslation(blockIndex: 0, text: '译文一。'),
+      ]);
+      source.enabled = true;
+      final first = await source.parseSection(0);
+      expect(identical(first, await source.parseSection(0)), isTrue);
+      await source.storeBatch(0, const [
+        BlockTranslation(blockIndex: 0, text: '译文二。'),
+      ]);
+      final updated = await source.parseSection(0);
+      expect(identical(first, updated), isFalse);
+      expect((updated.blocks.single as TextBlock).plainText, '译文二。');
+      source.mode = TranslationMode.bilingual;
+      expect((await source.parseSection(0)).blocks, hasLength(2));
+      source.enabled = false;
+      expect(identical(await source.parseSection(0), original.section), isTrue);
+    },
+  );
+  test(
     'bilingual paragraphs share original anchors but retain distinct display identities',
     () async {
       final paragraph = _text('Original paragraph.', 'n0');

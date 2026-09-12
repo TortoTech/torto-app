@@ -82,6 +82,26 @@ class SyncStore {
 
   Future<void> close() => database.close();
 
+  /// Account-scoped, regenerable transfer state; never part of cloud data.
+  Future<String?> cacheGet(String account, String key) =>
+      _meta(database, 'transfer:$account:$key');
+
+  Future<void> cacheSet(String account, String key, String value) =>
+      _setMeta(database, 'transfer:$account:$key', value);
+
+  Future<void> cacheRemove(String account, String key) => database.delete(
+    'meta',
+    where: 'key = ?',
+    whereArgs: ['transfer:$account:$key'],
+  );
+
+  Future<Set<String>> readingBookIds() async => {
+    for (final row in await database.rawQuery(
+      'SELECT book_id FROM progress UNION SELECT book_id FROM annotations',
+    ))
+      row['book_id'] as String,
+  };
+
   static Future<void> _createAnnotationsTable(DatabaseExecutor db) =>
       db.execute('''
         CREATE TABLE IF NOT EXISTS annotations (

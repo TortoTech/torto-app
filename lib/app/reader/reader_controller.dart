@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart';
 
 import '../../core/formats/formats.dart';
 import '../../core/html_ir/package_path.dart';
@@ -65,10 +66,23 @@ class ReaderController extends ChangeNotifier {
   Future<List<BookTextNode>> textNodes(
     int spine, {
     bool displayed = false,
-  }) async => sectionTextNodes(
-    await (displayed ? _source! : _resourceSource!).parseSection(spine),
-    includeNotes: true,
-  ).toList();
+  }) async {
+    final section = await (displayed ? _source! : _resourceSource!)
+        .parseSection(spine);
+    final key = (spine, displayed);
+    final cached = _textNodeCache.remove(key);
+    if (cached != null && identical(cached.$1, section)) {
+      _textNodeCache[key] = cached;
+      return cached.$2;
+    }
+    final nodes = sectionTextNodes(section, includeNotes: true).toList();
+    _textNodeCache[key] = (section, nodes);
+    while (_textNodeCache.length > 6) {
+      _textNodeCache.remove(_textNodeCache.keys.first);
+    }
+    return nodes;
+  }
+
   Future<void> saveAnnotation(
     List<SourceRange> ranges,
     String quote, {
@@ -210,6 +224,71 @@ class ReaderController extends ChangeNotifier {
   /// Pagination already in progress, shared by foreground navigation and
   /// background peek preparation so a section is never laid out twice.
   final Map<int, Future<List<PageLayout>>> _paginations = {};
+  final Map<int, int> _sectionRevisions = {};
+  final Map<(int, bool), (Section, List<BookTextNode>)> _textNodeCache = {};
+  final Set<int> _translationDirty = {};
+  final List<List<PageLayout>> _retiredPages = [];
+  Timer? _translationRefreshTimer;
+  bool _pageTurnActive = false;
+  bool _translationRefreshing = false;
+  bool _readerVisible = true;
+  bool _disposed = false;
+
+  bool get canReuseSession =>
+      !_disposed &&
+      opened &&
+      !busy &&
+      _format == BookFormat.epub &&
+      _activeAiSettings == null &&
+      !translationEnabled &&
+      !_translationRefreshing &&
+      !_progressDirty &&
+      _source != null;
+
+  void setReaderVisible(bool visible) {
+    if (_disposed) return;
+    _readerVisible = visible;
+    _pageTurnActive = false;
+    if (!visible) {
+      _translationRefreshTimer?.cancel();
+      _saveTimer?.cancel();
+    } else {
+      _scheduleTranslationRefresh();
+    }
+  }
+
+  /// A warm session must still respect reading progress received while away.
+  Future<void> restoreSavedPosition() async {
+    if (_disposed || !opened || _source == null || busy || sectionCount == 0) {
+      return;
+    }
+    final locator = await progressStore.load(_book.id);
+    if (locator == null || _disposed) return;
+    final anchor = locator.source?.start;
+    final identified = anchor == null ? -1 : _book.indexOfSpine(anchor.spine);
+    final byHref = _book.spine.indexWhere(
+      (item) => item.href == splitPackageFragment(locator.href).$1,
+    );
+    final target = identified >= 0
+        ? identified
+        : byHref >= 0
+        ? byHref
+        : locator.position.clamp(0, sectionCount - 1);
+    if (target != sectionIndex) {
+      final wasDirty = _progressDirty;
+      await goToSection(target);
+      // Restoring a received locator is not a new local reading event.
+      _saveTimer?.cancel();
+      _saveTimer = null;
+      _progressDirty = wasDirty;
+    }
+    if (_disposed || target != sectionIndex) return;
+    final restored = await _restorePageIndex(target, locator);
+    if (restored != pageIndex) {
+      pageIndex = restored;
+      notifyListeners();
+    }
+  }
 
   /// Decoded images by package href; null values mark known-missing.
   final Map<String, ui.Image?> _images = {};
@@ -233,6 +312,116 @@ class ReaderController extends ChangeNotifier {
   int _translationGeneration = 0;
   String? translationError;
   final Map<int, String> _translatedTocLabels = {};
+
+  /// Network work can finish during a swipe; applying its layout must wait.
+  void setPageTurnActive(bool active) {
+    _pageTurnActive = active;
+    if (active) {
+      _translationRefreshTimer?.cancel();
+    } else {
+      _scheduleTranslationRefresh();
+      if (_translationRecheckPending) _queueVisibleTranslation();
+    }
+  }
+
+  void _retirePages(List<PageLayout> pages) {
+    _retiredPages.add(pages);
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      if (_retiredPages.remove(pages)) _disposePages(pages);
+    });
+    SchedulerBinding.instance.scheduleFrame();
+  }
+
+  void _scheduleTranslationRefresh() {
+    _translationRefreshTimer?.cancel();
+    if (!_readerVisible ||
+        !translationEnabled ||
+        _translationDirty.isEmpty ||
+        _pageTurnActive ||
+        _translationRefreshing) {
+      return;
+    }
+    _translationRefreshTimer = Timer(const Duration(milliseconds: 250), () {
+      unawaited(_applyTranslationUpdates());
+    });
+  }
+
+  Future<void> _applyTranslationUpdates() async {
+    if (!_readerVisible ||
+        !opened ||
+        !translationEnabled ||
+        _pageTurnActive ||
+        _translationRefreshing) {
+      return;
+    }
+    if (busy) {
+      _scheduleTranslationRefresh();
+      return;
+    }
+    _translationRefreshing = true;
+    var changed = false;
+    var failed = false;
+    try {
+      for (final index in _translationDirty.toList()) {
+        if (index == sectionIndex) continue;
+        final old = _sections.remove(index);
+        if (old != null) _retirePages(old);
+        _translationDirty.remove(index);
+        changed = true;
+      }
+      final index = sectionIndex;
+      if (_translationDirty.contains(index)) {
+        final generation = _paginationGeneration;
+        final translationGeneration = _translationGeneration;
+        final revision = _sectionRevisions[index];
+        final pages = await _layoutSection(index);
+        if (generation != _paginationGeneration ||
+            translationGeneration != _translationGeneration ||
+            revision != _sectionRevisions[index] ||
+            sectionIndex != index ||
+            _pageTurnActive ||
+            busy ||
+            !opened) {
+          _disposePages(pages);
+          return;
+        }
+        // A reader may have navigated while the new layout yielded. Anchor to
+        // the latest visible page, never the page that requested translation.
+        final anchor = currentPage?.firstAnchor;
+        final progression = currentPage?.progression ?? 0;
+        final old = _sections[index];
+        _sections[index] = pages;
+        pageIndex = pages.isEmpty
+            ? 0
+            : anchor != null
+            ? _pageForAnchor(pages, anchor, progression)
+            : (progression * (pages.length - 1)).round().clamp(
+                0,
+                pages.length - 1,
+              );
+        _translationDirty.remove(index);
+        if (old != null) _retirePages(old);
+        changed = true;
+        _scheduleSave();
+      }
+    } catch (error, stack) {
+      failed = true;
+      debugPrint('Could not apply translated layout: $error\n$stack');
+      translationError = error.toString();
+    } finally {
+      _translationRefreshing = false;
+      if (opened && _source != null) {
+        if (changed || failed) notifyListeners();
+        if (!failed) {
+          _scheduleTranslationRefresh();
+          _queueVisibleTranslation();
+        }
+        if (changed && !failed) {
+          unawaited(ensurePeek().catchError((Object _, StackTrace _) {}));
+        }
+      }
+    }
+  }
 
   Timer? _saveTimer;
   bool _progressDirty = false;
@@ -320,8 +509,14 @@ class ReaderController extends ChangeNotifier {
     LayoutViewport viewport,
     ReaderStyle style,
   ) async {
+    if (_disposed) throw StateError('Reader is closed');
+    final openingGeneration = _paginationGeneration;
     _viewport = viewport;
     _style = style;
+    final openingWatch = Stopwatch()..start();
+    final hintedLocator = publicationIdHint == null
+        ? null
+        : await progressStore.load(publicationIdHint!);
     final fileName = _baseName(file.path);
     final format = BookFormat.fromFileName(fileName);
     _format = format;
@@ -330,6 +525,7 @@ class ReaderController extends ChangeNotifier {
       source = await EpubBookSource.fromFileInBackground(
         file.path,
         publicationIdHint: publicationIdHint,
+        initialLocator: hintedLocator,
       );
     } else {
       final bytes = await file.readAsBytes();
@@ -341,7 +537,14 @@ class ReaderController extends ChangeNotifier {
         publicationIdHint: publicationIdHint,
       );
     }
+    if (_disposed || openingGeneration != _paginationGeneration) {
+      if (source is DisposableBookSource) {
+        (source as DisposableBookSource).dispose();
+      }
+      throw StateError('Reader was closed while opening');
+    }
     _resourceSource = source;
+    final sourceMilliseconds = openingWatch.elapsedMilliseconds;
     final translationSource = TranslationBookSource(source);
     _translationSource = translationSource;
     _source = translationSource;
@@ -356,7 +559,7 @@ class ReaderController extends ChangeNotifier {
         ? _fileTitle(file.path)
         : _book.metadata.title;
 
-    final locator = await progressStore.load(_book.id);
+    final locator = hintedLocator ?? await progressStore.load(_book.id);
     final count = _book.sectionCount;
     var start = 0;
     if (locator != null && count > 0) {
@@ -398,11 +601,15 @@ class ReaderController extends ChangeNotifier {
         pageIndex = await _restorePageIndex(target, locator);
       }
       _evictDistantSections();
+      if (_disposed) throw StateError('Reader was closed while opening');
       opened = true;
     } finally {
       busy = false;
       notifyListeners();
     }
+    debugPrint(
+      'TortoReader open source_ms=$sourceMilliseconds total_ms=${openingWatch.elapsedMilliseconds} section=$sectionIndex pages=${currentPages.length}',
+    );
     // Generated/OCR TOC metadata is optional for the first paint. Load it
     // after the page is visible so a large metadata file cannot delay opening.
     unawaited(_loadDerivedToc(source, file.parent));
@@ -477,6 +684,8 @@ class ReaderController extends ChangeNotifier {
     translationError = null;
     if (translationEnabled) {
       translationEnabled = false;
+      _translationRefreshTimer?.cancel();
+      _translationDirty.clear();
       _translationGeneration++;
       source.enabled = false;
       _translationInFlight = false;
@@ -506,11 +715,17 @@ class ReaderController extends ChangeNotifier {
     );
     _activeAiSettings = settings;
     _translationGeneration++;
+    _paginationGeneration++;
+    _paginations.clear();
     translationEnabled = true;
     source
       ..mode = translation.mode
       ..targetLanguageCode = languageCode
       ..enabled = true;
+    for (final index in _sections.keys) {
+      if (source.hasTranslations(index)) _translationDirty.add(index);
+    }
+    _scheduleTranslationRefresh();
     notifyListeners();
     _queueVisibleTranslation();
     _queueTocTranslation();
@@ -520,14 +735,20 @@ class ReaderController extends ChangeNotifier {
   void retryTranslation() {
     if (!translationEnabled) return;
     translationError = null;
+    _scheduleTranslationRefresh();
     _queueVisibleTranslation();
     _queueTocTranslation();
   }
 
   void _queueVisibleTranslation() {
-    if (!translationEnabled) return;
-    if (_translationInFlight || busy) {
+    if (!translationEnabled || !_readerVisible || _disposed) return;
+    if (_translationInFlight ||
+        busy ||
+        _pageTurnActive ||
+        _translationRefreshing ||
+        _translationDirty.contains(sectionIndex)) {
       _translationRecheckPending = true;
+      _scheduleTranslationRefresh();
       return;
     }
     _translationRecheckPending = false;
@@ -551,9 +772,9 @@ class ReaderController extends ChangeNotifier {
     final visibleSection = sectionIndex;
     _translationInFlight = true;
     translationError = null;
-    notifyListeners();
     unawaited(() async {
       var succeeded = false;
+      var requested = false;
       try {
         final candidates = await _translationCandidateNodes(
           visibleSection,
@@ -572,6 +793,9 @@ class ReaderController extends ChangeNotifier {
           break;
         }
         if (requestedSection == null || blocks == null) return;
+        if (generation != _translationGeneration || !translationEnabled) return;
+        requested = true;
+        notifyListeners();
         final translation = settings.translation;
         final provider = settings.provider(translation.providerId)!;
         final results = await translationClient.translateBlocks(
@@ -590,9 +814,14 @@ class ReaderController extends ChangeNotifier {
         await source.storeBatch(requestedSection, results);
         if (generation != _translationGeneration || !translationEnabled) return;
         succeeded = true;
-        if (sectionIndex == requestedSection && !busy) {
-          await _refreshCurrentSectionPreservingPosition();
-        }
+        _sectionRevisions.update(
+          requestedSection,
+          (value) => value + 1,
+          ifAbsent: () => 1,
+        );
+        _paginations.remove(requestedSection);
+        _translationDirty.add(requestedSection);
+        _scheduleTranslationRefresh();
       } catch (error, stackTrace) {
         debugPrint(
           'Could not translate visible book text: $error\n$stackTrace',
@@ -603,7 +832,7 @@ class ReaderController extends ChangeNotifier {
       } finally {
         if (generation == _translationGeneration) {
           _translationInFlight = false;
-          notifyListeners();
+          if (requested) notifyListeners();
           if ((succeeded ||
                   _translationRecheckPending ||
                   sectionIndex != visibleSection) &&
@@ -884,7 +1113,13 @@ class ReaderController extends ChangeNotifier {
   /// invoked only when something was actually paginated, so the current
   /// page is never rebuilt with a partially-updated model.
   Future<void> ensurePeek() async {
-    if (busy || !opened || _peekPreparing) return;
+    if (busy ||
+        !opened ||
+        _peekPreparing ||
+        _pageTurnActive ||
+        !_readerVisible) {
+      return;
+    }
     _peekPreparing = true;
     try {
       var paginatedAny = false;
@@ -893,6 +1128,7 @@ class ReaderController extends ChangeNotifier {
           final section = _peekCoordinate(direction).$1;
           if (section < 0 || _sections.containsKey(section)) break;
           await _paginate(section);
+          if (_pageTurnActive || !opened) break;
           paginatedAny = true;
           // If the section was empty, _peekCoordinate now skips it and the
           // loop prepares the next candidate as well.
@@ -906,6 +1142,7 @@ class ReaderController extends ChangeNotifier {
 
   Future<void> nextPage() async {
     if (busy || !opened) return;
+    _scheduleTranslationRefresh();
     if (pageIndex + 1 < currentPages.length) {
       pageIndex++;
       notifyListeners();
@@ -918,6 +1155,7 @@ class ReaderController extends ChangeNotifier {
 
   Future<void> prevPage() async {
     if (busy || !opened) return;
+    _scheduleTranslationRefresh();
     if (pageIndex > 0) {
       pageIndex--;
       notifyListeners();
@@ -1080,28 +1318,51 @@ class ReaderController extends ChangeNotifier {
   }
 
   Future<List<PageLayout>> _paginateFresh(int index, int generation) async {
-    final section = await _source!.parseSection(index);
-    await Future.wait([
-      _decodeSectionImages(section),
-      EnglishHyphenator.instance.ensureLoadedForSection(
-        section,
-        publicationLanguage: _style.publicationLanguage,
-      ),
-    ]);
-    await Future<void>.delayed(Duration.zero);
-    final pages = _engine.paginate(
-      section,
-      _viewport,
-      _style,
-      imageSizeResolver: _imageSize,
-      coverHref: _book.coverHref,
-      renditionLayout: _book.metadata.layout,
-    );
-    if (generation != _paginationGeneration) {
+    final revision = _sectionRevisions[index];
+    final pages = await _layoutSection(index);
+    if (generation != _paginationGeneration ||
+        revision != _sectionRevisions[index]) {
       _disposePages(pages);
       return _sections[index] ?? const [];
     }
     _sections[index] = pages;
+    _translationDirty.remove(index);
+    return pages;
+  }
+
+  Future<List<PageLayout>> _layoutSection(int index) async {
+    final source = _source;
+    if (source == null) return const [];
+    final book = source.book;
+    final viewport = _viewport;
+    final style = _style;
+    final watch = Stopwatch()..start();
+    final section = await source.parseSection(index);
+    await Future.wait([
+      _decodeSectionImages(section),
+      EnglishHyphenator.instance.ensureLoadedForSection(
+        section,
+        publicationLanguage: style.publicationLanguage,
+      ),
+    ]);
+    await Future<void>.delayed(Duration.zero);
+    final pages = await _engine.paginateAsync(
+      section,
+      viewport,
+      style,
+      imageSizeResolver: _imageSize,
+      coverHref: book.coverHref,
+      renditionLayout: book.metadata.layout,
+      timeSlice: opened
+          ? const Duration(milliseconds: 4)
+          : const Duration(milliseconds: 10),
+      shouldPause: () => opened && (_pageTurnActive || !_readerVisible),
+    );
+    if (watch.elapsedMilliseconds >= 32) {
+      debugPrint(
+        'TortoReader layout section=$index pages=${pages.length} elapsed_ms=${watch.elapsedMilliseconds} translated=$translationEnabled',
+      );
+    }
     return pages;
   }
 
@@ -1311,7 +1572,23 @@ class ReaderController extends ChangeNotifier {
   }
 
   @override
+  void notifyListeners() {
+    if (!_disposed) super.notifyListeners();
+  }
+
+  @override
   void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    opened = false;
+    _pageTurnActive = false;
+    _translationRefreshTimer?.cancel();
+    _translationDirty.clear();
+    for (final pages in _retiredPages) {
+      _disposePages(pages);
+    }
+    _retiredPages.clear();
+    _textNodeCache.clear();
     _paginationGeneration++;
     _saveTimer?.cancel();
     if (_progressDirty) unawaited(_saveProgress());

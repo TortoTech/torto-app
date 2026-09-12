@@ -1,10 +1,13 @@
-import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../../l10n/app_localizations.dart';
 import '../library/library_store.dart';
 import '../progress_store.dart';
+import '../reader/annotations_repository.dart';
+import 'statistics_distribution.dart';
+import 'statistics_period.dart';
 import 'statistics_model.dart';
 import 'statistics_store.dart';
+export 'statistics_distribution.dart' show ReadingTrend;
 
 String statisticsDuration(int ms) {
   if (ms > 0 && ms < 60000) return '<1 min';
@@ -26,12 +29,14 @@ class ReadingStatisticsPage extends StatefulWidget {
   final ReadingStatisticsStore? store;
   final LibraryStore? libraryStore;
   final ProgressStore? progressStore;
+  final AnnotationsRepository? annotationsRepository;
   const ReadingStatisticsPage({
     super.key,
     this.bookId,
     this.store,
     this.libraryStore,
     this.progressStore,
+    this.annotationsRepository,
   });
   @override
   State<ReadingStatisticsPage> createState() => _ReadingStatisticsPageState();
@@ -41,11 +46,9 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
   Map<String, BookReadingStats>? _books;
   Map<String, LibraryBook> _library = {};
   String? _error;
-  String _period = '30';
-  DateTimeRange? _custom;
-  ReadingStatus? _filter;
-  String _query = '';
-  bool _mutating = false;
+  StatisticsPeriod _period = StatisticsPeriod.week;
+  int _periodOffset = 0;
+  (int, int)? _annotationCounts;
   @override
   void initState() {
     super.initState();
@@ -62,11 +65,28 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
       for (final book in books.values) {
         book.progress = progress[book.id]?.totalProgression ?? book.progress;
       }
+      (int, int)? annotationCounts;
+      if (widget.bookId != null &&
+          (widget.store == null || widget.annotationsRepository != null)) {
+        try {
+          final repository =
+              widget.annotationsRepository ??
+              await AnnotationsRepository.open();
+          final annotations = await repository.list(widget.bookId!);
+          annotationCounts = (
+            annotations.length,
+            annotations.where((a) => a.note?.trim().isNotEmpty == true).length,
+          );
+        } catch (_) {
+          // Reading history remains usable when annotations cannot be loaded.
+        }
+      }
       if (mounted) {
         setState(() {
           _books = books;
           _library = {for (final book in library) book.id: book};
           _error = null;
+          _annotationCounts = annotationCounts;
         });
       }
     } catch (_) {
@@ -80,19 +100,6 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
       }
     }
   }
-
-  DateTime get _end =>
-      _period == 'custom' ? _custom!.end : DateUtils.dateOnly(DateTime.now());
-  DateTime? get _start => switch (_period) {
-    '7' => _end.subtract(const Duration(days: 6)),
-    '30' => _end.subtract(const Duration(days: 29)),
-    'year' => DateTime(_end.year),
-    'custom' => _custom!.start,
-    _ => null,
-  };
-  bool _inRange(String day) =>
-      day.compareTo(dayKey(_end)) <= 0 &&
-      (_start == null || day.compareTo(dayKey(_start!)) >= 0);
 
   Widget _cover(String id, {double width = 44}) {
     final bytes = _library[id]?.coverBytes;
@@ -116,6 +123,16 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
   }
 
   Widget _card(Widget child) => Card(
+    elevation: 0,
+    color: Theme.of(context).colorScheme.surface,
+    shape: RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(12),
+      side: BorderSide(
+        color: Theme.of(
+          context,
+        ).colorScheme.outlineVariant.withValues(alpha: .6),
+      ),
+    ),
     margin: const EdgeInsets.only(bottom: 12),
     child: Padding(padding: const EdgeInsets.all(16), child: child),
   );
@@ -123,209 +140,252 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
     padding: const EdgeInsets.only(bottom: 12),
     child: Text(
       context.l10n.text(zh, en),
-      style: Theme.of(context).textTheme.titleMedium,
+      style: Theme.of(context).textTheme.titleSmall?.copyWith(
+        color: Theme.of(context).colorScheme.onSurfaceVariant,
+      ),
     ),
   );
-  Widget _metric(String label, String value) => Column(
+  Widget _metric(String label, Widget value) => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
       Text(label, style: Theme.of(context).textTheme.bodySmall),
       const SizedBox(height: 6),
-      Text(value, style: Theme.of(context).textTheme.titleLarge),
+      value,
     ],
   );
   Future<void> _openBook(String id) async {
     await Navigator.push(
       context,
       MaterialPageRoute<void>(
-        builder: (_) => ReadingStatisticsPage(bookId: id),
+        builder: (_) => ReadingStatisticsPage(
+          bookId: id,
+          store: widget.store,
+          libraryStore: widget.libraryStore,
+          progressStore: widget.progressStore,
+          annotationsRepository: widget.annotationsRepository,
+        ),
       ),
     );
     if (mounted) await _reload();
   }
 
-  Widget _bookRow(BookReadingStats book) => ListTile(
-    contentPadding: EdgeInsets.zero,
-    leading: _cover(book.id),
-    title: Text(
-      book.title.isEmpty
-          ? context.l10n.text('未知书籍', 'Unknown book')
-          : book.title,
-      maxLines: 2,
-      overflow: TextOverflow.ellipsis,
-    ),
-    subtitle: Text(
-      '${statusLabel(context, book.status)} · ${statisticsDuration(book.duration)}',
-    ),
-    trailing: const Icon(Icons.chevron_right),
+  Widget _bookRow(BookReadingStats book, int duration) => InkWell(
     onTap: () => _openBook(book.id),
+    borderRadius: BorderRadius.circular(8),
+    child: Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Row(
+        children: [
+          _cover(book.id),
+          const SizedBox(width: 14),
+          Expanded(
+            // Font boxes include uneven ascent/descent space. On-device ink
+            // measurements put this mixed-size pair about 2 dp below the
+            // cover centre even when its layout box is centred.
+            child: Transform.translate(
+              offset: Offset(
+                0,
+                -MediaQuery.textScalerOf(context).scale(20) * .1,
+              ),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(minHeight: 44 * 1.4),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    ReadingTimeValue(duration, fontSize: 20, compact: true),
+                    const SizedBox(height: 5),
+                    Text(
+                      book.title.isEmpty
+                          ? context.l10n.text('未知书籍', 'Unknown book')
+                          : book.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      textHeightBehavior: const TextHeightBehavior(
+                        applyHeightToFirstAscent: false,
+                        applyHeightToLastDescent: false,
+                      ),
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        height: 1.2,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Icon(
+            Icons.chevron_right,
+            size: 18,
+            color: Theme.of(context).colorScheme.onSurfaceVariant,
+          ),
+        ],
+      ),
+    ),
   );
+
+  String _rangeLabel(StatisticsRange range) {
+    final start = range.start, end = range.end;
+    if (start == null) {
+      return '';
+    }
+    String short(DateTime d) => dayKey(d).substring(5).replaceAll('-', '/');
+    if (_period == StatisticsPeriod.month) {
+      return dayKey(start).substring(0, 7).replaceAll('-', '/');
+    }
+    if (_period == StatisticsPeriod.year) return '${start.year}';
+    final left = start.year == DateTime.now().year
+        ? short(start)
+        : dayKey(start).replaceAll('-', '/');
+    final right = start.year == end.year
+        ? short(end)
+        : dayKey(end).replaceAll('-', '/');
+    return '$left ${context.l10n.text('至', '–')} $right';
+  }
 
   Widget _overview() {
     final all = _books!.values.toList();
+    final range = _period.range(DateTime.now(), _periodOffset);
     final daily = dailyReading(all.expand((book) => book.intervals));
     final valid = dailyReading(all.expand((book) => book.validIntervals));
-    final total = daily.entries
-        .where((e) => _inRange(e.key))
-        .fold<int>(0, (sum, e) => sum + e.value);
-    final finished =
-        all
-            .where(
-              (book) =>
-                  book.status == ReadingStatus.finished &&
-                  book.finished != null &&
-                  _inRange(book.finished!),
-            )
-            .toList()
-          ..sort((a, b) => b.finished!.compareTo(a.finished!));
-    final filtered =
-        all
-            .where(
-              (book) =>
-                  (_filter == null || book.status == _filter) &&
-                  '${book.title} ${book.authors}'.toLowerCase().contains(
-                    _query.toLowerCase(),
-                  ),
-            )
-            .toList()
-          ..sort((a, b) => (b.last ?? 0).compareTo(a.last ?? 0));
+    final ranked = longestReading(all, range);
+    final finished = all
+        .where(
+          (book) =>
+              book.status == ReadingStatus.finished &&
+              book.finished != null &&
+              range.contains(book.finished!),
+        )
+        .length;
+    final l10n = context.l10n;
+    final metrics = <(String, Widget)>[
+      (l10n.text('阅读时长', 'Reading time'), ReadingTimeValue(range.total(daily))),
+      (
+        l10n.text('阅读', 'Reading days'),
+        StatisticValue([
+          (
+            '${valid.keys.where(range.contains).length}',
+            l10n.text('天', 'days'),
+          ),
+        ]),
+      ),
+      (
+        l10n.text('读过', 'Books read'),
+        StatisticValue([('${ranked.length}', l10n.text('本', 'books'))]),
+      ),
+      (
+        l10n.text('读完', 'Finished'),
+        StatisticValue([('$finished', l10n.text('本', 'books'))]),
+      ),
+    ];
+    final currentLabel = switch (_period) {
+      StatisticsPeriod.week => l10n.text('本周', 'This week'),
+      StatisticsPeriod.month => l10n.text('本月', 'This month'),
+      StatisticsPeriod.year => l10n.text('今年', 'This year'),
+      StatisticsPeriod.all => '',
+    };
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        Wrap(
-          spacing: 8,
-          children: [
-            for (final entry in {
-              '7': context.l10n.text('最近7天', '7 days'),
-              '30': context.l10n.text('最近30天', '30 days'),
-              'year': context.l10n.text('今年', 'This year'),
-              'all': context.l10n.text('全部', 'All time'),
-              'custom': context.l10n.text('自定义', 'Custom'),
-            }.entries)
-              ChoiceChip(
-                label: Text(entry.value),
-                selected: _period == entry.key,
-                onSelected: (_) async {
-                  if (entry.key == 'custom') {
-                    final dates = await showDateRangePicker(
-                      context: context,
-                      firstDate: DateTime(1970),
-                      lastDate: DateTime.now(),
-                      initialDateRange: _custom,
-                    );
-                    if (dates == null || !mounted) return;
-                    setState(() {
-                      _custom = dates;
-                      _period = 'custom';
-                    });
-                  } else {
-                    setState(() => _period = entry.key);
-                  }
-                },
-              ),
+        SegmentedButton<StatisticsPeriod>(
+          expandedInsets: EdgeInsets.zero,
+          showSelectedIcon: false,
+          segments: [
+            ButtonSegment(
+              value: StatisticsPeriod.week,
+              label: Text(l10n.text('周', 'Week')),
+            ),
+            ButtonSegment(
+              value: StatisticsPeriod.month,
+              label: Text(l10n.text('月', 'Month')),
+            ),
+            ButtonSegment(
+              value: StatisticsPeriod.year,
+              label: Text(l10n.text('年', 'Year')),
+            ),
+            ButtonSegment(
+              value: StatisticsPeriod.all,
+              label: Text(l10n.text('总', 'All')),
+            ),
           ],
+          selected: {_period},
+          onSelectionChanged: (selection) => setState(() {
+            _period = selection.single;
+            _periodOffset = 0;
+          }),
         ),
-        if (_period == 'custom')
+        if (_period == StatisticsPeriod.all)
+          const SizedBox(height: 16)
+        else
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 8),
-            child: Text('${dayKey(_start!)} — ${dayKey(_end)}'),
+            child: Wrap(
+              key: const ValueKey('statistics-period-navigation'),
+              alignment: WrapAlignment.start,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: [
+                if (_period != StatisticsPeriod.all)
+                  IconButton(
+                    tooltip: l10n.text('上一周期', 'Previous period'),
+                    icon: const Icon(Icons.chevron_left),
+                    onPressed: () => setState(() => _periodOffset--),
+                  ),
+                Text(
+                  _rangeLabel(range),
+                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
+                if (_period != StatisticsPeriod.all)
+                  IconButton(
+                    tooltip: l10n.text('下一周期', 'Next period'),
+                    icon: const Icon(Icons.chevron_right),
+                    onPressed: _periodOffset < 0
+                        ? () => setState(() => _periodOffset++)
+                        : null,
+                  ),
+                if (_periodOffset < 0)
+                  TextButton(
+                    onPressed: () => setState(() => _periodOffset = 0),
+                    child: Text(currentLabel),
+                  ),
+              ],
+            ),
           ),
-        const SizedBox(height: 12),
-        _card(
-          Column(
-            children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: _metric(
-                      context.l10n.text('今日阅读', 'Today'),
-                      statisticsDuration(daily[dayKey(DateTime.now())] ?? 0),
-                    ),
+        for (var row = 0; row < 2; row++)
+          IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(
+                  child: _card(
+                    _metric(metrics[row * 2].$1, metrics[row * 2].$2),
                   ),
-                  Expanded(
-                    child: _metric(
-                      context.l10n.text('期间阅读时长', 'Reading time'),
-                      statisticsDuration(total),
-                    ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _card(
+                    _metric(metrics[row * 2 + 1].$1, metrics[row * 2 + 1].$2),
                   ),
-                ],
-              ),
-              const SizedBox(height: 20),
-              Row(
-                children: [
-                  Expanded(
-                    child: _metric(
-                      context.l10n.text('期间读完', 'Books finished'),
-                      '${finished.length}',
-                    ),
-                  ),
-                  Expanded(
-                    child: _metric(
-                      context.l10n.text('阅读天数', 'Reading days'),
-                      '${valid.keys.where(_inRange).length}',
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-        _card(
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _title('阅读趋势', 'Reading trend'),
-              ReadingTrend(daily: daily, start: _start, end: _end),
-            ],
-          ),
-        ),
-        if (all.every((b) => b.intervals.isEmpty))
-          _card(
-            Text(
-              context.l10n.text(
-                '开始阅读后，这里会记录你的阅读时间。历史时长不会根据阅读进度推算。',
-                'Start reading to record your reading time. Past duration is not inferred from progress.',
-              ),
+                ),
+              ],
             ),
           ),
         _card(
           Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _title('最近读完', 'Recently finished'),
-              if (finished.isEmpty)
-                Text(
-                  context.l10n.text(
-                    '这段时间还没有读完的书',
-                    'No books finished in this period.',
-                  ),
-                )
-              else
-                SizedBox(
-                  height: 158,
-                  child: ListView.separated(
-                    scrollDirection: Axis.horizontal,
-                    itemCount: math.min(10, finished.length),
-                    separatorBuilder: (_, _) => const SizedBox(width: 16),
-                    itemBuilder: (_, i) => InkWell(
-                      onTap: () => _openBook(finished[i].id),
-                      child: SizedBox(
-                        width: 88,
-                        child: Column(
-                          children: [
-                            _cover(finished[i].id, width: 70),
-                            const SizedBox(height: 8),
-                            Text(
-                              finished[i].title,
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
+              _title('阅读时长分布', 'Reading time distribution'),
+              ReadingTrend(
+                daily: daily,
+                period: _period,
+                start: range.start,
+                end: range.end,
+              ),
             ],
           ),
         ),
@@ -333,42 +393,19 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
           Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              _title('书籍阅读记录', 'Books'),
-              TextField(
-                decoration: InputDecoration(
-                  prefixIcon: const Icon(Icons.search),
-                  hintText: context.l10n.text(
-                    '搜索书名或作者',
-                    'Search title or author',
-                  ),
-                ),
-                onChanged: (v) => setState(() => _query = v),
-              ),
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 6,
-                children: [
-                  ChoiceChip(
-                    label: Text(context.l10n.text('全部', 'All')),
-                    selected: _filter == null,
-                    onSelected: (_) => setState(() => _filter = null),
-                  ),
-                  for (final status in ReadingStatus.values)
-                    ChoiceChip(
-                      label: Text(statusLabel(context, status)),
-                      selected: _filter == status,
-                      onSelected: (_) => setState(() => _filter = status),
-                    ),
-                ],
-              ),
-              if (filtered.isEmpty)
+              _title('阅读最久', 'Most time spent reading'),
+              if (ranked.isEmpty)
                 Padding(
-                  padding: const EdgeInsets.all(16),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
                   child: Text(
-                    context.l10n.text('没有匹配的书籍', 'No matching books'),
+                    l10n.text(
+                      '这段时间还没有阅读记录',
+                      'No reading recorded in this period.',
+                    ),
+                    style: Theme.of(context).textTheme.bodySmall,
                   ),
                 ),
-              for (final book in filtered) _bookRow(book),
+              for (final entry in ranked) _bookRow(entry.book, entry.duration),
             ],
           ),
         ),
@@ -376,139 +413,11 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
     );
   }
 
-  Future<void> _edit(BookReadingStats book) async {
-    var status = book.status;
-    var finished = DateTime.tryParse(book.finished ?? '') ?? DateTime.now();
-    final save = await showModalBottomSheet<bool>(
-      context: context,
-      isScrollControlled: true,
-      builder: (context) => StatefulBuilder(
-        builder: (context, update) => SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  context.l10n.text('编辑阅读状态', 'Edit reading status'),
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const SizedBox(height: 16),
-                DropdownButton<ReadingStatus>(
-                  isExpanded: true,
-                  value: status,
-                  items: [
-                    for (final s in ReadingStatus.values)
-                      DropdownMenuItem(
-                        value: s,
-                        child: Text(statusLabel(context, s)),
-                      ),
-                  ],
-                  onChanged: (v) => update(() => status = v!),
-                ),
-                if (status == ReadingStatus.finished)
-                  ListTile(
-                    title: Text(context.l10n.text('读完日期', 'Finished on')),
-                    subtitle: Text(dayKey(finished)),
-                    trailing: const Icon(Icons.calendar_today_outlined),
-                    onTap: () async {
-                      final date = await showDatePicker(
-                        context: context,
-                        firstDate: DateTime(1970),
-                        lastDate: DateTime.now(),
-                        initialDate: finished.isAfter(DateTime.now())
-                            ? DateTime.now()
-                            : finished,
-                      );
-                      if (date != null && context.mounted) {
-                        update(() => finished = date);
-                      }
-                    },
-                  ),
-                const SizedBox(height: 16),
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton(
-                    onPressed: () => Navigator.pop(context, true),
-                    child: Text(context.l10n.text('保存', 'Save')),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-    if (save == true) {
-      await _mutate(
-        (store) => store.setStatus(book.id, status, dayKey(finished)),
-      );
-    }
-  }
-
-  Future<void> _mutate(
-    Future<void> Function(ReadingStatisticsStore) action,
-  ) async {
-    if (_mutating) return;
-    setState(() => _mutating = true);
-    try {
-      await action(widget.store ?? await ReadingStatisticsStore.instance());
-      await _reload();
-    } catch (_) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              context.l10n.text('保存失败，请重试', 'Could not save. Try again.'),
-            ),
-          ),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => _mutating = false);
-    }
-  }
-
-  Future<void> _clear() async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text(
-          context.l10n.text('清空本书统计？', 'Clear this book’s statistics?'),
-        ),
-        content: Text(
-          context.l10n.text(
-            '阅读时间与完成记录将被清空，并在云同步时传播到其他设备。书籍、阅读位置和批注会保留。',
-            'Reading time and completion history will be cleared across devices on cloud sync. The book, reading position and annotations remain.',
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: Text(context.l10n.text('取消', 'Cancel')),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: Text(
-              context.l10n.text('确认清空', 'Clear'),
-              style: TextStyle(color: Theme.of(context).colorScheme.error),
-            ),
-          ),
-        ],
-      ),
-    );
-    if (confirmed == true) {
-      await _mutate((store) => store.clear(widget.bookId!));
-    }
-  }
-
   Widget _detail(BookReadingStats book) {
     final daily = dailyReading(book.intervals);
     String date(int? ms) => ms == null || ms == 0
         ? '—'
-        : dayKey(DateTime.fromMillisecondsSinceEpoch(ms));
-    final sessions = book.sessions.values.toList()
-      ..sort((a, b) => b.first.start.compareTo(a.first.start));
+        : dayKey(DateTime.fromMillisecondsSinceEpoch(ms)).replaceAll('-', '/');
     final days = daily.keys.toList()..sort((a, b) => b.compareTo(a));
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -525,24 +434,44 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
                   children: [
                     Text(
                       book.title,
-                      style: Theme.of(context).textTheme.titleLarge,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(
+                        context,
+                      ).textTheme.titleMedium?.copyWith(fontSize: 18),
                     ),
                     Text(book.authors),
                     const SizedBox(height: 12),
-                    Text(
-                      statusLabel(context, book.status),
-                      style: TextStyle(
-                        color: Theme.of(context).colorScheme.primary,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    LinearProgressIndicator(value: book.progress.clamp(0, 1)),
-                    const SizedBox(height: 6),
-                    Text(
-                      context.l10n.text(
-                        '当前阅读位置 ${(book.progress * 100).toStringAsFixed(1)}%',
-                        'Current position ${(book.progress * 100).toStringAsFixed(1)}%',
-                      ),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        Text(
+                          statusLabel(context, book.status),
+                          textHeightBehavior: const TextHeightBehavior(
+                            applyHeightToFirstAscent: false,
+                            applyHeightToLastDescent: false,
+                          ),
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.primary,
+                          ),
+                        ),
+                        if (book.status == ReadingStatus.reading) ...[
+                          const SizedBox(width: 10),
+                          Text(
+                            '${(book.progress.clamp(0, 1) * 100).toStringAsFixed(1)}%',
+                            key: const ValueKey('statistics-reading-position'),
+                            textHeightBehavior: const TextHeightBehavior(
+                              applyHeightToFirstAscent: false,
+                              applyHeightToLastDescent: false,
+                            ),
+                            style: TextStyle(
+                              color: Theme.of(
+                                context,
+                              ).colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
                   ],
                 ),
@@ -551,20 +480,39 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
           ),
         ),
         _card(
-          Row(
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              Expanded(
-                child: _metric(
-                  context.l10n.text('累计阅读', 'Total reading'),
-                  statisticsDuration(book.duration),
-                ),
+              Row(
+                children: [
+                  Expanded(
+                    child: _metric(
+                      context.l10n.text('累计阅读', 'Total reading'),
+                      ReadingTimeValue(book.duration),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _metric(
+                      context.l10n.text('阅读天数', 'Reading days'),
+                      StatisticValue([
+                        ('${book.readingDays}', context.l10n.text('天', 'days')),
+                      ]),
+                    ),
+                  ),
+                ],
               ),
-              Expanded(
-                child: _metric(
-                  context.l10n.text('阅读天数', 'Reading days'),
-                  '${book.readingDays}',
+              if (_annotationCounts != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(
+                    context.l10n.text(
+                      '${_annotationCounts!.$1} 处高亮 · ${_annotationCounts!.$2} 条批注',
+                      '${_annotationCounts!.$1} highlights · ${_annotationCounts!.$2} notes',
+                    ),
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
                 ),
-              ),
             ],
           ),
         ),
@@ -575,28 +523,26 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
                 context.l10n.text('加入书架', 'Added'): date(book.added),
                 context.l10n.text('开始阅读', 'Started'): date(book.started),
                 context.l10n.text('最近阅读', 'Last read'): date(book.last),
-                context.l10n.text('读完日期', 'Finished'): book.finished ?? '—',
+                context.l10n.text('读完日期', 'Finished'):
+                    book.finished?.replaceAll('-', '/') ?? '—',
               }.entries)
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 7),
                   child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.baseline,
+                    textBaseline: TextBaseline.alphabetic,
                     children: [
                       Expanded(child: Text(e.key)),
-                      Text(e.value),
+                      const SizedBox(width: 12),
+                      Text(
+                        e.value,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        ),
+                      ),
                     ],
                   ),
                 ),
-              const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed: _mutating ? null : () => _edit(book),
-                  icon: const Icon(Icons.edit_outlined),
-                  label: Text(
-                    context.l10n.text('编辑阅读状态', 'Edit reading status'),
-                  ),
-                ),
-              ),
             ],
           ),
         ),
@@ -605,49 +551,39 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               _title('阅读历史', 'Reading history'),
-              ReadingTrend(daily: daily, end: DateTime.now()),
-              ExpansionTile(
-                tilePadding: EdgeInsets.zero,
-                title: Text(context.l10n.text('每日明细', 'Daily details')),
-                children: [
-                  for (final day in days)
-                    ListTile(
-                      title: Text(day),
-                      trailing: Text(statisticsDuration(daily[day]!)),
-                    ),
-                ],
-              ),
-              ExpansionTile(
-                tilePadding: EdgeInsets.zero,
-                title: Text(context.l10n.text('阅读会话', 'Reading sessions')),
-                children: [
-                  if (sessions.isEmpty)
-                    ListTile(
-                      title: Text(
-                        context.l10n.text('暂无阅读会话', 'No reading sessions yet'),
+              if (days.isEmpty)
+                Text(
+                  context.l10n.text('暂无阅读记录', 'No reading records'),
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              for (final day in days)
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: Row(
+                    crossAxisAlignment: CrossAxisAlignment.baseline,
+                    textBaseline: TextBaseline.alphabetic,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          day.replaceAll('-', '/'),
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
+                                fontFeatures: const [
+                                  FontFeature.tabularFigures(),
+                                ],
+                              ),
+                        ),
                       ),
-                    ),
-                  for (final session in sessions.take(100))
-                    ListTile(
-                      title: Text(
-                        DateTime.fromMillisecondsSinceEpoch(
-                          session.first.start + session.first.offset * 1000,
-                          isUtc: true,
-                        ).toString().substring(0, 16),
+                      const SizedBox(width: 12),
+                      Text(
+                        readingTimeLabel(context, daily[day]!),
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        ),
                       ),
-                      trailing: Text(
-                        statisticsDuration(readingDuration(session)),
-                      ),
-                    ),
-                  if (sessions.length > 100)
-                    Text(
-                      context.l10n.text(
-                        '显示最近100次会话',
-                        'Showing the latest 100 sessions',
-                      ),
-                    ),
-                ],
-              ),
+                    ],
+                  ),
+                ),
             ],
           ),
         ),
@@ -666,18 +602,6 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
               ? context.l10n.text('阅读详情', 'Reading details')
               : context.l10n.text('阅读统计', 'Reading statistics'),
         ),
-        actions: [
-          if (detail)
-            PopupMenuButton<String>(
-              onSelected: (_) => _clear(),
-              itemBuilder: (_) => [
-                PopupMenuItem(
-                  value: 'clear',
-                  child: Text(context.l10n.text('清空本书统计', 'Clear statistics')),
-                ),
-              ],
-            ),
-        ],
       ),
       body: _error != null
           ? Center(
@@ -699,113 +623,6 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
                     : _overview(),
               ),
             ),
-    );
-  }
-}
-
-class ReadingTrend extends StatefulWidget {
-  final Map<String, int> daily;
-  final DateTime? start;
-  final DateTime end;
-  const ReadingTrend({
-    super.key,
-    required this.daily,
-    this.start,
-    required this.end,
-  });
-  @override
-  State<ReadingTrend> createState() => _ReadingTrendState();
-}
-
-class _ReadingTrendState extends State<ReadingTrend> {
-  int? _selected;
-  @override
-  Widget build(BuildContext context) {
-    final end = DateTime.utc(widget.end.year, widget.end.month, widget.end.day);
-    final start = widget.start;
-    final count = start == null
-        ? 30
-        : (end
-                      .difference(
-                        DateTime.utc(start.year, start.month, start.day),
-                      )
-                      .inDays +
-                  1)
-              .clamp(1, 30);
-    final days = List.generate(
-      count,
-      (i) => dayKey(end.subtract(Duration(days: count - 1 - i))),
-    );
-    final values = [for (final day in days) widget.daily[day] ?? 0];
-    final maximum = values.fold<int>(1, math.max);
-    final selected = (_selected ?? count - 1).clamp(0, count - 1);
-    final color = Theme.of(context).colorScheme.primary;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Text('${days[selected]} · ${statisticsDuration(values[selected])}'),
-        const SizedBox(height: 12),
-        LayoutBuilder(
-          builder: (context, box) => GestureDetector(
-            onTapDown: (d) => setState(
-              () => _selected = (d.localPosition.dx / box.maxWidth * count)
-                  .floor()
-                  .clamp(0, count - 1),
-            ),
-            onHorizontalDragUpdate: (d) => setState(
-              () => _selected = (d.localPosition.dx / box.maxWidth * count)
-                  .floor()
-                  .clamp(0, count - 1),
-            ),
-            child: SizedBox(
-              height: 126,
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  for (var i = 0; i < count; i++)
-                    Expanded(
-                      child: Semantics(
-                        label: '${days[i]} ${statisticsDuration(values[i])}',
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 2),
-                          child: Container(
-                            height: math.max(3, values[i] / maximum * 120),
-                            decoration: BoxDecoration(
-                              color: values[i] == 0
-                                  ? Theme.of(
-                                      context,
-                                    ).colorScheme.surfaceContainerHighest
-                                  : color.withValues(
-                                      alpha: i == selected ? 1 : 0.55,
-                                    ),
-                              borderRadius: BorderRadius.circular(3),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ),
-        ),
-        const SizedBox(height: 8),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Text(days.first.substring(5)),
-            Text(days.last.substring(5)),
-          ],
-        ),
-        const SizedBox(height: 8),
-        Text(
-          context.l10n.text(
-            '显示所选期间末尾$count天，点击查看每日时长',
-            'Last $count days of the period. Tap for daily time.',
-          ),
-          style: Theme.of(context).textTheme.bodySmall,
-        ),
-      ],
     );
   }
 }
@@ -876,15 +693,15 @@ class _StatisticsSummaryCardState extends State<StatisticsSummaryCard> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              _today == null ? '—' : statisticsDuration(_today!),
+              _today == null ? '—' : readingTimeLabel(context, _today!),
               style: Theme.of(context).textTheme.headlineMedium,
             ),
             Text(context.l10n.text('今日阅读', 'Today')),
             const SizedBox(height: 8),
             Text(
               context.l10n.text(
-                '本周 ${statisticsDuration(_week ?? 0)} · 阅读 $_days 天',
-                'This week ${statisticsDuration(_week ?? 0)} · $_days reading days',
+                '本周 ${readingTimeLabel(context, _week ?? 0)} · 阅读 $_days 天',
+                'This week ${readingTimeLabel(context, _week ?? 0)} · $_days reading days',
               ),
             ),
           ],

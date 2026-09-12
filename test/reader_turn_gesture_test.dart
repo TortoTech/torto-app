@@ -5,6 +5,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'package:torto/app/statistics/statistics_store.dart';
+import 'package:torto/app/statistics/statistics_model.dart';
+import 'package:torto/core/ir/text_index.dart';
 import 'package:torto/app/reader/reader_controller.dart';
 import 'package:torto/app/reader/text_selection_layer.dart';
 import 'package:torto/app/reader/reader_page.dart';
@@ -80,8 +84,133 @@ class _FakeReaderController extends ReaderController {
   ui.Image? resolveImage(String href) => null;
 }
 
+class _FinishedReaderController extends _FakeReaderController {
+  @override
+  String get statisticsBookId => 'finished-book';
+  @override
+  BookMetadata get statisticsMetadata =>
+      const BookMetadata(title: 'Finished book');
+  @override
+  Future<List<BookTextNode>> textNodes(
+    int spine, {
+    bool displayed = false,
+  }) async => [];
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+  testWidgets('finished book end screen reflects stored status', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    sqfliteFfiInit();
+    late ReadingStatisticsStore store;
+    await tester.runAsync(() async {
+      store = await ReadingStatisticsStore.openAt(
+        inMemoryDatabasePath,
+        'phone',
+        factory: databaseFactoryFfi,
+      );
+      await store.setStatus(
+        'finished-book',
+        ReadingStatus.finished,
+        '2026-09-12',
+      );
+    });
+    final controller = _FinishedReaderController()..pageIndex = 4;
+    await tester.binding.setSurfaceSize(const Size(411, 914));
+    addTearDown(() async {
+      await tester.pumpWidget(const SizedBox());
+      controller.dispose();
+      await tester.runAsync(store.database.close);
+      await tester.binding.setSurfaceSize(null);
+    });
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ReaderPage(
+          file: File('unused.epub'),
+          controller: controller,
+          statisticsStore: store,
+        ),
+      ),
+    );
+    for (var i = 0; i < 4; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 100)),
+      );
+    }
+    await tester.tapAt(const Offset(360, 450));
+    for (var i = 0; i < 4; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 100)),
+      );
+    }
+    await tester.pumpAndSettle();
+    expect(find.text('已读完'), findsOneWidget);
+    expect(find.text('标记读完'), findsNothing);
+    expect(
+      tester
+          .widget<FilledButton>(find.byKey(const Key('book-end-finish-button')))
+          .onPressed,
+      isNull,
+    );
+  });
+  testWidgets(
+    'book end uses the turn scene for entry cancellation and rapid return',
+    (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      final controller = _FakeReaderController()..pageIndex = 4;
+      await tester.binding.setSurfaceSize(const Size(411, 914));
+      addTearDown(() async {
+        await tester.pumpWidget(const SizedBox());
+        controller.dispose();
+        await tester.binding.setSurfaceSize(null);
+      });
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ReaderPage(file: File('unused.epub'), controller: controller),
+        ),
+      );
+      await tester.pumpAndSettle();
+      final short = await tester.startGesture(const Offset(340, 450));
+      await short.moveBy(const Offset(-30, 0));
+      await tester.pump();
+      await short.moveBy(const Offset(-30, 0));
+      await tester.pump();
+      expect(find.byKey(const Key('book-end-swipe')), findsOneWidget);
+      expect(find.byType(PageWidget), findsOneWidget);
+      expect(
+        tester.getTopLeft(find.byKey(const Key('reader-turn-moving-page'))).dx,
+        lessThan(0),
+      );
+      await short.up();
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('book-end-swipe')), findsNothing);
+      expect(controller.pageIndex, 4);
+      final forward = await tester.startGesture(const Offset(340, 450));
+      await forward.moveBy(const Offset(-30, 0));
+      await tester.pump();
+      await forward.moveBy(const Offset(-170, 0));
+      await forward.up();
+      await tester.pump(const Duration(milliseconds: 40));
+      final back = await tester.startGesture(const Offset(80, 450));
+      await back.moveBy(const Offset(30, 0));
+      await tester.pump();
+      await back.moveBy(const Offset(170, 0));
+      await tester.pump();
+      expect(find.byKey(const Key('book-end-swipe')), findsOneWidget);
+      expect(find.byType(PageWidget), findsOneWidget);
+      await back.up();
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('book-end-swipe')), findsNothing);
+      expect(controller.pageIndex, 4);
+      await tester.dragFrom(const Offset(80, 450), const Offset(240, 0));
+      await tester.pumpAndSettle();
+      expect(controller.pageIndex, 3);
+    },
+  );
   testWidgets(
     'translation locks paragraph selection and restores the normal preference',
     (tester) async {
@@ -148,7 +277,19 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('已到书籍结尾'), findsOneWidget);
       expect(find.byKey(const Key('book-end-finish-button')), findsOneWidget);
-      await tester.tap(find.text('返回最后一页'));
+      expect(find.text('返回最后一页'), findsNothing);
+      expect(find.text('标记读完'), findsOneWidget);
+      await tester.drag(
+        find.byKey(const Key('book-end-swipe')),
+        const Offset(-240, 0),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('已到书籍结尾'), findsOneWidget);
+      expect(controller.pageIndex, 4);
+      await tester.drag(
+        find.byKey(const Key('book-end-swipe')),
+        const Offset(240, 0),
+      );
       await tester.pumpAndSettle();
       expect(controller.pageIndex, 4);
       expect(find.byKey(const Key('book-end-finish-button')), findsNothing);

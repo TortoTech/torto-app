@@ -46,7 +46,112 @@ class _DelayedClient extends OpenAiCompatibleClient {
   }
 }
 
+class _SuccessfulClient extends OpenAiCompatibleClient {
+  final started = Completer<void>();
+  final release = Completer<void>();
+  @override
+  Future<List<BlockTranslation>> translateBlocks({
+    required AiProviderConfig provider,
+    required String model,
+    required String targetLanguage,
+    required List<TranslationBlockInput> blocks,
+    ReasoningEffort reasoningEffort = ReasoningEffort.defaultLevel,
+    FutureOr<void> Function(List<BlockTranslation>)? validate,
+  }) async {
+    if (!started.isCompleted) started.complete();
+    await release.future;
+    final values = [
+      for (final block in blocks)
+        BlockTranslation(
+          blockIndex: block.blockIndex,
+          segmentIndex: block.segmentIndex,
+          text: 'Translated ${block.text}',
+        ),
+    ];
+    await validate?.call(values);
+    return values;
+  }
+}
+
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  test(
+    'translation replies wait for the gesture and preserve unaffected neighbour pages',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final directory = await Directory.systemTemp.createTemp(
+        'torto-translation-idle-',
+      );
+      addTearDown(() => directory.delete(recursive: true));
+      final archive = Archive();
+      void add(String name, String text) {
+        final bytes = utf8.encode(text);
+        archive.addFile(ArchiveFile(name, bytes.length, bytes));
+      }
+
+      add('mimetype', 'application/epub+zip');
+      add(
+        'META-INF/container.xml',
+        '<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>',
+      );
+      add(
+        'book.opf',
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="id">idle-test</dc:identifier><dc:title>Test</dc:title><dc:language>en</dc:language></metadata><manifest><item id="a" href="a.xhtml" media-type="application/xhtml+xml"/><item id="b" href="b.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="a"/><itemref idref="b"/></spine></package>',
+      );
+      add('a.xhtml', '<html><body><p>First chapter.</p></body></html>');
+      add('b.xhtml', '<html><body><p>Second chapter.</p></body></html>');
+      final file = await File(
+        '${directory.path}/book.epub',
+      ).writeAsBytes(ZipEncoder().encode(archive));
+      final client = _SuccessfulClient();
+      final controller = ReaderController(
+        progressStore: ProgressStore(await SharedPreferences.getInstance()),
+        aiSettingsStore: _Settings(),
+        translationClient: client,
+      );
+      addTearDown(controller.dispose);
+      await controller.open(
+        file,
+        const LayoutViewport(width: 400, height: 700),
+        const ReaderStyle(),
+      );
+      await controller.ensurePeek();
+      final current = controller.currentPage;
+      final neighbour = controller.peekPage(1);
+      expect(neighbour, isNotNull);
+      await controller.toggleTranslation();
+      await client.started.future;
+      controller.setPageTurnActive(true);
+      client.release.complete();
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      expect(identical(controller.currentPage, current), isTrue);
+      expect(identical(controller.peekPage(1), neighbour), isTrue);
+      expect(controller.busy, isFalse);
+      controller.setPageTurnActive(false);
+      for (
+        var i = 0;
+        i < 100 && identical(controller.currentPage, current);
+        i++
+      ) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      expect(identical(controller.currentPage, current), isFalse);
+      expect(identical(controller.peekPage(1), neighbour), isTrue);
+      expect(controller.busy, isFalse);
+      expect(controller.sectionIndex, 0);
+      await controller.toggleTranslation();
+      final originalAgain = controller.currentPage;
+      await controller.toggleTranslation();
+      for (
+        var i = 0;
+        i < 100 && identical(controller.currentPage, originalAgain);
+        i++
+      ) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      expect(identical(controller.currentPage, originalAgain), isFalse);
+    },
+  );
   test(
     'chapter entered during an in-flight request is translated without another turn',
     () async {

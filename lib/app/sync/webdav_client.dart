@@ -5,6 +5,8 @@ import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 import 'package:xml/xml.dart';
+import 'package:crypto/crypto.dart';
+import 'sync_store.dart';
 
 class WebDavObject {
   final Uint8List bytes;
@@ -33,6 +35,23 @@ class WebDavClient {
   final bool cstCloudCompatibility;
   final String userAgent;
   final http.Client _client;
+  final SyncStore? cacheStore;
+  final bool forceWrite;
+  final Map<String, int> requestCounts = {};
+  int requestMilliseconds = 0;
+  String get accountKey => sha256
+      .convert(utf8.encode('$root\n$username\n$cstCloudCompatibility'))
+      .toString();
+  Future<String?> cacheGet(String key) async =>
+      cacheStore?.cacheGet(accountKey, key);
+  Future<void> cacheSet(String key, String value) async {
+    await cacheStore?.cacheSet(accountKey, key, value);
+  }
+
+  Future<void> invalidatePublished(String path) async {
+    await cacheStore?.cacheRemove(accountKey, 'published:$path');
+    await cacheStore?.cacheRemove(accountKey, 'object:$path');
+  }
 
   WebDavClient({
     required String baseUrl,
@@ -41,6 +60,8 @@ class WebDavClient {
     this.cstCloudCompatibility = false,
     this.userAgent = 'Torto/0.1.0 Zotero/7.0',
     http.Client? client,
+    this.cacheStore,
+    this.forceWrite = false,
   }) : root = _protocolRoot(baseUrl),
        _client = client ?? http.Client();
 
@@ -86,15 +107,7 @@ class WebDavClient {
 
   Future<void> ensureLayout() async {
     for (final uri in [root.resolve('../'), root]) {
-      final response = await _sendUri('MKCOL', uri);
-      if (response.statusCode != 201 &&
-          response.statusCode != 200 &&
-          response.statusCode != 405) {
-        throw WebDavException(
-          'Could not create the sync folder.',
-          response.statusCode,
-        );
-      }
+      await _ensureDirectory(uri);
     }
     final collections = <String>[
       'library/',
@@ -106,15 +119,7 @@ class WebDavClient {
       'tmp/',
     ];
     for (final path in collections) {
-      final response = await _send('MKCOL', path);
-      if (response.statusCode != 201 &&
-          response.statusCode != 200 &&
-          response.statusCode != 405) {
-        throw WebDavException(
-          'Could not create the sync folder.',
-          response.statusCode,
-        );
-      }
+      await _ensureDirectory(_uri(path));
     }
   }
 
@@ -124,23 +129,75 @@ class WebDavClient {
       'state/$bookId/',
       'state/$bookId/devices/',
     ]) {
-      final response = await _send('MKCOL', path);
-      if (response.statusCode != 201 &&
-          response.statusCode != 200 &&
-          response.statusCode != 405) {
-        throw WebDavException(
-          'Could not create a book sync folder.',
-          response.statusCode,
-        );
-      }
+      await _ensureDirectory(_uri(path));
     }
   }
 
+  // Remember only successful checks. Repair stale entries when the server
+  // reports a missing parent; never assume a cached directory still exists.
+  Future<void> _ensureDirectory(Uri uri, {bool repair = false}) async {
+    final key = 'directory:$uri';
+    if (!repair && await cacheGet(key) == '1') return;
+    if (repair && uri.path.length > root.resolve('../').path.length) {
+      await _ensureDirectory(uri.resolve('../'), repair: true);
+    }
+    final response = await _sendUri('MKCOL', uri);
+    if (!repair && (response.statusCode == 404 || response.statusCode == 409)) {
+      await _ensureDirectory(uri, repair: true);
+      return;
+    }
+    if (response.statusCode != 201 &&
+        response.statusCode != 200 &&
+        response.statusCode != 405) {
+      throw WebDavException(
+        'Could not create the sync folder.',
+        response.statusCode,
+      );
+    }
+    await cacheSet(key, '1');
+  }
+
   Future<WebDavObject?> getOptional(String path) async {
-    final response = await _send('GET', path);
-    if (response.statusCode == 404) return null;
+    final raw = await cacheGet('object:$path');
+    Map<String, dynamic>? cached;
+    try {
+      if (raw != null) cached = jsonDecode(raw) as Map<String, dynamic>;
+    } catch (_) {
+      /* Ignore regenerable cache corruption. */
+    }
+    final etag = cached?['etag'];
+    final response = await _send(
+      'GET',
+      path,
+      headers: {
+        if (etag is String && etag.isNotEmpty)
+          HttpHeaders.ifNoneMatchHeader: etag,
+      },
+    );
+    if (response.statusCode == 304) {
+      if (cached?['body'] is! String) {
+        throw const WebDavException('Server returned 304 without cached data.');
+      }
+      return WebDavObject(base64Decode(cached!['body'] as String));
+    }
+    if (response.statusCode == 404) {
+      await cacheStore?.cacheRemove(accountKey, 'object:$path');
+      return null;
+    }
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw WebDavException('Could not download $path.', response.statusCode);
+    }
+    final freshTag = response.headers[HttpHeaders.etagHeader];
+    if (freshTag != null && response.bodyBytes.length <= 2 * 1024 * 1024) {
+      await cacheSet(
+        'object:$path',
+        jsonEncode({
+          'etag': freshTag,
+          'body': base64Encode(response.bodyBytes),
+        }),
+      );
+    } else {
+      await cacheStore?.cacheRemove(accountKey, 'object:$path');
     }
     return WebDavObject(response.bodyBytes);
   }
@@ -177,7 +234,12 @@ class WebDavClient {
     return true;
   }
 
-  Future<bool> putImmutableFile(String path, File file) async {
+  Future<bool> putImmutableFile(
+    String path,
+    File file, {
+    void Function(int sent)? onProgress,
+    bool repairParents = true,
+  }) async {
     if (cstCloudCompatibility && await _exists(path)) return false;
     final request = http.StreamedRequest('PUT', _uri(path));
     request.headers.addAll({
@@ -186,8 +248,19 @@ class WebDavClient {
       HttpHeaders.contentTypeHeader: 'application/octet-stream',
     });
     request.contentLength = await file.length();
-    final sending = _client.send(request).timeout(_timeout);
-    await request.sink.addStream(file.openRead());
+    final sending = _client.send(request).timeout(const Duration(minutes: 30));
+    var sent = 0;
+    final progressClock = Stopwatch()..start();
+    await request.sink.addStream(
+      file.openRead().map((bytes) {
+        sent += bytes.length;
+        if (progressClock.elapsedMilliseconds >= 100) {
+          onProgress?.call(sent < request.contentLength! ? sent : sent - 1);
+          progressClock.reset();
+        }
+        return bytes;
+      }),
+    );
     await request.sink.close();
     final response = await sending;
     await response.stream.drain<void>();
@@ -197,13 +270,30 @@ class WebDavClient {
       );
     }
     if (response.statusCode == 412) return false;
+    if (repairParents &&
+        (response.statusCode == 404 || response.statusCode == 409)) {
+      await _ensureDirectory(_uri(path).resolve('./'), repair: true);
+      return putImmutableFile(
+        path,
+        file,
+        onProgress: onProgress,
+        repairParents: false,
+      );
+    }
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw WebDavException('Could not upload $path.', response.statusCode);
     }
+    onProgress?.call(sent);
     return true;
   }
 
   Future<void> putMutableJson(String path, Map<String, Object?> value) async {
+    final semanticValue = Map<String, Object?>.of(value)..remove('updated_at');
+    final fingerprint = sha256
+        .convert(utf8.encode(jsonEncode(semanticValue)))
+        .toString();
+    if (!forceWrite && await cacheGet('published:$path') == fingerprint) return;
+    await cacheStore?.cacheRemove(accountKey, 'object:$path');
     final response = await _send(
       'PUT',
       path,
@@ -213,6 +303,7 @@ class WebDavClient {
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw WebDavException('Could not update $path.', response.statusCode);
     }
+    await cacheSet('published:$path', fingerprint);
   }
 
   Future<List<String>> listJsonFiles(String path) async {
@@ -322,7 +413,25 @@ class WebDavClient {
     String path, {
     Map<String, String> headers = const {},
     List<int>? body,
-  }) => _sendUri(method, _uri(path), headers: headers, body: body);
+  }) async {
+    var response = await _sendUri(
+      method,
+      _uri(path),
+      headers: headers,
+      body: body,
+    );
+    if (method == 'PUT' &&
+        (response.statusCode == 404 || response.statusCode == 409)) {
+      await _ensureDirectory(_uri(path).resolve('./'), repair: true);
+      response = await _sendUri(
+        method,
+        _uri(path),
+        headers: headers,
+        body: body,
+      );
+    }
+    return response;
+  }
 
   Future<http.Response> _sendUri(
     String method,
@@ -337,8 +446,15 @@ class WebDavClient {
         ..headers.addAll(headers)
         ..followRedirects = false;
       if (body != null) request.bodyBytes = body;
-      final streamed = await _client.send(request).timeout(_timeout);
-      final response = await http.Response.fromStream(streamed);
+      final watch = Stopwatch()..start();
+      requestCounts.update(method, (count) => count + 1, ifAbsent: () => 1);
+      late http.Response response;
+      try {
+        final streamed = await _client.send(request).timeout(_timeout);
+        response = await http.Response.fromStream(streamed).timeout(_timeout);
+      } finally {
+        requestMilliseconds += watch.elapsedMilliseconds;
+      }
       if (!response.isRedirect) return response;
       final location = response.headers[HttpHeaders.locationHeader];
       if (location == null) return response;

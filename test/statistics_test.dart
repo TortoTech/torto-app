@@ -237,6 +237,14 @@ void main() {
             'authors': 'Author',
             'added': 1,
           }),
+          const ReadingEvent(
+            'empty-meta',
+            'phone',
+            'empty-book',
+            0,
+            'Metadata',
+            {'title': 'No reading history book', 'authors': '', 'added': 1},
+          ),
           interval(
             'reading',
             DateTime.now().millisecondsSinceEpoch - 40000,
@@ -270,11 +278,114 @@ void main() {
           await Future<void>.delayed(const Duration(milliseconds: 300));
         });
         await tester.pumpAndSettle();
-        expect(find.byType(ReadingTrend), findsOneWidget);
+        expect(
+          find.byType(ReadingTrend),
+          bookId == null ? findsOneWidget : findsNothing,
+        );
+        if (bookId == null) {
+          expect(find.text('No reading history book'), findsNothing);
+          expect(find.byType(TextField), findsNothing);
+          await tester.tap(find.text('总'));
+          await tester.pumpAndSettle();
+          expect(find.text('全部阅读记录'), findsNothing);
+          expect(
+            find.byKey(const ValueKey('statistics-period-navigation')),
+            findsNothing,
+          );
+          await tester.tap(find.text('周'));
+          await tester.pumpAndSettle();
+          expect(
+            tester
+                .widget<Wrap>(
+                  find.byKey(const ValueKey('statistics-period-navigation')),
+                )
+                .alignment,
+            WrapAlignment.start,
+          );
+          await tester.tap(find.text('年'));
+          await tester.pumpAndSettle();
+          expect(
+            tester.widget<ReadingTrend>(find.byType(ReadingTrend)).start!.month,
+            1,
+          );
+          await tester.tap(find.byTooltip('上一周期'));
+          await tester.pumpAndSettle();
+          expect(
+            tester.widget<ReadingTrend>(find.byType(ReadingTrend)).start!.year,
+            DateTime.now().year - 1,
+          );
+          await tester.tap(find.text('今年'));
+          await tester.pumpAndSettle();
+          expect(
+            tester.widget<ReadingTrend>(find.byType(ReadingTrend)).start!.year,
+            DateTime.now().year,
+          );
+          final selectedStart = tester
+              .widget<ReadingTrend>(find.byType(ReadingTrend))
+              .start;
+          final bookRow = find.text('A book with a long title');
+          await tester.ensureVisible(bookRow);
+          await tester.tap(bookRow);
+          for (var i = 0; i < 12; i++) {
+            await tester.pump(const Duration(milliseconds: 100));
+            await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 100)),
+            );
+          }
+          await tester.pumpAndSettle();
+          expect(find.text('阅读详情'), findsOneWidget);
+          expect(find.byType(ReadingTrend), findsNothing);
+          expect(find.byType(LinearProgressIndicator), findsNothing);
+          expect(
+            find.byKey(const ValueKey('statistics-reading-position')),
+            findsOneWidget,
+          );
+          expect(find.byType(ExpansionTile), findsNothing);
+          expect(find.text('阅读会话'), findsNothing);
+          expect(find.byType(ListTile), findsWidgets);
+          await tester.pageBack();
+          for (var i = 0; i < 12; i++) {
+            await tester.pump(const Duration(milliseconds: 100));
+            await tester.runAsync(
+              () => Future<void>.delayed(const Duration(milliseconds: 100)),
+            );
+          }
+          await tester.pumpAndSettle();
+          expect(
+            tester.widget<ReadingTrend>(find.byType(ReadingTrend)).start,
+            selectedStart,
+          );
+        }
         expect(find.text('计时中'), findsNothing);
         expect(find.text('暂停计时'), findsNothing);
         expect(tester.takeException(), isNull);
       }
+      await tester.runAsync(() async {
+        await store.setStatus(
+          'book',
+          ReadingStatus.finished,
+          dayKey(DateTime.now()),
+        );
+        await tester.pumpWidget(
+          MaterialApp(
+            home: ReadingStatisticsPage(
+              key: const ValueKey('finished-detail'),
+              bookId: 'book',
+              store: store,
+              libraryStore: LibraryStore(booksDir: dir),
+              progressStore: ProgressStore(preferences),
+            ),
+          ),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      });
+      await tester.pumpAndSettle();
+      expect(find.text('已读完'), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('statistics-reading-position')),
+        findsNothing,
+      );
+      expect(find.byType(LinearProgressIndicator), findsNothing);
     },
   );
 }

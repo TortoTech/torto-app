@@ -7,6 +7,8 @@ import 'translation_models.dart';
 class TranslationBookSource implements BookSource {
   final BookSource inner;
   final Map<int, Map<int, _StoredBlockTranslation>> _sections = {};
+  final Map<int, (Section, List<TranslationBlockInput>)> _inputCache = {};
+  final Map<int, (Section, TranslationMode, String, Section)> _renderCache = {};
 
   bool enabled = false;
   TranslationMode mode;
@@ -17,7 +19,13 @@ class TranslationBookSource implements BookSource {
   @override
   Book get book => inner.book;
 
-  void clear() => _sections.clear();
+  void clear() {
+    _sections.clear();
+    _inputCache.clear();
+    _renderCache.clear();
+  }
+
+  bool hasTranslations(int index) => _sections[index]?.isNotEmpty == true;
 
   Future<List<TranslationBlockInput>> untranslatedBlocksForNodes(
     int sectionIndex,
@@ -25,7 +33,15 @@ class TranslationBookSource implements BookSource {
   ) async {
     final section = await inner.parseSection(sectionIndex);
     final stored = _sections[sectionIndex];
-    return _translatableBlocks(section)
+    var cached = _inputCache.remove(sectionIndex);
+    if (cached == null || !identical(cached.$1, section)) {
+      cached = (section, _translatableBlocks(section));
+    }
+    _inputCache[sectionIndex] = cached;
+    while (_inputCache.length > 6) {
+      _inputCache.remove(_inputCache.keys.first);
+    }
+    return cached.$2
         .where((input) => visibleNodes.contains(input.nodeId))
         .where(
           (input) =>
@@ -40,6 +56,7 @@ class TranslationBookSource implements BookSource {
     List<BlockTranslation> translations,
   ) async {
     await validateBatch(sectionIndex, translations);
+    _renderCache.remove(sectionIndex);
     final values = _sections.putIfAbsent(sectionIndex, () => {});
     for (final translation in translations) {
       if (translation.text.trim().isEmpty) continue;
@@ -82,6 +99,14 @@ class TranslationBookSource implements BookSource {
     final section = await inner.parseSection(index);
     final translations = enabled ? _sections[index] : null;
     if (translations == null || translations.isEmpty) return section;
+    final cached = _renderCache.remove(index);
+    if (cached != null &&
+        identical(cached.$1, section) &&
+        cached.$2 == mode &&
+        cached.$3 == targetLanguageCode) {
+      _renderCache[index] = cached;
+      return cached.$4;
+    }
     final blocks = <Block>[];
     for (var blockIndex = 0; blockIndex < section.blocks.length; blockIndex++) {
       final block = section.blocks[blockIndex];
@@ -129,13 +154,18 @@ class TranslationBookSource implements BookSource {
           blocks.add(block);
       }
     }
-    return Section(
+    final rendered = Section(
       id: section.id,
       spineIndex: section.spineIndex,
       href: section.href,
       blocks: blocks,
       anchors: section.anchors,
     );
+    _renderCache[index] = (section, mode, targetLanguageCode, rendered);
+    while (_renderCache.length > 3) {
+      _renderCache.remove(_renderCache.keys.first);
+    }
+    return rendered;
   }
 
   @override
