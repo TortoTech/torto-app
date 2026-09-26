@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:flutter/physics.dart';
 import 'dart:ui' show FrameTiming;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../core/ir/text_index.dart';
@@ -63,6 +64,174 @@ class _ReaderPageState extends State<ReaderPage>
   bool _selecting = false;
   bool _showBookEnd = false;
   double _readerWidth = 0;
+  AnimationController? _focusMotion;
+  bool _focusDragging = false;
+  double _focusDragDistance = 0;
+
+  void _stopFocusMotion() {
+    _focusMotion?.stop();
+    _focusDragging = false;
+    if (_turnPhase == _TurnPhase.idle) {
+      _controller?.setPageTurnActive(_selecting);
+    }
+  }
+
+  void _startFocusDrag(DragStartDetails details, ReaderController controller) {
+    if (_selecting || controller.busy || _turnPhase != _TurnPhase.idle) return;
+    _stopFocusMotion();
+    _focusDragging = true;
+    _focusDragDistance = 0;
+    controller.setPageTurnActive(true);
+    setState(() => _overlayVisible = false);
+  }
+
+  void _updateFocusDrag(
+    DragUpdateDetails details,
+    ReaderController controller,
+  ) {
+    if (!_focusDragging) return;
+    _focusDragDistance += details.delta.dy;
+    if ((controller.currentPage?.scrollExtent ?? 0) > 0) {
+      controller.scrollFocus(controller.focusReading.offset - details.delta.dy);
+    }
+  }
+
+  void _endFocusDrag(DragEndDetails details, ReaderController controller) {
+    if (!_focusDragging) return;
+    _focusDragging = false;
+    final page = controller.currentPage;
+    if (page == null || page.scrollExtent <= 0) {
+      if (_focusDragDistance.abs() >= 36) {
+        controller.activateFocusUnit(
+          controller.focusReading.active + (_focusDragDistance < 0 ? 1 : -1),
+        );
+      }
+      controller.setPageTurnActive(false);
+      return;
+    }
+    final velocity = -(details.primaryVelocity ?? 0);
+    if (velocity.abs() < 50) {
+      controller.setPageTurnActive(false);
+      return;
+    }
+    _focusMotion?.dispose();
+    final next = AnimationController.unbounded(vsync: this);
+    _focusMotion = next;
+    next.addListener(() {
+      if (controller.currentPage != page || _selecting || controller.busy) {
+        _stopFocusMotion();
+        return;
+      }
+      controller.scrollFocus(next.value);
+      if (next.value <= 0 || next.value >= page.scrollExtent) {
+        _stopFocusMotion();
+      }
+    });
+    next
+        .animateWith(
+          FrictionSimulation(0.135, controller.focusReading.offset, velocity),
+        )
+        .whenCompleteOrCancel(() {
+          if (mounted && !_focusDragging && _turnPhase == _TurnPhase.idle) {
+            controller.setPageTurnActive(_selecting);
+          }
+        });
+  }
+
+  Future<void> _toggleFocusMode() async {
+    final controller = _controller;
+    if (controller == null || controller.busy || !controller.focusModeAllowed) {
+      return;
+    }
+    _stopFocusMotion();
+    final next = _style.copyWith(focusMode: !_style.focusMode);
+    setState(() {
+      _style = next;
+      _overlayVisible = false;
+    });
+    await controller.updateStyle(next);
+    try {
+      await _preferencesStore.saveFocusMode(next.focusMode);
+    } catch (error) {
+      debugPrint('Could not persist focus mode: $error');
+    }
+    _schedulePeekPreparation();
+  }
+
+  Future<void> _toggleSentenceSplit() async {
+    final controller = _controller;
+    if (controller == null ||
+        controller.busy ||
+        !controller.focusModeAllowed ||
+        !_style.focusMode) {
+      return;
+    }
+    _stopFocusMotion();
+    final next = _style.copyWith(sentenceSplit: !_style.sentenceSplit);
+    setState(() {
+      _style = next;
+      _overlayVisible = false;
+    });
+    await controller.updateStyle(next);
+    try {
+      await _preferencesStore.saveSentenceSplit(next.sentenceSplit);
+    } catch (error) {
+      debugPrint('Could not persist sentence splitting: $error');
+    }
+    _schedulePeekPreparation();
+  }
+
+  Widget _focusPageSurface(
+    ReaderController controller,
+    PageLayout page, {
+    int? active,
+  }) {
+    final selected = active ?? controller.focusReading.active;
+    return ClipRect(
+      clipper: page.scrollExtent > 0
+          ? _FocusContentClipper(_style.marginTop, _style.marginBottom)
+          : null,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          PageWidget(
+            page: page,
+            imageResolver: controller.resolveImage,
+            background: _background,
+            foreground: _foreground,
+          ),
+          for (var i = 0; i < page.focusUnits.length; i++)
+            Positioned.fromRect(
+              rect: Rect.fromLTRB(
+                0,
+                page.focusUnits[i].bounds.top,
+                page.viewport.width,
+                page.focusUnits[i].bounds.bottom,
+              ),
+              child: IgnorePointer(
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 120),
+                  color: _background.withValues(alpha: i == selected ? 0 : .48),
+                ),
+              ),
+            ),
+          if (page.focusUnits.length > 1)
+            Positioned(
+              left: 8,
+              top: page.focusUnits[selected].bounds.top + 4,
+              child: IgnorePointer(
+                child: Container(
+                  width: 2,
+                  height: 18,
+                  color: _foreground.withValues(alpha: .45),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   bool _completionSaving = false;
   bool _completionMarked = false;
   bool _completionStatusLoading = false;
@@ -569,6 +738,7 @@ class _ReaderPageState extends State<ReaderPage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) _stopFocusMotion();
     _controller?.setReaderVisible(state == AppLifecycleState.resumed);
     _statisticsForeground = state == AppLifecycleState.resumed;
     _tickStatistics(activity: _statisticsForeground);
@@ -789,6 +959,8 @@ class _ReaderPageState extends State<ReaderPage>
       _baseStyle.copyWith(
         baseFontSize: typography.fontSize,
         typesettingMode: mode,
+        focusMode: await _preferencesStore.loadFocusMode(),
+        sentenceSplit: await _preferencesStore.loadSentenceSplit(),
         typography: typography,
       ),
       darkMode,
@@ -814,6 +986,7 @@ class _ReaderPageState extends State<ReaderPage>
     WidgetsBinding.instance.removeObserver(this);
     _peekTimer?.cancel();
     _turnAnimation?.dispose();
+    _focusMotion?.dispose();
     if (_ownsController) {
       _controller?.dispose();
     } else {
@@ -872,9 +1045,21 @@ class _ReaderPageState extends State<ReaderPage>
       }
       return;
     }
-    final link = controller.currentPage?.linkAt(details.localPosition);
+    final link = controller.displayPage?.linkAt(details.localPosition);
     if (link != null) {
       unawaited(_activateLink(controller, link));
+      return;
+    }
+    final focusPage = controller.displayPage;
+    if (focusPage != null && focusPage.focusUnits.isNotEmpty) {
+      final unit = focusPage.focusUnits.indexWhere(
+        (u) => u.bounds.contains(details.localPosition),
+      );
+      if (unit >= 0 && unit != controller.focusReading.active) {
+        controller.activateFocusUnit(unit);
+      } else {
+        setState(() => _overlayVisible = !_overlayVisible);
+      }
       return;
     }
     if (fraction < 0.2) {
@@ -1047,6 +1232,7 @@ class _ReaderPageState extends State<ReaderPage>
   }
 
   void _onDragStart(DragStartDetails _, ReaderController controller) {
+    _stopFocusMotion();
     if (_selecting || !controller.opened) return;
     final continuingRapidTurn = _turnPhase == _TurnPhase.animating;
     if (continuingRapidTurn) {
@@ -1281,14 +1467,29 @@ class _ReaderPageState extends State<ReaderPage>
   Widget _buildTurnScene(ReaderController controller, double width) {
     final offset = _turnOffset();
     final direction = _turnDirection!;
-    final neighbour = controller.peekPage(
+    final rawNeighbour = controller.peekPage(
       direction == _TurnDirection.next ? 1 : -1,
     );
-    final current = controller.currentPage;
+    final preview = rawNeighbour != null && rawNeighbour.focusUnits.isNotEmpty
+        ? controller.focusReading.preview(
+            rawNeighbour,
+            backwards: direction == _TurnDirection.previous,
+          )
+        : null;
+    final neighbour = preview?.$1 ?? rawNeighbour;
+    final current = controller.displayPage;
     final imageResolver = controller.resolveImage;
 
     Widget page(PageLayout? layout) => layout == null
         ? ColoredBox(color: _background)
+        : layout.focusUnits.isNotEmpty
+        ? _focusPageSurface(
+            controller,
+            layout,
+            active: identical(layout, current)
+                ? controller.focusReading.active
+                : (preview?.$2 ?? 0),
+          )
         : PageWidget(
             page: layout,
             imageResolver: imageResolver,
@@ -1488,6 +1689,37 @@ class _ReaderPageState extends State<ReaderPage>
                 onPressed: () => Navigator.of(context).maybePop(),
               ),
               const Spacer(),
+              if (_controller?.style.focusMode == true &&
+                  _controller?.focusModeAllowed == true) ...[
+                IconButton(
+                  key: const Key('reader-focus-previous-page'),
+                  tooltip: context.l10n.text('上一页', 'Previous page'),
+                  icon: const Icon(Icons.chevron_left),
+                  onPressed: _controller!.busy
+                      ? null
+                      : () {
+                          _stopFocusMotion();
+                          if (_showBookEnd) {
+                            setState(() => _showBookEnd = false);
+                          } else {
+                            _controller!.prevPage().then(
+                              (_) => _schedulePeekPreparation(),
+                            );
+                          }
+                        },
+                ),
+                IconButton(
+                  key: const Key('reader-focus-next-page'),
+                  tooltip: context.l10n.text('下一页', 'Next page'),
+                  icon: const Icon(Icons.chevron_right),
+                  onPressed: _controller!.busy || _showBookEnd
+                      ? null
+                      : () {
+                          _stopFocusMotion();
+                          _nextPageOrEnd(_controller!);
+                        },
+                ),
+              ],
               IconButton(
                 onPressed: _searchBook,
                 icon: Icon(Icons.search, color: _chromeForeground),
@@ -1706,74 +1938,116 @@ class _ReaderPageState extends State<ReaderPage>
     if (controller == null || controller.busy) return;
     final selected = await showModalBottomSheet<TypesettingMode>(
       context: context,
+      isScrollControlled: true,
       backgroundColor: _chromeBackground,
       builder: (sheetContext) => Theme(
         data: _readerThemeData(Theme.of(context), _background, _foreground),
         child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                ListTile(
-                  leading: const Icon(Icons.text_fields),
-                  title: Text(context.l10n.text('字体与字号', 'Fonts and size')),
-                  trailing: const Icon(Icons.chevron_right),
-                  onTap: () {
-                    Navigator.of(sheetContext).pop();
-                    _openReadingSettings();
-                  },
-                ),
-                if (controller.semanticLayoutError != null)
+          child: SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
                   ListTile(
-                    leading: const Icon(Icons.info_outline),
-                    title: Text(
-                      context.l10n.text(
-                        'AI 排版暂不可用，保留原排版',
-                        'AI layout unavailable; original layout retained',
-                      ),
-                    ),
-                    subtitle: Text(
-                      context.l10n.text(
-                        '检查排版模型设置；返回阅读时会重试',
-                        'Check the layout model settings; returning retries recognition',
-                      ),
-                    ),
+                    leading: const Icon(Icons.text_fields),
+                    title: Text(context.l10n.text('字体与字号', 'Fonts and size')),
+                    trailing: const Icon(Icons.chevron_right),
                     onTap: () {
                       Navigator.of(sheetContext).pop();
                       _openReadingSettings();
                     },
                   ),
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-                  child: Text(
-                    context.l10n.text('版式', 'Typesetting'),
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w600,
+                  SwitchListTile(
+                    key: const Key('reader-focus-mode-switch'),
+                    title: Text(context.l10n.text('专注模式', 'Focus mode')),
+                    subtitle: Text(
+                      controller.focusModeAllowed
+                          ? context.l10n.text(
+                              '上下切换段落或滚动，左右翻页',
+                              'Swipe vertically to focus or scroll; horizontally to turn pages',
+                            )
+                          : context.l10n.text(
+                              '固定版式暂不支持',
+                              'Unavailable for fixed-layout books',
+                            ),
+                    ),
+                    value: _style.focusMode && controller.focusModeAllowed,
+                    onChanged: controller.focusModeAllowed
+                        ? (_) {
+                            Navigator.of(sheetContext).pop();
+                            _toggleFocusMode();
+                          }
+                        : null,
+                  ),
+                  SwitchListTile(
+                    key: const Key('reader-sentence-split-switch'),
+                    title: Text(context.l10n.text('按句分段', 'Split by sentence')),
+                    subtitle: Text(
+                      context.l10n.text(
+                        '仅在专注模式下，将所有支持的段落按句另起行',
+                        'Start each sentence on a new line throughout focus mode',
+                      ),
+                    ),
+                    value: _style.sentenceSplit,
+                    onChanged: _style.focusMode && controller.focusModeAllowed
+                        ? (_) {
+                            Navigator.of(sheetContext).pop();
+                            _toggleSentenceSplit();
+                          }
+                        : null,
+                  ),
+                  if (controller.semanticLayoutError != null)
+                    ListTile(
+                      leading: const Icon(Icons.info_outline),
+                      title: Text(
+                        context.l10n.text(
+                          'AI 排版暂不可用，保留原排版',
+                          'AI layout unavailable; original layout retained',
+                        ),
+                      ),
+                      subtitle: Text(
+                        context.l10n.text(
+                          '检查排版模型设置；返回阅读时会重试',
+                          'Check the layout model settings; returning retries recognition',
+                        ),
+                      ),
+                      onTap: () {
+                        Navigator.of(sheetContext).pop();
+                        _openReadingSettings();
+                      },
+                    ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                    child: Text(
+                      context.l10n.text('版式', 'Typesetting'),
+                      style: const TextStyle(
+                        fontSize: 20,
+                        fontWeight: FontWeight.w600,
+                      ),
                     ),
                   ),
-                ),
-                _typesettingChoice(
-                  sheetContext,
-                  TypesettingMode.unified,
-                  context.l10n.text('统一版式', 'Unified'),
-                  context.l10n.text(
-                    '统一正文、标题、段落、列表和表格的排版',
-                    'Use consistent styling for body text, headings, lists and tables',
+                  _typesettingChoice(
+                    sheetContext,
+                    TypesettingMode.unified,
+                    context.l10n.text('统一版式', 'Unified'),
+                    context.l10n.text(
+                      '统一正文、标题、段落、列表和表格的排版',
+                      'Use consistent styling for body text, headings, lists and tables',
+                    ),
                   ),
-                ),
-                _typesettingChoice(
-                  sheetContext,
-                  TypesettingMode.book,
-                  context.l10n.text('跟随书籍', 'Follow book'),
-                  context.l10n.text(
-                    '保留书籍自带的字号、行距、缩进和颜色',
-                    'Keep the book’s font size, line height, indentation and colors',
+                  _typesettingChoice(
+                    sheetContext,
+                    TypesettingMode.book,
+                    context.l10n.text('跟随书籍', 'Follow book'),
+                    context.l10n.text(
+                      '保留书籍自带的字号、行距、缩进和颜色',
+                      'Keep the book’s font size, line height, indentation and colors',
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -1797,6 +2071,7 @@ class _ReaderPageState extends State<ReaderPage>
   Future<void> _openReadingSettings() async {
     final controller = _controller;
     if (controller == null) return;
+    _stopFocusMotion();
     controller.setReaderVisible(false);
     final saved = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
@@ -1973,7 +2248,29 @@ class _ReaderPageState extends State<ReaderPage>
     );
   }
 
+  bool _viewportUpdateScheduled = false;
+
   Widget _buildReader(ReaderController controller, BoxConstraints constraints) {
+    final viewport = LayoutViewport(
+      width: constraints.maxWidth,
+      height: constraints.maxHeight,
+    );
+    if (controller.style.focusMode &&
+        controller.focusModeAllowed &&
+        !controller.busy &&
+        controller.needsViewport(viewport) &&
+        !_viewportUpdateScheduled) {
+      _viewportUpdateScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        _viewportUpdateScheduled = false;
+        if (!mounted || controller.busy) return;
+        _stopFocusMotion();
+        _resetTurn();
+        if (_selecting) _selectionKey.currentState?.clear();
+        await controller.updateViewport(viewport);
+        if (mounted) _schedulePeekPreparation();
+      });
+    }
     _readerWidth = constraints.maxWidth;
     final page = controller.currentPage;
     if (page != null && _interactionPage != page) {
@@ -1984,15 +2281,32 @@ class _ReaderPageState extends State<ReaderPage>
         if (mounted) _loadInteraction(page);
       });
     }
+    final displayPage = controller.displayPage;
+    final focus = page?.focusUnits.isNotEmpty == true && !_showBookEnd;
     final width = constraints.maxWidth;
     return Stack(
       children: [
         Positioned.fill(
           child: Listener(
-            onPointerDown: (_) => _tickStatistics(activity: true),
+            onPointerDown: (_) {
+              _tickStatistics(activity: true);
+              if (_focusMotion?.isAnimating == true) _stopFocusMotion();
+            },
             onPointerSignal: (_) => _tickStatistics(activity: true),
             child: GestureDetector(
               key: const Key('reader-page-gesture'),
+              onVerticalDragStart: focus && !_selecting
+                  ? (d) => _startFocusDrag(d, controller)
+                  : null,
+              onVerticalDragUpdate: focus && !_selecting
+                  ? (d) => _updateFocusDrag(d, controller)
+                  : null,
+              onVerticalDragEnd: focus && !_selecting
+                  ? (d) => _endFocusDrag(d, controller)
+                  : null,
+              onVerticalDragCancel: focus && !_selecting
+                  ? _stopFocusMotion
+                  : null,
               behavior: HitTestBehavior.opaque,
               onTapUp: _selecting
                   ? null
@@ -2017,7 +2331,7 @@ class _ReaderPageState extends State<ReaderPage>
                         ? const SizedBox.expand()
                         : ReaderSelectionLayer(
                             key: _selectionKey,
-                            page: page,
+                            page: displayPage ?? page,
                             nodes: _interactionNodes,
                             mode: controller.translationEnabled
                                 ? ReaderSelectionMode.paragraph
@@ -2027,6 +2341,7 @@ class _ReaderPageState extends State<ReaderPage>
                             onSelecting: (value) {
                               if (mounted && value != _selecting) {
                                 setState(() {
+                                  if (value) _stopFocusMotion();
                                   _selecting = value;
                                   controller.setPageTurnActive(value);
                                   if (value) _overlayVisible = false;
@@ -2035,12 +2350,17 @@ class _ReaderPageState extends State<ReaderPage>
                             },
                             onSave: _saveSelection,
                             onMarkTap: _annotationActions,
-                            child: PageWidget(
-                              page: page,
-                              imageResolver: controller.resolveImage,
-                              background: _background,
-                              foreground: _foreground,
-                            ),
+                            child: focus
+                                ? _focusPageSurface(
+                                    controller,
+                                    displayPage ?? page,
+                                  )
+                                : PageWidget(
+                                    page: page,
+                                    imageResolver: controller.resolveImage,
+                                    background: _background,
+                                    foreground: _foreground,
+                                  ),
                           )),
             ),
           ),
@@ -2098,4 +2418,19 @@ class _ReaderPageState extends State<ReaderPage>
       ],
     );
   }
+}
+
+class _FocusContentClipper extends CustomClipper<Rect> {
+  final double top, bottom;
+  const _FocusContentClipper(this.top, this.bottom);
+  @override
+  Rect getClip(Size size) => Rect.fromLTRB(
+    0,
+    top,
+    size.width,
+    (size.height - bottom).clamp(top, double.infinity),
+  );
+  @override
+  bool shouldReclip(_FocusContentClipper oldClipper) =>
+      top != oldClipper.top || bottom != oldClipper.bottom;
 }

@@ -25,6 +25,30 @@ class ReaderPreferencesStore {
   Future<SharedPreferences> get _preferences async =>
       _resolved ??= _injected ?? await SharedPreferences.getInstance();
 
+  Future<bool> loadFocusMode() async {
+    try {
+      return (await _preferences).getBool('reader_focus_mode_v1') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> loadSentenceSplit() async {
+    try {
+      return (await _preferences).getBool('reader_sentence_split_v1') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> saveSentenceSplit(bool value) async {
+    await (await _preferences).setBool('reader_sentence_split_v1', value);
+  }
+
+  Future<void> saveFocusMode(bool value) async {
+    await (await _preferences).setBool('reader_focus_mode_v1', value);
+  }
+
   Future<TypesettingMode> loadTypesettingMode() async {
     try {
       return switch ((await _preferences).getString(_typesettingModeKey)) {

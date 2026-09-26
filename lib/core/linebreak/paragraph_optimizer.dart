@@ -140,6 +140,9 @@ class ParagraphOptimizer {
     Map<int, double> hyphenBreaks = const {},
     required double lineWidth,
     required double firstLineIndent,
+    // Sentence subparagraphs restart indentation; authored line breaks normally
+    // continue the original paragraph without another first-line indent.
+    bool indentAfterBreak = false,
     required double defaultEm,
   }) {
     if (clusters.length > 4096 ||
@@ -219,7 +222,9 @@ class ParagraphOptimizer {
                   entry.key - from: entry.value,
             },
             lineWidth: lineWidth,
-            firstLineIndent: start == 0 ? firstLineIndent : 0,
+            firstLineIndent: start == 0 || indentAfterBreak
+                ? firstLineIndent
+                : 0,
             defaultEm: defaultEm,
           );
           if (part == null) return null;

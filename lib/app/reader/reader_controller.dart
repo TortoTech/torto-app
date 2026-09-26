@@ -20,6 +20,7 @@ import '../../core/ir/ir.dart';
 import '../../core/ir/text_index.dart';
 import '../sync/sync_models.dart';
 import 'annotations_repository.dart';
+import 'focus_reading_state.dart';
 import '../../core/layout/layout_engine.dart';
 import '../../core/layout/layout_types.dart';
 import '../../core/linebreak/english_hyphenator.dart';
@@ -618,10 +619,8 @@ class ReaderController extends ChangeNotifier {
     }
     if (_disposed || target != sectionIndex) return;
     final restored = await _restorePageIndex(target, locator);
-    if (restored != pageIndex) {
-      pageIndex = restored;
-      notifyListeners();
-    }
+    pageIndex = restored;
+    notifyListeners();
   }
 
   /// Decoded images by package href; null values mark known-missing.
@@ -724,7 +723,7 @@ class ReaderController extends ChangeNotifier {
         }
         // A reader may have navigated while the new layout yielded. Anchor to
         // the latest visible page, never the page that requested translation.
-        final anchor = currentPage?.firstAnchor;
+        final anchor = readingAnchor;
         final progression = currentPage?.progression ?? 0;
         final old = _sections[index];
         _sections[index] = pages;
@@ -781,9 +780,41 @@ class ReaderController extends ChangeNotifier {
 
   List<PageLayout> get currentPages => _sections[sectionIndex] ?? const [];
 
+  final focusReading = FocusReadingState();
+  bool get focusModeAllowed =>
+      _format != BookFormat.pdf &&
+      _source?.book.metadata.layout != RenditionLayout.prePaginated;
+  SourceAnchor? get readingAnchor {
+    final page = currentPage;
+    return page == null ? null : focusReading.anchor;
+  }
+
+  PageLayout? get displayPage {
+    final page = currentPage;
+    return page == null ? null : focusReading.display(page);
+  }
+
+  void activateFocusUnit(int index) {
+    if (busy || currentPage == null) return;
+    if (focusReading.activate(index)) {
+      notifyListeners();
+      _scheduleSave();
+    }
+  }
+
+  void scrollFocus(double offset) {
+    if (busy || currentPage == null) return;
+    if (focusReading.scroll(offset)) {
+      notifyListeners();
+      _scheduleSave();
+    }
+  }
+
   PageLayout? get currentPage {
     final pages = currentPages;
-    return pageIndex < pages.length ? pages[pageIndex] : null;
+    final page = pageIndex < pages.length ? pages[pageIndex] : null;
+    if (page != null) focusReading.attach(page, _style.marginTop);
+    return page;
   }
 
   int get sectionCount => _source?.book.sectionCount ?? 0;
@@ -982,6 +1013,16 @@ class ReaderController extends ChangeNotifier {
     notifyListeners();
   }
 
+  bool needsViewport(LayoutViewport next) =>
+      _source != null &&
+      (_viewport.width != next.width || _viewport.height != next.height);
+
+  Future<void> updateViewport(LayoutViewport next) async {
+    if (busy || !opened || !needsViewport(next)) return;
+    _viewport = next;
+    await _refreshCurrentSectionPreservingPosition();
+  }
+
   /// Applies a presentation change and repaginates around the current
   /// logical position. Parsed publication data and decoded images stay
   /// cached; only layout-dependent pages are rebuilt.
@@ -992,7 +1033,7 @@ class ReaderController extends ChangeNotifier {
 
     final currentSection = sectionIndex;
     final progression = currentPage?.progression ?? 0.0;
-    final anchor = currentPage?.firstAnchor;
+    final anchor = readingAnchor;
     final staleSections = Map<int, List<PageLayout>>.of(_sections);
     _sections.clear();
     _paginations.clear();
@@ -1297,7 +1338,7 @@ class ReaderController extends ChangeNotifier {
     if (!opened || busy || _source == null) return;
     final currentSection = sectionIndex;
     final progression = currentPage?.progression ?? 0.0;
-    final anchor = currentPage?.firstAnchor;
+    final anchor = readingAnchor;
     final staleSections = Map<int, List<PageLayout>>.of(_sections);
     _sections.clear();
     _paginations.clear();
@@ -1329,13 +1370,17 @@ class ReaderController extends ChangeNotifier {
     }
   }
 
-  static int _pageForAnchor(
+  int _pageForAnchor(
     List<PageLayout> pages,
     SourceAnchor anchor,
     double fallbackProgression,
   ) {
+    focusReading.target = anchor;
     var match = -1;
     for (var index = 0; index < pages.length; index++) {
+      if (pages[index].focusUnits.any((unit) => unit.contains(anchor))) {
+        match = index;
+      }
       for (final item in pages[index].items) {
         if (item is TextPlacement &&
             item.source?.start.spine == anchor.spine &&
@@ -1508,6 +1553,7 @@ class ReaderController extends ChangeNotifier {
 
   Future<void> nextPage() async {
     if (busy || !opened) return;
+    focusReading.backwards = false;
     _scheduleTranslationRefresh();
     if (pageIndex + 1 < currentPages.length) {
       pageIndex++;
@@ -1521,6 +1567,7 @@ class ReaderController extends ChangeNotifier {
 
   Future<void> prevPage() async {
     if (busy || !opened) return;
+    focusReading.backwards = true;
     _scheduleTranslationRefresh();
     if (pageIndex > 0) {
       pageIndex--;
@@ -1559,6 +1606,8 @@ class ReaderController extends ChangeNotifier {
       if (target == -1) return; // effectively empty book; stay put
       sectionIndex = target;
       pageIndex = 0;
+      focusReading.target =
+          currentPages.firstOrNull?.focusUnits.firstOrNull?.anchor;
       _evictDistantSections();
     } finally {
       busy = false;
@@ -1598,6 +1647,7 @@ class ReaderController extends ChangeNotifier {
             ),
           );
           if (index >= 0) targetPage = index;
+          focusReading.target = anchor.source;
         }
       }
       sectionIndex = target;
@@ -1785,7 +1835,7 @@ class ReaderController extends ChangeNotifier {
     final pages = await _engine.paginateAsync(
       section,
       viewport,
-      style,
+      style.copyWith(focusMode: style.focusMode && focusModeAllowed),
       imageSizeResolver: _imageSize,
       coverHref: book.coverHref,
       renditionLayout: book.metadata.layout,
@@ -2009,7 +2059,7 @@ class ReaderController extends ChangeNotifier {
     if (book.sectionCount == 0) return;
     final page = currentPage;
     final progression = page?.progression ?? 0.0;
-    final displayedAnchor = page?.firstAnchor;
+    final displayedAnchor = readingAnchor;
     // Translation has no character-level original alignment. Persist the
     // canonical paragraph start, never a translated-text offset as original.
     final anchor = displayedAnchor == null

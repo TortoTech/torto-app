@@ -23,6 +23,8 @@ import '../linebreak/paragraph_optimizer.dart';
 import '../linebreak/measurement.dart';
 import '../linebreak/unicode_line_breaker.dart';
 import 'layout_types.dart';
+import 'focus_layout.dart';
+import 'sentence_structure.dart';
 import 'source_offset_map.dart';
 
 /// Default heading size scales by level, applied only when the IR left every
@@ -356,7 +358,24 @@ class LayoutEngine {
     bool Function()? shouldCancel,
   }) sync* {
     if (section.blocks.isEmpty) return;
-    final flowBlocks = _collectFlowBlocks(section.blocks, style);
+    if (style.focusMode &&
+        (renditionLayout == RenditionLayout.prePaginated ||
+            section.blocks.any(
+              (block) => block is ImageBlock && block.fixedPage,
+            ))) {
+      style = style.copyWith(focusMode: false);
+    }
+    final flowBlocks = _collectFlowBlocks(section.blocks, style)
+        .where(
+          (block) =>
+              !style.focusMode ||
+              block is! TextBlock ||
+              block.kind != TextBlockKind.footnoteDefinition,
+        )
+        .toList();
+    final focusGroups = style.focusMode
+        ? FocusUnitBuilder.build(flowBlocks)
+        : <int, List<Block>>{};
     if (flowBlocks.isEmpty) return;
 
     final contentLeft = style.marginLeft;
@@ -389,6 +408,7 @@ class LayoutEngine {
     }
 
     final paginator = _Paginator(
+      focusMode: style.focusMode,
       top: contentTop,
       bottom: contentBottom,
       left: contentLeft,
@@ -402,6 +422,9 @@ class LayoutEngine {
     while (blockIndex < flowBlocks.length) {
       if (shouldCancel?.call() == true) break;
       final block = flowBlocks[blockIndex];
+      if (focusGroups[blockIndex] case final group?) {
+        paginator.beginFocusUnit(group);
+      }
       if (style.typesettingMode == TypesettingMode.unified &&
           block is ImageBlock &&
           blockIndex + 1 < flowBlocks.length &&
@@ -596,8 +619,18 @@ class LayoutEngine {
       pages.add(
         PageLayout(
           viewport: viewport,
+          focusUnits: style.focusMode ? paginator.focusPages[i] : const [],
+          scrollExtent:
+              style.focusMode &&
+                  paginator.focusPageBottoms[i] > contentBottom + _eps
+              ? math.max(0, paginator.focusPageBottoms[i] - contentBottom)
+              : 0,
           items: items,
-          firstAnchor: anchor,
+          firstAnchor:
+              anchor ??
+              (style.focusMode
+                  ? paginator.focusPages[i].firstOrNull?.anchor
+                  : null),
           progression: progression,
           disposalPool: disposalPool,
         ),
@@ -761,7 +794,22 @@ class LayoutEngine {
     BlockAlign? unifiedAlignmentOverride,
     ui.Size? Function(String href)? imageSizeResolver,
     bool semanticAnnotation = false,
+    bool allowSentenceSplit = true,
+    bool splitSemicolons = true,
   }) {
+    final sentenceInlines =
+        style.focusMode &&
+            style.sentenceSplit &&
+            allowSentenceSplit &&
+            SentenceStructure.supports(block.kind)
+        ? SentenceStructure.apply(
+            block.inlines,
+            splitSemicolons:
+                splitSemicolons && block.kind != TextBlockKind.blockquote,
+          )
+        : block.inlines;
+    final sentenceStructured = !identical(sentenceInlines, block.inlines);
+    if (sentenceStructured) block = withInlines(block, sentenceInlines);
     block = withInlines(block, _presentationInlines(block.inlines, style));
     final displayMath =
         block.inlines.length == 1 &&
@@ -1065,6 +1113,17 @@ class LayoutEngine {
           } else {
             appendSourceText('\n');
           }
+          if (sentenceStructured && indentWidth > 0) {
+            builder.addPlaceholder(
+              indentWidth,
+              baseSize,
+              ui.PlaceholderAlignment.baseline,
+              baseline: ui.TextBaseline.alphabetic,
+              baselineOffset: baseSize * 0.8,
+            );
+            paragraphOffset++;
+            normalDisplayToSource.add(sourceOffset);
+          }
         case InlineImageRun():
           final metrics = _inlineImageMetrics(
             inline,
@@ -1156,6 +1215,7 @@ class LayoutEngine {
         isHeading: isHeading,
         isQuote: isQuote,
         firstLineIndent: indentWidth,
+        indentAfterBreak: sentenceStructured,
         width: width,
         publicationLanguage: style.publicationLanguage,
         writingSystem: style.writingSystem,
@@ -1226,6 +1286,7 @@ class LayoutEngine {
     var offset = 0;
     for (final inline in inlines) {
       if (inline is BreakInline && !inline.synthetic) offset++;
+      if (inline is MathInline) offset += inline.sourceText.runes.length;
       if (inline is! TextRun) continue;
       final end = offset + inline.text.runes.length;
       if (inline.style.baseline != TextBaselineShift.none &&
@@ -1381,6 +1442,7 @@ class LayoutEngine {
     required bool isHeading,
     required bool isQuote,
     required double firstLineIndent,
+    bool indentAfterBreak = false,
     required double width,
     required String publicationLanguage,
     required WritingSystem writingSystem,
@@ -1394,7 +1456,6 @@ class LayoutEngine {
     for (final inline in block.inlines) {
       switch (inline) {
         case BreakInline(:final synthetic):
-          if (synthetic) return null;
           text.write('\n');
           slices.add(
             _SourceRunSlice(
@@ -1409,9 +1470,46 @@ class LayoutEngine {
             ),
           );
           sourceOffset++;
-          logicalToOriginalSource.add(++originalSourceOffset);
+          // Sentence boundaries exist only in presentation text. Keep the
+          // canonical book offsets unchanged for selection and reading progress.
+          if (!synthetic) originalSourceOffset++;
+          logicalToOriginalSource.add(originalSourceOffset);
         case MathInline():
-          return null;
+          if (inline.latex.isEmpty) continue;
+          final raster = formulaResolver?.call(inline, foreground.toARGB32());
+          if (raster == null) return null;
+          final fontSize =
+              baseSize * blockScale * (unified ? 1 : inline.sizeScale);
+          final scale = math.min(
+            fontSize / FormulaRasterizer.em,
+            width / raster.width,
+          );
+          final start = sourceOffset;
+          text.write('\uFFFC');
+          sourceOffset++;
+          originalSourceOffset += inline.sourceText.runes.length;
+          logicalToOriginalSource.add(originalSourceOffset);
+          slices.add(
+            _SourceRunSlice(
+              start: start,
+              end: sourceOffset,
+              style: TextStyle.plain,
+              link: null,
+              language: null,
+              footnoteIcon: false,
+              footnoteSize: 0,
+              fontSize: fontSize,
+              inlineImageMetrics: _InlineImageMetrics(
+                width: raster.width * scale,
+                height: raster.height * scale,
+                boxHeight: raster.height * scale,
+                baselineOffset: raster.baseline * scale,
+                paintOffsetY: 0,
+              ),
+              inlineImageHref: raster.href,
+              formula: inline,
+            ),
+          );
         case InlineImageRun():
           final metrics = _inlineImageMetrics(
             inline,
@@ -1721,6 +1819,7 @@ class LayoutEngine {
       hyphenBreaks: hyphenBreakWidths,
       lineWidth: optimizedWidth,
       firstLineIndent: firstLineIndent,
+      indentAfterBreak: indentAfterBreak,
       defaultEm: baseSize,
     );
     if (_debugHyphenation && plan == null) {
@@ -1934,6 +2033,17 @@ class LayoutEngine {
           displayOffset++;
           displayToSource.add(logicalToOriginalSource[boundary]);
         }
+        if (indentAfterBreak && hasIndent && line.paragraphEnd) {
+          builder.addPlaceholder(
+            firstLineIndent,
+            baseSize,
+            ui.PlaceholderAlignment.baseline,
+            baseline: ui.TextBaseline.alphabetic,
+            baselineOffset: baseSize * 0.8,
+          );
+          displayOffset++;
+          displayToSource.add(logicalToOriginalSource[boundary]);
+        }
         sourceToDisplayStart[boundary] = displayOffset;
       }
     }
@@ -1986,7 +2096,9 @@ class LayoutEngine {
     final links = <TextLinkRange>[];
     for (final slice in slices) {
       final link = slice.link;
-      if (link == null && !slice.footnoteIcon) continue;
+      if (link == null && !slice.footnoteIcon && slice.formula == null) {
+        continue;
+      }
       final start = sourceToDisplayStart[slice.start];
       final end = sourceToDisplayEnd[slice.end];
       if (start < 0 || end <= start) continue;
@@ -2000,6 +2112,8 @@ class LayoutEngine {
           footnoteIcon: slice.footnoteIcon,
           citationOrdinal: slice.style.inlineCitation,
           websiteIcon: slice.style.website,
+          latex: slice.formula?.latex,
+          originalImage: slice.formula?.originalImage,
           inlineNote:
               slice.style.inlineCitation > 0 ||
                   slice.style.inlineRole == InlineRole.footnote
@@ -2307,6 +2421,7 @@ class LayoutEngine {
       imageSizeResolver: imageSizeResolver,
       unifiedAlignmentOverride: alignment,
       semanticAnnotation: true,
+      allowSentenceSplit: false,
     );
     var result = prepare(
       unified && text.kind != TextBlockKind.caption ? BlockAlign.start : null,
@@ -2791,6 +2906,7 @@ class LayoutEngine {
         quoteWidth,
         offset,
         imageSizeResolver: imageSizeResolver,
+        splitSemicolons: false,
       );
       if (value != null &&
           unified &&
@@ -2811,6 +2927,7 @@ class LayoutEngine {
         quoteWidth,
         offset,
         imageSizeResolver: imageSizeResolver,
+        allowSentenceSplit: false,
       );
       if (value != null) prepared.add(value);
     }
@@ -3247,6 +3364,7 @@ class _SourceRunSlice {
   final double fontSize;
   final _InlineImageMetrics? inlineImageMetrics;
   final String? inlineImageHref;
+  final MathInline? formula;
 
   const _SourceRunSlice({
     required this.start,
@@ -3259,6 +3377,7 @@ class _SourceRunSlice {
     required this.fontSize,
     this.inlineImageMetrics,
     this.inlineImageHref,
+    this.formula,
   });
 }
 
@@ -3437,7 +3556,9 @@ class _ActiveQuote {
 /// Port of torto's Paginator: a single-column cursor over the content area.
 class _Paginator {
   final double top;
-  final double bottom;
+  final double pageBottom;
+  double get bottom => focusMode ? double.infinity : pageBottom;
+  final bool focusMode;
   final double left;
   final double width;
   final bool centerStandaloneImage;
@@ -3455,11 +3576,68 @@ class _Paginator {
 
   _Paginator({
     required this.top,
-    required this.bottom,
+    required double bottom,
+    this.focusMode = false,
     required this.left,
     required this.width,
     required this.centerStandaloneImage,
-  }) : cursorY = top;
+  }) : pageBottom = bottom,
+       cursorY = top;
+
+  final List<List<FocusUnitLayout>> focusPages = [];
+  final List<double> focusPageBottoms = [];
+  List<FocusUnitLayout> focusUnits = [];
+  int? _unitStart;
+  List<Block> _unitBlocks = [];
+
+  void beginFocusUnit(List<Block> blocks) {
+    endFocusUnit();
+    _unitStart = items.length;
+    _unitBlocks = blocks;
+  }
+
+  void endFocusUnit() {
+    final start = _unitStart;
+    _unitStart = null;
+    if (start == null || start >= items.length) return;
+    double itemTop(PageItem item) => switch (item) {
+      TextPlacement(:final y) ||
+      ListMarkerPlacement(:final y) ||
+      QuotePlacement(:final y) => y,
+      TableCellPlacement(:final rect) ||
+      ImagePlacement(:final rect) ||
+      SeparatorPlacement(:final rect) => rect.top,
+    };
+    var unitTop = items.skip(start).map(itemTop).reduce(math.min);
+    final height = cursorY - unitTop;
+    if (start > 0 && cursorY > pageBottom + _eps) {
+      final groupItems = items.sublist(start);
+      items = items.sublist(0, start);
+      final margin = pendingMargin;
+      cursorY = focusUnits.isEmpty ? top : focusUnits.last.bounds.bottom;
+      advance();
+      items = groupItems
+          .map((item) => shiftPageItem(item, top - unitTop))
+          .toList();
+      unitTop = top;
+      cursorY = top + height;
+      pendingMargin = margin;
+      hasContent = true;
+    }
+    final sources = _unitBlocks.expand(FocusUnitBuilder.sources).toList();
+    final body = _unitBlocks.where(
+      (b) => b is! TextBlock || b.kind != TextBlockKind.heading,
+    );
+    final bodySources = body.expand(FocusUnitBuilder.sources);
+    focusUnits.add(
+      FocusUnitLayout(
+        bounds: ui.Rect.fromLTWH(left, unitTop, width, height),
+        sources: sources,
+        anchor: bodySources.firstOrNull?.start ?? sources.firstOrNull?.start,
+      ),
+    );
+    if (cursorY > pageBottom + _eps) advance();
+  }
 
   double get remaining => bottom - cursorY;
 
@@ -3668,7 +3846,7 @@ class _Paginator {
     _collapseMargin(marginBefore);
     if (height > remaining + _eps && hasContent) advance();
     final x = fillViewportWidth ? 0.0 : left + (this.width - width) / 2;
-    final y = centerVertically && !hasContent
+    final y = centerVertically && !hasContent && !focusMode
         ? top + math.max(0, (bottom - top - height) / 2)
         : cursorY;
     items.add(
@@ -3758,6 +3936,7 @@ class _Paginator {
   }
 
   void forcePage() {
+    if (focusMode) endFocusUnit();
     if (items.isNotEmpty) advance();
   }
 
@@ -3775,7 +3954,8 @@ class _Paginator {
         }
         active!.decorationIndex = null;
       }
-      if (centerStandaloneImage &&
+      if (!focusMode &&
+          centerStandaloneImage &&
           items.length == 1 &&
           items.single is ImagePlacement) {
         final image = items.single as ImagePlacement;
@@ -3791,6 +3971,11 @@ class _Paginator {
           ),
         );
       }
+      if (focusMode) {
+        focusPages.add(focusUnits);
+        focusPageBottoms.add(cursorY);
+        focusUnits = [];
+      }
       pages.add(items);
       items = [];
     }
@@ -3800,6 +3985,7 @@ class _Paginator {
   }
 
   List<List<PageItem>> finish() {
+    if (focusMode) endFocusUnit();
     advance();
     return pages;
   }

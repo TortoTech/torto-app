@@ -162,6 +162,10 @@ class ReaderTypography {
 }
 
 class ReaderStyle {
+  final bool focusMode;
+
+  /// Global sentence subparagraphs, effective only in focus mode.
+  final bool sentenceSplit;
   double get unifiedBodyLineHeight => switch (writingSystem) {
     WritingSystem.cjk => 1.7,
     WritingSystem.latin => 1.4,
@@ -203,6 +207,8 @@ class ReaderStyle {
   final ReaderTypography typography;
 
   const ReaderStyle({
+    this.focusMode = false,
+    this.sentenceSplit = false,
     this.baseFontSize = 20,
     this.lineHeight = 1.5,
     this.marginTop = 24,
@@ -226,6 +232,8 @@ class ReaderStyle {
   };
 
   ReaderStyle copyWith({
+    bool? focusMode,
+    bool? sentenceSplit,
     double? baseFontSize,
     double? lineHeight,
     double? marginTop,
@@ -240,6 +248,8 @@ class ReaderStyle {
     String? publicationLanguage,
     ReaderTypography? typography,
   }) => ReaderStyle(
+    focusMode: focusMode ?? this.focusMode,
+    sentenceSplit: sentenceSplit ?? this.sentenceSplit,
     baseFontSize: baseFontSize ?? this.baseFontSize,
     lineHeight: lineHeight ?? this.lineHeight,
     marginTop: marginTop ?? this.marginTop,
@@ -258,6 +268,8 @@ class ReaderStyle {
   @override
   bool operator ==(Object other) =>
       other is ReaderStyle &&
+      other.focusMode == focusMode &&
+      other.sentenceSplit == sentenceSplit &&
       other.baseFontSize == baseFontSize &&
       other.lineHeight == lineHeight &&
       other.marginTop == marginTop &&
@@ -275,6 +287,8 @@ class ReaderStyle {
   @override
   int get hashCode => Object.hash(
     baseFontSize,
+    focusMode,
+    sentenceSplit,
     lineHeight,
     marginTop,
     marginBottom,
@@ -542,8 +556,35 @@ class ParagraphDisposalPool {
   bool markDisposed(ui.Paragraph paragraph) => _disposed.add(paragraph);
 }
 
+class FocusUnitLayout {
+  final ui.Rect bounds;
+  final List<SourceRange> sources;
+  final SourceAnchor? anchor;
+  const FocusUnitLayout({
+    required this.bounds,
+    required this.sources,
+    this.anchor,
+  });
+
+  bool contains(SourceAnchor value) => sources.any((range) {
+    if (range.start.spine != value.spine) return false;
+    if (range.start.node == value.node && range.end.node == value.node) {
+      return value.textOffset >= range.start.textOffset &&
+          (value.textOffset < range.end.textOffset ||
+              range.start.textOffset == range.end.textOffset);
+    }
+    return (range.start.node == value.node &&
+            value.textOffset >= range.start.textOffset) ||
+        (range.end.node == value.node &&
+            value.textOffset < range.end.textOffset);
+  });
+}
+
 /// Renderer-independent display data for one page.
 class PageLayout {
+  /// Complete semantic units in page coordinates; empty in ordinary mode.
+  final List<FocusUnitLayout> focusUnits;
+  final double scrollExtent;
   final LayoutViewport viewport;
   final List<PageItem> items;
 
@@ -560,6 +601,8 @@ class PageLayout {
   final ParagraphDisposalPool? disposalPool;
 
   const PageLayout({
+    this.focusUnits = const [],
+    this.scrollExtent = 0,
     required this.viewport,
     required this.items,
     required this.firstAnchor,
