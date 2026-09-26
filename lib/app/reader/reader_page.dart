@@ -14,6 +14,8 @@ import 'system_reader_fonts.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_math_fork/flutter_math.dart' as fm;
 
 import '../../core/ir/style.dart' show LinkRole;
 import '../../core/layout/layout_types.dart';
@@ -567,6 +569,7 @@ class _ReaderPageState extends State<ReaderPage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
+    _controller?.setReaderVisible(state == AppLifecycleState.resumed);
     _statisticsForeground = state == AppLifecycleState.resumed;
     _tickStatistics(activity: _statisticsForeground);
   }
@@ -893,10 +896,83 @@ class _ReaderPageState extends State<ReaderPage>
     ReaderController controller,
     TextLinkRange link,
   ) async {
+    if (link.latex != null) {
+      final actionStyle = TextButton.styleFrom(
+        minimumSize: const Size(64, 36),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+      );
+      await showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          contentPadding: const EdgeInsets.fromLTRB(24, 28, 24, 20),
+          actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+          buttonPadding: const EdgeInsets.symmetric(horizontal: 2),
+          actionsAlignment: MainAxisAlignment.end,
+          content: SizedBox(
+            width: 500,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.sizeOf(context).height * .6,
+              ),
+              child: Align(
+                heightFactor: 1,
+                child: InteractiveViewer(
+                  minScale: .5,
+                  maxScale: 8,
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: fm.Math.tex(
+                      link.latex!,
+                      textStyle: TextStyle(
+                        fontSize: 22,
+                        color: Theme.of(context).colorScheme.onSurface,
+                      ),
+                      onErrorFallback: (_) => Text(link.latex!),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              style: actionStyle,
+              onPressed: () {
+                Clipboard.setData(ClipboardData(text: link.latex!));
+                Navigator.pop(context);
+              },
+              child: Text(context.l10n.text('复制', 'Copy')),
+            ),
+            TextButton(
+              style: actionStyle.copyWith(
+                foregroundColor: WidgetStatePropertyAll(
+                  Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+              onPressed: () => Navigator.pop(context),
+              child: Text(context.l10n.text('关闭', 'Close')),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+    final url = Uri.tryParse(link.href);
+    if (url != null && const {'http', 'https'}.contains(url.scheme)) {
+      await launchUrl(url, mode: LaunchMode.externalApplication);
+      return;
+    }
     if (_overlayVisible && mounted) {
       setState(() => _overlayVisible = false);
     }
     if (link.footnoteIcon || link.role == LinkRole.footnoteReference) {
+      final entries = await controller.referenceNotes(link);
       final inlineNote = link.inlineNote;
       final note = inlineNote == null
           ? await controller.resolveFootnote(link)
@@ -922,6 +998,8 @@ class _ReaderPageState extends State<ReaderPage>
           publicationLanguage: controller.publicationLanguage,
           writingSystem: controller.style.writingSystem,
           typography: controller.style.typography,
+          entries: entries,
+          initialCitation: link.citationOrdinal,
         );
       } finally {
         _statisticsFootnote = false;
@@ -1647,6 +1725,26 @@ class _ReaderPageState extends State<ReaderPage>
                     _openReadingSettings();
                   },
                 ),
+                if (controller.semanticLayoutError != null)
+                  ListTile(
+                    leading: const Icon(Icons.info_outline),
+                    title: Text(
+                      context.l10n.text(
+                        'AI 排版暂不可用，保留原排版',
+                        'AI layout unavailable; original layout retained',
+                      ),
+                    ),
+                    subtitle: Text(
+                      context.l10n.text(
+                        '检查排版模型设置；返回阅读时会重试',
+                        'Check the layout model settings; returning retries recognition',
+                      ),
+                    ),
+                    onTap: () {
+                      Navigator.of(sheetContext).pop();
+                      _openReadingSettings();
+                    },
+                  ),
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
                   child: Text(
@@ -1699,11 +1797,15 @@ class _ReaderPageState extends State<ReaderPage>
   Future<void> _openReadingSettings() async {
     final controller = _controller;
     if (controller == null) return;
+    controller.setReaderVisible(false);
     final saved = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
         builder: (_) => ReadingSettingsPage(store: _preferencesStore),
       ),
     );
+    if (!mounted) return;
+    controller.setReaderVisible(true);
+    await controller.reloadSemanticLayout();
     if (saved != true || !mounted) return;
     final typography = await _preferencesStore.loadTypography();
     final mode = await _preferencesStore.loadTypesettingMode();

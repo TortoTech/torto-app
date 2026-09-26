@@ -40,3 +40,45 @@ First-time opening still waits for the initial chapter's full pagination.
 Incremental, anchor-aware pagination remains a separate opportunity; its
 navigation, progress-restoration, and paragraph ownership rules need to remain
 consistent before that path can replace full pagination.
+
+## Pure-Dart PDF performance (2026-09-22, build 7020)
+
+PDF rendering remains pure Dart. The native Android experiment was withdrawn
+after the user confirmed this architectural requirement and was never installed.
+
+- The local `pdf_cos` 3.7.0 override only changes JPEG 2000 inverse-wavelet hot
+  loops. It preserves Float32 operation order and sample output; see
+  `third_party/pdf_cos/PATCHES.md` for provenance and equivalence checks.
+- PDF lookahead prepares the next page first and announces it before preparing
+  the previous page. EPUB lookahead order is unchanged.
+- Rendered pages use a lossless PNG disk cache, keyed by the actual PDF content
+  SHA-256, page index and output dimension. It lives in the app's temporary
+  directory, with a 128-page / 256 MiB budget across books. Writes use temporary
+  files; completed entries are evicted by last access. Bump the raster cache
+  directory version if future renderer changes alter output semantics.
+- Cache hits do not start a PDF worker. Fresh renders publish immediately and
+  encode/write a cloned image asynchronously. Closing a reader does not discard
+  completed cached pages, and cache/disk failures do not block book opening.
+
+### Device results
+
+Same phone (23013RK75C), same book (*My mother was a computer*), 2048-pixel
+maximum page dimension. These are application-internal content-ready timings,
+not ADB command or route animation durations.
+
+| Measurement | Build 7018 | Build 7020 |
+| --- | --- | --- |
+| Initial uncached open | 4000 ms | 2786 ms |
+| Five repeated opens | 3701–3790 ms; median 3754 ms | 416–430 ms; median 419 ms |
+| Background decode sample median | 3423 ms | 2168 ms (4 uncached pages) |
+
+The repeats used nearby saved pages of the same PDF, not a large cross-book
+corpus. Build 7020 recorded 18 disk-cache hits during the run. The sampled
+background decoding still takes about two seconds for an uncached scanned
+page; no claim of instant first-time rendering is made.
+
+Text/image layers were visually checked. No new ANR/crash event was observed
+during this run. The test screenshots, raw phase logs and timing summary are
+local under `output/torto-pdf-performance-20260922/` in the workspace, outside
+this repository. Build 7020 was installed with `adb install -r`, preserving
+private data; wireless ADB was left running.

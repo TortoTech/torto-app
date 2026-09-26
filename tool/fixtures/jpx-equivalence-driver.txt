@@ -1,0 +1,20 @@
+void main() {
+  final random = Random(42);
+  var checked = 0;
+  for(var n = 1; n <= 257; n++) {
+    for(final origin in [0,1,7,-3]) {
+      for(final reversible in [true,false]) {
+        final original = Float32List.fromList(List.generate(n, (_) => (random.nextDouble() - .5) * 65536));
+        final actual = Float32List.fromList(original);
+        reference(original, origin, reversible);
+        _synthesize1d(actual, origin, reversible);
+        final a = original.buffer.asUint32List(), b = actual.buffer.asUint32List();
+        for(var i = 0; i < n; i++) {
+          if(a[i] != b[i]) throw StateError('Mismatch n=$n origin=$origin reversible=$reversible index=$i');
+        }
+        checked++;
+      }
+    }
+  }
+  print('bit_exact_cases=$checked');
+}

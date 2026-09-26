@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'semantic_layout_settings_page.dart';
 import '../../core/layout/layout_types.dart';
 import '../../l10n/app_localizations.dart';
 import '../reader/reader_preferences_store.dart';
@@ -128,6 +129,21 @@ class _ReadingSettingsPageState extends State<ReadingSettingsPage> {
           ? const Center(child: CircularProgressIndicator())
           : ListView(
               children: [
+                ListTile(
+                  title: Text(l.text('AI 排版', 'AI layout')),
+                  subtitle: Text(
+                    l.text(
+                      '引用、图注、小节标题和公式',
+                      'Quotations, captions, section headings and formulas',
+                    ),
+                  ),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute(
+                      builder: (_) => const SemanticLayoutSettingsPage(),
+                    ),
+                  ),
+                ),
                 _heading('正文样式', 'Content style'),
                 Padding(
                   padding: const EdgeInsets.all(16),

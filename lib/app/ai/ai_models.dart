@@ -164,11 +164,44 @@ class TranslationSettings {
       );
 }
 
+class SemanticLayoutSettings {
+  final bool enabled;
+  final String providerId;
+  final String model;
+  final ReasoningEffort reasoningEffort;
+  const SemanticLayoutSettings({
+    this.enabled = false,
+    this.providerId = '',
+    this.model = '',
+    this.reasoningEffort = ReasoningEffort.defaultLevel,
+  });
+  Map<String, dynamic> toJson() => {
+    'enabled': enabled,
+    'provider_id': providerId,
+    'model': model,
+    'reasoning_effort': reasoningEffort.label,
+  };
+  factory SemanticLayoutSettings.fromJson(Map json) => SemanticLayoutSettings(
+    enabled: json['enabled'] == true,
+    providerId: json['provider_id'] as String? ?? '',
+    model: json['model'] as String? ?? '',
+    reasoningEffort: ReasoningEffort.values.firstWhere(
+      (value) => value.label == json['reasoning_effort'],
+      orElse: () => ReasoningEffort.defaultLevel,
+    ),
+  );
+}
+
 class AiSettings {
   final List<AiProviderConfig> providers;
   final TranslationSettings translation;
+  final SemanticLayoutSettings semanticLayout;
 
-  const AiSettings({required this.providers, required this.translation});
+  const AiSettings({
+    required this.providers,
+    required this.translation,
+    this.semanticLayout = const SemanticLayoutSettings(),
+  });
 
   factory AiSettings.defaults() => const AiSettings(
     providers: [AiProviderConfig(id: 'provider-1', name: 'Custom')],
@@ -178,9 +211,11 @@ class AiSettings {
   AiSettings copyWith({
     List<AiProviderConfig>? providers,
     TranslationSettings? translation,
+    SemanticLayoutSettings? semanticLayout,
   }) => AiSettings(
     providers: providers ?? this.providers,
     translation: translation ?? this.translation,
+    semanticLayout: semanticLayout ?? this.semanticLayout,
   );
 
   AiProviderConfig? provider(String id) {
@@ -194,6 +229,7 @@ class AiSettings {
     'version': 2,
     'providers': providers.map((provider) => provider.toJson()).toList(),
     'translation': translation.toJson(),
+    'semantic_layout': semanticLayout.toJson(),
   };
 
   factory AiSettings.fromJson(Map<String, dynamic> json) {
@@ -212,6 +248,9 @@ class AiSettings {
           ? AiSettings.defaults().providers
           : providers,
       translation: translation,
+      semanticLayout: json['semantic_layout'] is Map
+          ? SemanticLayoutSettings.fromJson(json['semantic_layout'] as Map)
+          : const SemanticLayoutSettings(),
     ).normalized();
   }
 
@@ -259,6 +298,7 @@ class AiSettings {
     return AiSettings(
       providers: normalizedProviders,
       translation: translation.copyWith(providerId: selected, model: model),
+      semanticLayout: semanticLayout,
     );
   }
 }

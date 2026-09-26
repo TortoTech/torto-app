@@ -37,7 +37,7 @@ class HtmlIrParser {
     bool Function(String href)? isDecorativeSeparatorImage,
   }) {
     try {
-      final document = tryParseXmlTolerant(xhtml);
+      final document = tryParsePublicationContent(xhtml);
       if (document == null) {
         return Section(
           id: spineId ?? SpineItemId.generated(spineIndex),
@@ -112,6 +112,14 @@ Map<XmlElement, LinkRole> _classifyFootnoteLinks(
     if (fragment != null) byFragment[fragment] = element;
   }
   final sectionPath = splitPackageFragment(sectionHref).$1;
+  final linksByFragment = <String, List<XmlElement>>{};
+  for (final anchor in anchors) {
+    if (_attr(anchor, 'href') == null) continue;
+    final fragment = _footnoteReferenceFragment(anchor);
+    if (fragment != null) {
+      linksByFragment.putIfAbsent(fragment, () => []).add(anchor);
+    }
+  }
   for (final anchor in anchors) {
     final sourceFragment = _footnoteReferenceFragment(anchor);
     final rawTarget = _attr(anchor, 'href');
@@ -126,6 +134,7 @@ Map<XmlElement, LinkRole> _classifyFootnoteLinks(
     final candidates = <XmlElement>[
       targetNode,
       ...targetNode.descendants.whereType<XmlElement>(),
+      ...?linksByFragment[targetFragment],
     ];
     for (final candidate in candidates) {
       if (_name(candidate) != 'a' || identical(candidate, anchor)) continue;
@@ -626,6 +635,8 @@ class _SectionParser {
   late final Map<XmlElement, LinkRole> _footnoteLinks;
   final List<Block> blocks = [];
   final Map<XmlElement, SourceAnchor> _elementSources = Map.identity();
+  final Map<Block, XmlElement> _blockElements = Map.identity();
+  bool _insideNestedMedia = false;
   final List<double> _paragraphListIndents = [];
   int _nextNode = 0;
   bool _insideNote = false;
@@ -682,6 +693,7 @@ class _SectionParser {
     } else {
       _parseChildren(root);
     }
+    _attachTableCaptions();
     final anchors = <SectionAnchor>[];
     final seen = <String>{};
     for (final element in document.descendants.whereType<XmlElement>()) {
@@ -1024,6 +1036,8 @@ class _SectionParser {
   }
 
   int _tryParseSiblingQuote(List<XmlNode> siblings, int start) {
+    final indented = _tryParseIndentedAttributedQuote(siblings, start);
+    if (indented > 0) return indented;
     const minimumAttributedBodyBlocks = 1;
     const minimumUnattributedBodyBlocks = 2;
 
@@ -1110,6 +1124,48 @@ class _SectionParser {
         bodyHasVerticalBoundary) {
       _parseQuoteElements(body, null, stanzaBreakAfter: stanzaBreakAfter);
       return lastBodyConsumed;
+    }
+    return 0;
+  }
+
+  int _tryParseIndentedAttributedQuote(List<XmlNode> siblings, int start) {
+    final body = <XmlElement>[];
+    double? bodyInset;
+    for (var index = start; index < siblings.length; index++) {
+      final node = siblings[index];
+      if (node is XmlText) {
+        if (node.value.trim().isEmpty) continue;
+        break;
+      }
+      if (node is! XmlElement) continue;
+      if (!const {'p', 'div'}.contains(_name(node)) ||
+          !_nodeHasVisibleText(node) ||
+          node.descendants.whereType<XmlElement>().any((child) {
+            final name = _name(child);
+            return name == 'img'
+                ? _imageEstablishesBlockLayout(child)
+                : _isBlockBoundary(name) ||
+                      const {'svg', 'table', 'video', 'object'}.contains(name);
+          })) {
+        break;
+      }
+      final inset = _quoteLayoutMetrics(node).start;
+      if (_blockStyleFor(node).align == BlockAlign.end) {
+        if (bodyInset != null && inset <= bodyInset + 0.5) {
+          _parseQuoteElements(body, node);
+          return index - start + 1;
+        }
+        break;
+      }
+      // Whole-paragraph inset only; first-line indentation is ordinary prose.
+      if (inset < 4 ||
+          (bodyInset != null &&
+              (inset - bodyInset).abs() >
+                  math.max(4, bodyInset.abs() * 0.25))) {
+        break;
+      }
+      bodyInset ??= inset;
+      body.add(node);
     }
     return 0;
   }
@@ -1277,6 +1333,14 @@ class _SectionParser {
           headingLevel: level,
         );
       case 'p':
+        if (_hasDescendantImage(element) && _containsNestedBlocks(element)) {
+          final previous = _insideNestedMedia;
+          _insideNestedMedia = true;
+          _parseContainer(element, listDepth);
+          _insideNestedMedia = previous;
+          _groupNestedFigures(blockStart);
+          break;
+        }
         var style = _blockStyleFor(element);
         if (_hasStandaloneQuoteLayout(element) &&
             (_hasQuoteSemanticWord(element) ||
@@ -1371,6 +1435,9 @@ class _SectionParser {
   }
 
   void _rememberElementSource(XmlElement element, int blockStart) {
+    for (final block in blocks.skip(blockStart)) {
+      _blockElements.putIfAbsent(block, () => element);
+    }
     for (final block in blocks.skip(blockStart)) {
       final source = _firstBlockSource(block);
       if (source != null) {
@@ -1598,7 +1665,8 @@ class _SectionParser {
     var index = 0;
     while (index < children.length) {
       final child = children[index];
-      if (child is XmlElement && _isBlockBoundary(_name(child))) {
+      if (child is XmlElement &&
+          (_isBlockBoundary(_name(child)) || _containsNestedBlocks(child))) {
         flush();
         final quoteCount = _tryParseSiblingQuote(children, index);
         if (quoteCount > 0) {
@@ -1623,7 +1691,7 @@ class _SectionParser {
       _collectInlineNode(
         child,
         textStyle,
-        null,
+        _ancestorLink(container),
         collector,
         inlineImages: inlineImages,
       );
@@ -1856,8 +1924,268 @@ class _SectionParser {
     return false;
   }
 
+  bool _containsNestedBlocks(XmlElement element) =>
+      element.descendants.whereType<XmlElement>().any(
+        (node) =>
+            !const {'img', 'image', 'br'}.contains(_name(node)) &&
+            _isBlockBoundary(_name(node)),
+      );
+
+  String? _ancestorLink(XmlElement element) {
+    XmlElement? current = element;
+    while (current != null) {
+      if (_name(current) == 'a') {
+        final href = _attr(current, 'href');
+        if (href != null && href.trim().isNotEmpty) return _resolveLink(href);
+      }
+      current = current.parentElement;
+    }
+    return null;
+  }
+
+  void _groupNestedFigures(int start) {
+    final parsed = blocks.sublist(start);
+    blocks.removeRange(start, blocks.length);
+    bool caption(Block b) => b is TextBlock && b.kind == TextBlockKind.caption;
+    for (var i = 0; i < parsed.length;) {
+      final first = parsed[i];
+      if (first is! ImageBlock && !caption(first)) {
+        blocks.add(first);
+        i++;
+        continue;
+      }
+      final before = caption(first);
+      var mid = i + 1;
+      while (mid < parsed.length &&
+          (before ? caption(parsed[mid]) : parsed[mid] is ImageBlock)) {
+        mid++;
+      }
+      var end = mid;
+      while (end < parsed.length &&
+          (before ? parsed[end] is ImageBlock : caption(parsed[end]))) {
+        end++;
+      }
+      if (end == mid ||
+          (before && end < parsed.length && caption(parsed[end]))) {
+        blocks.addAll(parsed.sublist(i, end));
+      } else {
+        final group = parsed.sublist(i, end);
+        blocks.add(
+          FigureBlock(
+            images: group.whereType<ImageBlock>().toList(),
+            captions: group.whereType<TextBlock>().toList(),
+            captionPosition: before
+                ? CaptionPosition.before
+                : CaptionPosition.after,
+            source: _combinedBlockSource(group),
+          ),
+        );
+      }
+      i = end;
+    }
+  }
+
+  /// Associate only adjacent, unambiguous labels. Keep the original nodes so
+  /// source anchors and inline links remain valid after moving their text.
+  void _attachTableCaptions() {
+    final original = List<Block>.of(blocks);
+    final claims = <int, List<int>>{};
+    bool carrier(Block b) => b is TableBlock || b is ImageBlock;
+    XmlElement? ownership(XmlElement? label) {
+      var parent = label?.parentElement;
+      while (parent != null &&
+          !const {'body', 'html'}.contains(_name(parent))) {
+        if (RegExp(
+              r'table|tabular|tbl',
+            ).hasMatch((_attr(parent, 'class') ?? '').toLowerCase()) &&
+            parent.descendants.whereType<XmlElement>().any(
+              (e) => const {'table', 'img', 'image'}.contains(_name(e)),
+            )) {
+          return parent;
+        }
+        parent = parent.parentElement;
+      }
+      return null;
+    }
+
+    bool scoped(XmlElement? label, XmlElement? media) {
+      if (label == null || media == null) return false;
+      var parent = media.parentElement;
+      while (parent != null &&
+          !const {'body', 'html'}.contains(_name(parent))) {
+        final classes = (_attr(parent, 'class') ?? '').toLowerCase();
+        final hasLabel = label.ancestors.contains(parent);
+        if (hasLabel && RegExp(r'table|tabular|tbl').hasMatch(classes)) {
+          // A wrapper around several tables cannot establish unique ownership.
+          return parent.descendants
+                  .whereType<XmlElement>()
+                  .where((e) => _name(e) == 'table')
+                  .length <=
+              1;
+        }
+        parent = parent.parentElement;
+      }
+      return false;
+    }
+
+    bool eligible(int label, int media) {
+      final b = original[label];
+      if (b is! TextBlock ||
+          !const {
+            TextBlockKind.paragraph,
+            TextBlockKind.caption,
+          }.contains(b.kind)) {
+        return false;
+      }
+      final text = b.plainText.trim();
+      if (text.isEmpty) return false;
+      final node = _blockElements[b];
+      final scope = ownership(node);
+      final mediaNode = _blockElements[original[media]];
+      if (scope != null &&
+          mediaNode != null &&
+          !mediaNode.ancestors.contains(scope)) {
+        return false;
+      }
+      final inScope = scoped(node, mediaNode);
+      final classes = (_attrOrEmpty(
+        node,
+        'class',
+      )).toLowerCase().replaceAll('-', '').replaceAll('_', '');
+      final numbered =
+          RegExp(
+            r'^(?:table|表格|表)\s*[0-9一二三四五六七八九十]+(?:[.\-–][0-9]+)*\b',
+            caseSensitive: false,
+          ).hasMatch(text) ||
+          RegExp(r'^表(?:格)?\s*[0-9一二三四五六七八九十]+').hasMatch(text);
+      final proseReference = RegExp(
+        r'^(?:table\s+[0-9.]+\s+(?:shows|lists|presents|summarizes|is|was)|表\s*[0-9一二三四五六七八九十]+(?:显示|列出|说明|中))',
+        caseSensitive: false,
+      ).hasMatch(text);
+      if (proseReference) return false;
+      if (numbered ||
+          classes.contains('tablecaption') ||
+          classes.contains('tabletitle')) {
+        return true;
+      }
+      return inScope &&
+          (RegExp(r'caption|title|legend').hasMatch(classes) ||
+              RegExp(
+                r'^(?:notes?|source|sources|注|说明|来源|资料来源)\s*[:：]',
+                caseSensitive: false,
+              ).hasMatch(text));
+    }
+
+    for (var i = 0; i < original.length; i++) {
+      if (!carrier(original[i])) continue;
+      for (final direction in [-1, 1]) {
+        for (
+          var j = i + direction;
+          j >= 0 && j < original.length;
+          j += direction
+        ) {
+          if (original[j] is SeparatorBlock &&
+              (original[j] as SeparatorBlock).kind == SeparatorKind.spacing) {
+            continue;
+          }
+          if (!eligible(j, i)) break;
+          claims.putIfAbsent(j, () => []).add(i);
+        }
+      }
+    }
+    final owned = <int, List<int>>{};
+    for (final entry in claims.entries) {
+      if (entry.value.length == 1) {
+        owned.putIfAbsent(entry.value.single, () => []).add(entry.key);
+      }
+    }
+    final removed = owned.values.expand((ids) => ids).toSet();
+    blocks.clear();
+    for (var i = 0; i < original.length; i++) {
+      if (removed.contains(i)) continue;
+      final block = original[i];
+      final ids = owned[i];
+      if (ids == null) {
+        blocks.add(block);
+        continue;
+      }
+      ids.sort();
+      TextBlock textAt(int id) {
+        final text = original[id] as TextBlock;
+        final note = RegExp(
+          r'^(?:notes?|sources?|注|说明|来源|资料来源)\s*[:：]',
+          caseSensitive: false,
+        ).hasMatch(text.plainText.trim());
+        return _copyTextBlock(
+          text,
+          kind: note ? TextBlockKind.paragraph : TextBlockKind.caption,
+        );
+      }
+
+      if (block is TableBlock) {
+        blocks.add(
+          TableBlock(
+            rows: block.rows,
+            style: block.style,
+            source: block.source,
+            before: [...ids.where((id) => id < i).map(textAt), ...block.before],
+            after: [...block.after, ...ids.where((id) => id > i).map(textAt)],
+          ),
+        );
+      } else {
+        if (ids.first < i && ids.last > i) {
+          blocks.add(
+            FigureBlock(
+              images: [block as ImageBlock],
+              captions: ids.where((id) => id < i).map(textAt).toList(),
+              afterCaptions: ids.where((id) => id > i).map(textAt).toList(),
+              captionPosition: CaptionPosition.before,
+              source: block.source,
+            ),
+          );
+        } else {
+          blocks.add(
+            FigureBlock(
+              images: [block as ImageBlock],
+              captions: ids.map(textAt).toList(),
+              captionPosition: ids.first < i
+                  ? CaptionPosition.before
+                  : CaptionPosition.after,
+              source: block.source,
+            ),
+          );
+        }
+      }
+    }
+  }
+
+  String _attrOrEmpty(XmlElement? element, String name) =>
+      element == null ? '' : _attr(element, name) ?? '';
+
   void _parseTable(XmlElement table) {
     final tableNodeId = _allocateNode();
+    final before = <TextBlock>[];
+    final after = <TextBlock>[];
+    for (final caption in table.childElements.where(
+      (node) => _name(node) == 'caption',
+    )) {
+      final start = blocks.length;
+      _parseContainer(caption, 0);
+      _rememberElementSource(caption, start);
+      final parsed = blocks.sublist(start);
+      blocks.removeRange(start, blocks.length);
+      String? side;
+      XmlElement? current = caption;
+      while (current != null && side == null) {
+        side = styles.cascadedProperties(current)['caption-side'];
+        current = current.parentElement;
+      }
+      (side == 'bottom' ? after : before).addAll(
+        parsed.whereType<TextBlock>().map(
+          (text) => _copyTextBlock(text, kind: TextBlockKind.caption),
+        ),
+      );
+    }
     final parsedRows = <TableRow>[];
     for (final row in table.descendants.whereType<XmlElement>()) {
       if (_name(row) != 'tr' || _nearestTableAncestor(row) != table) {
@@ -1927,6 +2255,8 @@ class _SectionParser {
       blocks.add(
         TableBlock(
           rows: List.unmodifiable(parsedRows),
+          before: before,
+          after: after,
           style: _blockStyleFor(table),
           source: _sourceFor(tableNodeId, 0),
         ),
@@ -2054,7 +2384,7 @@ class _SectionParser {
     _collectInline(
       element,
       textStyle,
-      null,
+      _ancestorLink(element),
       collector,
       inlineImages: inlineImages,
     );
@@ -2064,7 +2394,11 @@ class _SectionParser {
     }
     if (collector.content.isNotEmpty) {
       _emitTextBlock(
-        kind,
+        _insideNestedMedia &&
+                kind == TextBlockKind.paragraph &&
+                _isInferredFigureCaption(element)
+            ? TextBlockKind.caption
+            : kind,
         style,
         collector.content,
         headingLevel: headingLevel,
@@ -2074,6 +2408,7 @@ class _SectionParser {
         listMarkerVisible: listMarkerVisible,
         sourceNode: sourceNode,
       );
+      _blockElements[blocks.last] = element;
     }
     final images = _descendantImages(element)
         .where((image) => !inlineImages || _imageEstablishesBlockLayout(image))
@@ -2403,6 +2738,13 @@ class _SectionParser {
       style,
       styles.cascadedProperties(node),
       inheritedSize: inherited.sizeScale,
+      rootSize:
+          _cssScale(
+            styles.cascadedProperties(document.rootElement)['font-size'],
+            1,
+            1,
+          ) ??
+          1,
     );
 
     if (name == 'span' && classes.any((value) => value == 'math')) {
@@ -2659,15 +3001,33 @@ class _SectionParser {
     int headingLevel = 0,
   }) {
     var style = TextStyle.plain;
+    final rootSize =
+        _cssScale(
+          styles.cascadedProperties(document.rootElement)['font-size'],
+          1,
+          1,
+        ) ??
+        1;
     for (final ancestor in _chain(element)) {
       final inheritedSize = style.sizeScale;
       if (identical(ancestor, element)) {
         style = _applySemanticBlockStyle(style, kind, headingLevel);
+        if (kind == TextBlockKind.heading ||
+            kind == TextBlockKind.preformatted) {
+          final size = styles
+              .cascadedProperties(ancestor)['font-size']
+              ?.trim()
+              .toLowerCase();
+          if (size != 'inherit' && size != 'unset') {
+            style = style.copyWith(clearKeywordSize: true);
+          }
+        }
       }
       style = _applyCssTextProperties(
         style,
         styles.cascadedProperties(ancestor),
         inheritedSize: inheritedSize,
+        rootSize: identical(ancestor, document.rootElement) ? 1 : rootSize,
       );
     }
     return style;
@@ -2760,6 +3120,7 @@ TextStyle _copyTextStyle(
     underline: underline ?? base.underline,
     strikethrough: strikethrough ?? base.strikethrough,
     sizeScale: sizeScale ?? base.sizeScale,
+    keywordSizeScale: base.keywordSizeScale,
     color: color ?? base.color,
     baseline: baseline ?? base.baseline,
     linkRole: linkRole ?? base.linkRole,
@@ -2773,14 +3134,36 @@ TextStyle _applyCssTextProperties(
   TextStyle base,
   Map<String, String> props, {
   double? inheritedSize,
+  double rootSize = 1,
 }) {
   var style = base;
-  final fontSize = _cssScale(props['font-size']);
+  final declaration = props['font-size']?.trim().toLowerCase();
+  final fontSize = _cssScale(
+    declaration,
+    inheritedSize ?? style.sizeScale,
+    rootSize,
+  );
   if (fontSize != null) {
-    style = _copyTextStyle(
-      style,
-      sizeScale: (inheritedSize ?? style.sizeScale) * fontSize,
-    );
+    style = _copyTextStyle(style, sizeScale: fontSize);
+  }
+  if (fontSize != null) {
+    const keywords = {
+      'xx-small',
+      'x-small',
+      'small',
+      'medium',
+      'large',
+      'x-large',
+      'xx-large',
+      'xxx-large',
+      'smaller',
+      'larger',
+    };
+    if (keywords.contains(declaration)) {
+      style = style.copyWith(keywordSizeScale: fontSize);
+    } else if (declaration != 'inherit' && declaration != 'unset') {
+      style = style.copyWith(clearKeywordSize: true);
+    }
   }
   final fontWeight = props['font-weight'];
   if (fontWeight != null) {
@@ -3254,25 +3637,40 @@ double? _cssLength(String? value) {
 }
 
 /// Font-size value → scale factor (px absolute vs 16px base; em/% multiply).
-double? _cssScale(String? value) {
+double? _cssScale(String? value, double parent, double root) {
   if (value == null) return null;
-  final v = value.trim();
-  if (v.isEmpty) return null;
-  if (v.endsWith('%')) {
-    final parsed = double.tryParse(v.substring(0, v.length - 1).trim());
-    return parsed == null ? null : parsed / 100.0;
+  final v = value.trim().toLowerCase();
+  const absolute = {
+    'xx-small': .6,
+    'x-small': .75,
+    'small': 8 / 9,
+    'medium': 1.0,
+    'initial': 1.0,
+    'large': 1.2,
+    'x-large': 1.5,
+    'xx-large': 2.0,
+    'xxx-large': 3.0,
+  };
+  if (absolute.containsKey(v)) return absolute[v];
+  if (v == 'smaller') return parent / 1.2;
+  if (v == 'larger') return parent * 1.2;
+  if (v == 'inherit' || v == 'unset') return parent;
+  for (final unit in ['rem', 'em', 'px', 'pt', '%']) {
+    if (!v.endsWith(unit)) continue;
+    final n = double.tryParse(v.substring(0, v.length - unit.length).trim());
+    if (n == null || !n.isFinite || n < 0) return null;
+    final result =
+        n *
+        switch (unit) {
+          'rem' => root,
+          'em' => parent,
+          'px' => 1 / 16,
+          'pt' => 1 / 12,
+          _ => parent / 100,
+        };
+    return result.isFinite ? result : null;
   }
-  if (v.endsWith('rem')) {
-    return double.tryParse(v.substring(0, v.length - 3).trim());
-  }
-  if (v.endsWith('em')) {
-    return double.tryParse(v.substring(0, v.length - 2).trim());
-  }
-  if (v.endsWith('px')) {
-    final parsed = double.tryParse(v.substring(0, v.length - 2).trim());
-    return parsed == null ? null : parsed / _baseFontSize;
-  }
-  return null;
+  return v == '0' ? 0 : null;
 }
 
 double? _inlineEmLength(String? value) {

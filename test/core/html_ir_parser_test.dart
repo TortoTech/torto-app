@@ -36,6 +36,70 @@ QuoteBlock quoteBlock(Section section, int index) {
 }
 
 void main() {
+  test('paired footnotes accept adjacent empty anchors on both sides', () {
+    final section = parseSection('''
+      <p>First<a id="w1"/><a href="#m1"><sup>[1]</sup></a>.</p>
+      <p>Second<a id="w2"/> <a href="#m2"><sup>[2]</sup></a>.</p>
+      <p><a id="m1"/><a href="#w1">[1]</a> First note.</p>
+      <p><a id="m2"/> <a href="#w2">[2]</a> Second note.</p>
+      <p><a id="other"/> Intervening prose <a href="#w1">[1]</a>.</p>
+    ''');
+    final runs = section.blocks
+        .expand((block) => block is NoteBlock ? block.blocks : [block])
+        .whereType<TextBlock>()
+        .expand((block) => block.inlines)
+        .whereType<TextRun>()
+        .toList();
+    expect(
+      runs.where((run) => run.style.linkRole == LinkRole.footnoteReference),
+      hasLength(2),
+    );
+    expect(
+      runs.where((run) => run.style.linkRole == LinkRole.footnoteBacklink),
+      hasLength(2),
+    );
+    expect(
+      runs.lastWhere((run) => run.link != null).style.linkRole,
+      LinkRole.normal,
+    );
+  });
+
+  test('inset and right-aligned attribution need no typography hints', () {
+    for (final credit in ['An Author', '2026/09/14', '128.00']) {
+      final section = parseSection('''
+        <p style="padding-left:0.5em">Quoted <img src="symbol.png" style="display:inline;height:1em"/> text.</p>
+        <div style="padding-left:0.5em">Second paragraph.</div>
+        <p style="text-align:right">$credit</p><p>Ordinary prose.</p>
+      ''');
+      final quote = quoteBlock(section, 0);
+      expect(quote.body, hasLength(2));
+      expect(
+        quote.body.first.inlines.whereType<InlineImageRun>(),
+        hasLength(1),
+      );
+      expect(quote.attribution!.plainText, credit);
+      expect(textBlock(section, 1).plainText, 'Ordinary prose.');
+    }
+  });
+
+  test('inset quote detection stops at content and structural boundaries', () {
+    for (final body in [
+      '<p style="text-indent:2em">Prose.</p><p style="text-align:right">Author</p>',
+      '<p style="padding-left:1em">Text.</p><img src="figure.png"/><p style="text-align:right">Author</p>',
+      '<p style="padding-left:1em">Text<img src="figure.png" style="display:block"/></p><p style="text-align:right">Author</p>',
+      '<p style="padding-left:1em">Text.</p><h2>Heading</h2><p style="text-align:right">Author</p>',
+      '<p style="padding-left:1em">Text.</p><p>Prose.</p><p style="text-align:right">Author</p>',
+      '<p style="padding-left:1em">Text.</p><p style="text-align:right;padding-left:3em">Author</p>',
+      '<div><p style="padding-left:1em">Text.</p></div><div><p style="text-align:right">Author</p></div>',
+    ]) {
+      expect(
+        parseSection(body).blocks.whereType<QuoteBlock>(),
+        isEmpty,
+        reason: body,
+      );
+    }
+  });
+
   group('blocks', () {
     test('headings with levels and semantic style', () {
       final section = parseSection('<h1>One</h1><h3>Three</h3>');
@@ -1112,14 +1176,14 @@ void main() {
       expect(textBlock(section, 0).plainText, 'ok');
     });
 
-    test('completely broken markup yields empty blocks, not an exception', () {
+    test('truncated HTML chapter recovers its existing text', () {
       final section = const HtmlIrParser().parse(
         spineIndex: 0,
         href: 'a.xhtml',
         xhtml: '<html><body><p>unclosed',
         basePath: '',
       );
-      expect(section.blocks, isEmpty);
+      expect(textBlock(section, 0).plainText, 'unclosed');
     });
   });
 }

@@ -342,7 +342,7 @@ void main() {
           );
           expect(find.byType(ExpansionTile), findsNothing);
           expect(find.text('阅读会话'), findsNothing);
-          expect(find.byType(ListTile), findsWidgets);
+          expect(find.text('暂无满 1 分钟的阅读记录'), findsOneWidget);
           await tester.pageBack();
           for (var i = 0; i < 12; i++) {
             await tester.pump(const Duration(milliseconds: 100));

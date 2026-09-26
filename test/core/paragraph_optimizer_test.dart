@@ -19,6 +19,42 @@ List<MeasuredCluster> clustersFor(String text, {double width = 10}) {
 void main() {
   const optimizer = ParagraphOptimizer();
 
+  test('notes stay with their anchor across spaces and adjacent markers', () {
+    for (final text in ['甲乙丙丁①', '甲乙丙丁 ①②', '甲乙\n丙丁 ①']) {
+      final clusters = [
+        for (final cluster in clustersFor(text))
+          MeasuredCluster(
+            start: cluster.start,
+            end: cluster.end,
+            advance: 10,
+            em: 10,
+            footnoteReference: '①②'.contains(
+              text.substring(cluster.start, cluster.end),
+            ),
+          ),
+      ];
+      final plan = optimizer.plan(
+        text: text,
+        clusters: clusters,
+        legalBreaks: {for (final cluster in clusters) cluster.end},
+        hyphenBreaks: {for (final cluster in clusters) cluster.end: 2},
+        lineWidth: 52,
+        firstLineIndent: 0,
+        defaultEm: 10,
+      );
+      expect(plan, isNotNull);
+      for (final line in plan!.lines) {
+        final content = text
+            .substring(
+              clusters[line.startCluster].start,
+              clusters[line.endCluster - 1].end,
+            )
+            .trim();
+        expect(content.startsWith('①') || content.startsWith('②'), isFalse);
+      }
+    }
+  });
+
   test('hard breaks keep paragraph endings and share mixed-script spacing', () {
     const text = '中文中文中文中文 Harry Harlow 中文中文中文中文中文中文。\n\n中文中文中文中文中文中文中文。\n';
     final clusters = clustersFor(text);

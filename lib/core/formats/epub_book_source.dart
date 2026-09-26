@@ -11,6 +11,7 @@
 library;
 
 import 'dart:collection';
+import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:typed_data';
@@ -41,7 +42,7 @@ class _ManifestItem {
 }
 
 /// [BookSource] backed by EPUB file bytes.
-class EpubBookSource implements BookSource {
+class EpubBookSource implements BookSource, DisposableBookSource {
   /// Zip entries by both their raw name and their percent-decoded,
   /// normalized name (real-world EPUBs disagree on whether entry names are
   /// percent-encoded).
@@ -58,7 +59,31 @@ class EpubBookSource implements BookSource {
   Set<int> _noteSectionIndexes = const {};
   Map<String, List<TocHeadingHint>> _tocHeadingHints = const {};
 
+  bool _backgroundParsing = false;
+  bool _disposed = false;
+  Future<_EpubSectionWorker>? _worker;
+  final Map<int, Future<Section>> _parsing = {};
   EpubBookSource._();
+
+  static EpubBookSource _enableBackground(EpubBookSource source) {
+    source._backgroundParsing = true;
+    return source;
+  }
+
+  EpubBookSource _workerSnapshot() => EpubBookSource._()
+    .._entries.addAll(_entries)
+    .._book = _book
+    .._noteSectionIndexes = _noteSectionIndexes
+    .._tocHeadingHints = _tocHeadingHints;
+
+  @override
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    _worker?.then((worker) => worker.dispose(), onError: (Object _) {});
+    _resourceCache.clear();
+    _sectionCache.clear();
+  }
 
   /// Opens an EPUB from its raw file bytes.
   ///
@@ -161,7 +186,7 @@ class EpubBookSource implements BookSource {
       }
     }
     return source;
-  });
+  }).then(_enableBackground);
 
   /// Opens already-loaded EPUB bytes outside the UI isolate. A transferable
   /// buffer avoids costly message serialization when crossing isolates.
@@ -175,7 +200,7 @@ class EpubBookSource implements BookSource {
         transferable.materialize().asUint8List(),
         publicationIdHint: publicationIdHint,
       ),
-    );
+    ).then(_enableBackground);
   }
 
   /// Reads and decodes an XML resource, tolerating BOMs, DOCTYPE
@@ -205,8 +230,20 @@ class EpubBookSource implements BookSource {
 
   @override
   Future<Section> parseSection(int index) async {
+    if (_disposed) throw StateError('EPUB source is disposed');
     final cached = _sectionCache[index];
     if (cached != null) return cached;
+    if (_backgroundParsing) {
+      final existing = _parsing[index];
+      if (existing != null) return existing;
+      final future = _parseOffThread(index);
+      _parsing[index] = future;
+      try {
+        return await future;
+      } finally {
+        _parsing.remove(index);
+      }
+    }
     final item = book.spine[index];
     Section section;
     try {
@@ -252,6 +289,23 @@ class EpubBookSource implements BookSource {
       );
     }
     _sectionCache[index] = section;
+    return section;
+  }
+
+  Future<Section> _parseOffThread(int index) async {
+    final worker = await (_worker ??= _EpubSectionWorker.start(
+      _workerSnapshot(),
+    ));
+    if (_disposed) {
+      worker.dispose();
+      throw StateError('EPUB source is disposed');
+    }
+    final section = await worker.parse(index);
+    if (_disposed) throw StateError('EPUB source is disposed');
+    _sectionCache[index] = section;
+    while (_sectionCache.length > 6) {
+      _sectionCache.remove(_sectionCache.keys.first);
+    }
     return section;
   }
 
@@ -620,4 +674,85 @@ class _PackageModel {
     }
     return spine;
   }
+}
+
+class _EpubSectionWorker {
+  final Isolate isolate;
+  final SendPort port;
+  final Map<ReceivePort, Completer<Section>> pending = {};
+  bool disposed = false;
+  _EpubSectionWorker(this.isolate, this.port);
+  static Future<_EpubSectionWorker> start(EpubBookSource source) async {
+    final ready = ReceivePort();
+    try {
+      final isolate = await Isolate.spawn(_epubSectionEntry, (
+        ready.sendPort,
+        source,
+      ));
+      final port =
+          await ready.first.timeout(
+                const Duration(seconds: 10),
+                onTimeout: () {
+                  isolate.kill(priority: Isolate.immediate);
+                  throw TimeoutException('EPUB worker startup timed out');
+                },
+              )
+              as SendPort;
+      return _EpubSectionWorker(isolate, port);
+    } finally {
+      ready.close();
+    }
+  }
+
+  Future<Section> parse(int index) {
+    if (disposed) return Future.error(StateError('EPUB worker is disposed'));
+    final reply = ReceivePort();
+    final completer = Completer<Section>();
+    pending[reply] = completer;
+    reply.listen((message) {
+      pending.remove(reply);
+      reply.close();
+      if (message is Section) {
+        completer.complete(message);
+      } else {
+        completer.completeError(StateError('EPUB section parsing failed'));
+      }
+    });
+    port.send((index, reply.sendPort));
+    return completer.future.timeout(
+      const Duration(seconds: 30),
+      onTimeout: () {
+        dispose();
+        throw TimeoutException('EPUB section parsing timed out');
+      },
+    );
+  }
+
+  void dispose() {
+    if (disposed) return;
+    disposed = true;
+    isolate.kill(priority: Isolate.immediate);
+    for (final entry in pending.entries) {
+      entry.key.close();
+      entry.value.completeError(StateError('EPUB worker is disposed'));
+    }
+    pending.clear();
+  }
+}
+
+void _epubSectionEntry((SendPort, EpubBookSource) args) {
+  final requests = ReceivePort();
+  args.$1.send(requests.sendPort);
+  requests.listen((message) async {
+    final (index, reply) = message as (int, SendPort);
+    try {
+      reply.send(await args.$2.parseSection(index));
+      while (args.$2._sectionCache.length > 6) {
+        args.$2._sectionCache.remove(args.$2._sectionCache.keys.first);
+      }
+      args.$2._resourceCache.clear();
+    } catch (_) {
+      reply.send(null);
+    }
+  });
 }

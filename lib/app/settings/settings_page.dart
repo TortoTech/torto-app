@@ -1,4 +1,8 @@
 import 'package:flutter/material.dart';
+import 'dart:convert';
+import 'dart:typed_data';
+import 'package:file_picker/file_picker.dart';
+import '../../core/diagnostics.dart';
 
 import '../../l10n/app_localizations.dart';
 import '../sync/cloud_settings_page.dart';
@@ -101,6 +105,29 @@ class SettingsPage extends StatelessWidget {
             onTap: () => Navigator.of(
               context,
             ).push(MaterialPageRoute<void>(builder: (_) => const AboutPage())),
+          ),
+          ListTile(
+            leading: const Icon(Icons.bug_report_outlined),
+            title: Text(l10n.text('导出诊断日志', 'Export diagnostics')),
+            onTap: () async {
+              try {
+                final log = await ReaderDiagnostics.instance.export();
+                await FilePicker.saveFile(
+                  fileName: 'torto-diagnostics.txt',
+                  bytes: Uint8List.fromList(utf8.encode(log)),
+                );
+              } catch (_) {
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        l10n.text('导出失败，请重试', 'Export failed. Please retry.'),
+                      ),
+                    ),
+                  );
+                }
+              }
+            },
           ),
         ],
       ),

@@ -886,6 +886,54 @@ void main() {
     expect(link.footnoteIcon, isTrue);
   });
 
+  test('footnotes retain anchor lines, hit targets and source offsets', () {
+    for (final strategy in LineBreakStrategy.values) {
+      for (final width in [75.0, 95.0, 125.0]) {
+        const prefix = '甲乙丙丁甲乙丙丁';
+        final block = TextBlock(
+          nodeId: 'note-test',
+          inlines: const [
+            TextRun(prefix),
+            TextRun('  '),
+            TextRun(
+              '[1]',
+              link: 's.xhtml#note',
+              style: TextStyle(linkRole: LinkRole.footnoteReference),
+            ),
+          ],
+        );
+        final pages = engine.paginate(
+          _section([block]),
+          LayoutViewport(width: width, height: 500),
+          _style().copyWith(lineBreakStrategy: strategy),
+        );
+        final placement = pages.single.items.whereType<TextPlacement>().single;
+        final link = placement.links.single;
+        final anchorOffset = placement.displayToSource.lastIndexOf(
+          prefix.length - 1,
+        );
+        final anchorLine = placement.paragraph.getLineBoundary(
+          ui.TextPosition(offset: anchorOffset),
+        );
+        final noteLine = placement.paragraph.getLineBoundary(
+          ui.TextPosition(offset: link.start),
+        );
+        expect(noteLine, anchorLine, reason: '$strategy width=$width');
+        expect(placement.displayToSource[link.start], prefix.length + 2);
+        expect(placement.displayToSource[link.end], prefix.length + 5);
+        final box = placement.paragraph
+            .getBoxesForRange(link.start, link.end)
+            .first;
+        final point = ui.Offset(
+          placement.x + (box.left + box.right) / 2,
+          placement.y - placement.sliceTop + (box.top + box.bottom) / 2,
+        );
+        expect(pages.single.linkAt(point), same(link));
+        _disposeAll(pages);
+      }
+    }
+  });
+
   test('inline footnote is laid out as the same interactive icon', () {
     final block = TextBlock(
       nodeId: 'inline-note',

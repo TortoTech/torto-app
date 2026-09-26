@@ -9,6 +9,149 @@ library;
 import 'dart:convert';
 
 import 'package:xml/xml.dart';
+import 'package:html/parser.dart' as html;
+import 'package:html/dom.dart' as dom;
+
+final _opaqueXml = RegExp(r'<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>');
+
+/// Chapter-only HTML recovery. Package metadata and FB2 keep strict XML rules.
+XmlDocument? tryParsePublicationContent(String text) {
+  if (text.length > 2 * 1024 * 1024) return null;
+  final declarations = text.replaceAll(_opaqueXml, '');
+  if (RegExp(
+    r'<!ENTITY|<!DOCTYPE[^>]*\[',
+    caseSensitive: false,
+  ).hasMatch(declarations)) {
+    return null;
+  }
+  // Token counting respects comments, CDATA, quoted attributes and HTML's
+  // optional sibling end tags; a thousand <p> siblings are not thousand-deep.
+  final tokens = RegExp(
+    r"""<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<(/?)([A-Za-z][\w:.-]*)\b(?:"[^"]*"|'[^']*'|[^'"<>])*>""",
+  ).allMatches(text);
+  const voids = {
+    'area',
+    'base',
+    'br',
+    'col',
+    'embed',
+    'hr',
+    'img',
+    'input',
+    'link',
+    'meta',
+    'param',
+    'source',
+    'track',
+    'wbr',
+  };
+  const paragraphBoundaries = {
+    'p',
+    'div',
+    'section',
+    'article',
+    'aside',
+    'blockquote',
+    'h1',
+    'h2',
+    'h3',
+    'h4',
+    'h5',
+    'h6',
+    'hr',
+    'ul',
+    'ol',
+    'dl',
+    'table',
+    'pre',
+    'figure',
+  };
+  final stack = <String>[];
+  var count = 0;
+  String? rawText;
+  void closePrevious(Set<String> names, Set<String> boundaries) {
+    for (var i = stack.length - 1; i >= 0; i--) {
+      if (boundaries.contains(stack[i])) return;
+      if (names.contains(stack[i])) {
+        stack.removeRange(i, stack.length);
+        return;
+      }
+    }
+  }
+
+  for (final token in tokens) {
+    final name = token.group(2)?.toLowerCase();
+    if (name == null) continue;
+    final closing = token.group(1) == '/';
+    if (rawText != null && !(closing && name == rawText)) continue;
+    if (++count > 50000) return null;
+    if (closing) {
+      final i = stack.lastIndexOf(name);
+      if (i >= 0) stack.removeRange(i, stack.length);
+      if (name == rawText) rawText = null;
+      continue;
+    }
+    if (paragraphBoundaries.contains(name)) closePrevious({'p'}, {});
+    if (name == 'li') closePrevious({'li'}, {'ul', 'ol'});
+    if (name == 'dt' || name == 'dd') closePrevious({'dt', 'dd'}, {'dl'});
+    if (name == 'td' || name == 'th') {
+      closePrevious({'td', 'th'}, {'tr', 'table'});
+    }
+    if (name == 'tr') {
+      closePrevious({'tr'}, {'table', 'tbody', 'thead', 'tfoot'});
+    }
+    if (const {'tbody', 'thead', 'tfoot'}.contains(name)) {
+      closePrevious({'tbody', 'thead', 'tfoot'}, {'table'});
+    }
+    if (!voids.contains(name) && !token.group(0)!.endsWith('/>')) {
+      stack.add(name);
+      if (stack.length > 128) return null;
+      if (name == 'script' || name == 'style') rawText = name;
+    }
+  }
+  final normal = tryParseXmlTolerant(text);
+  if (normal != null) return normal;
+  try {
+    final document = html.parse(sanitizeXml(text));
+    var nodes = 0;
+    XmlName name(String value) {
+      final colon = value.indexOf(':');
+      return colon < 0
+          ? XmlName.parts(value)
+          : XmlName.parts(
+              value.substring(colon + 1),
+              prefix: value.substring(0, colon),
+            );
+    }
+
+    XmlNode? convert(dom.Node node, int depth) {
+      if (++nodes > 100000 || depth > 128) {
+        throw const FormatException('Content limit');
+      }
+      if (node is dom.Text) return XmlText(node.data);
+      if (node is! dom.Element) return null;
+      return XmlElement(
+        name(node.localName!),
+        [
+          for (final entry in node.attributes.entries)
+            XmlAttribute(name(entry.key.toString()), entry.value),
+        ],
+        [
+          for (final child in node.nodes)
+            if (convert(child, depth + 1) case final XmlNode value) value,
+        ],
+      );
+    }
+
+    final root = document.documentElement;
+    if (root == null || document.body == null || document.body!.nodes.isEmpty) {
+      return null;
+    }
+    return XmlDocument([convert(root, 0)!]);
+  } catch (_) {
+    return null;
+  }
+}
 
 /// Decodes XML bytes to text, handling UTF-8 / UTF-16 BOMs and malformed
 /// UTF-8 gracefully.
@@ -53,13 +196,31 @@ String sanitizeXml(String text) {
 
 /// Removes `<!DOCTYPE ...>` declarations, tolerating internal subsets.
 String stripDoctype(String text) {
-  final lower = text.toLowerCase();
-  final start = lower.indexOf('<!doctype');
-  if (start < 0) return text;
+  final tokens = RegExp(
+    r'<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<!DOCTYPE\b',
+    caseSensitive: false,
+  );
+  final declaration = tokens
+      .allMatches(text)
+      .where((token) => token.group(0)!.toLowerCase() == '<!doctype')
+      .firstOrNull;
+  if (declaration == null) return text;
+  final start = declaration.start;
   var i = start + '<!doctype'.length;
   var bracketDepth = 0;
+  String? quote;
   while (i < text.length) {
     final ch = text[i];
+    if (quote != null) {
+      if (ch == quote) quote = null;
+      i++;
+      continue;
+    }
+    if (ch == '"' || ch == "'") {
+      quote = ch;
+      i++;
+      continue;
+    }
     if (ch == '[') bracketDepth++;
     if (ch == ']') bracketDepth--;
     if (ch == '>' && bracketDepth <= 0) {
@@ -258,10 +419,23 @@ String replaceNamedEntities(String xml) {
 /// parsing). Returns null when parsing still fails.
 XmlDocument? tryParseXmlTolerant(String text) {
   final sanitized = sanitizeXml(text);
-  final recovered = replaceNamedEntities(escapeStrayAmpersands(sanitized));
+  final recovered = StringBuffer();
+  var cursor = 0;
+  for (final opaque in _opaqueXml.allMatches(sanitized)) {
+    recovered.write(
+      replaceNamedEntities(
+        escapeStrayAmpersands(sanitized.substring(cursor, opaque.start)),
+      ),
+    );
+    recovered.write(opaque.group(0));
+    cursor = opaque.end;
+  }
+  recovered.write(
+    replaceNamedEntities(escapeStrayAmpersands(sanitized.substring(cursor))),
+  );
   try {
-    return XmlDocument.parse(recovered);
-  } on XmlParserException {
+    return XmlDocument.parse(recovered.toString());
+  } on XmlException {
     return null;
   }
 }

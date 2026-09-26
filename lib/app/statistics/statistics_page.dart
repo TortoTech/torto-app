@@ -7,6 +7,7 @@ import 'statistics_distribution.dart';
 import 'statistics_period.dart';
 import 'statistics_model.dart';
 import 'statistics_store.dart';
+import 'reading_history.dart';
 export 'statistics_distribution.dart' show ReadingTrend;
 
 String statisticsDuration(int ms) {
@@ -418,7 +419,6 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
     String date(int? ms) => ms == null || ms == 0
         ? '—'
         : dayKey(DateTime.fromMillisecondsSinceEpoch(ms)).replaceAll('-', '/');
-    final days = daily.keys.toList()..sort((a, b) => b.compareTo(a));
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -551,39 +551,7 @@ class _ReadingStatisticsPageState extends State<ReadingStatisticsPage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               _title('阅读历史', 'Reading history'),
-              if (days.isEmpty)
-                Text(
-                  context.l10n.text('暂无阅读记录', 'No reading records'),
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              for (final day in days)
-                ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: Row(
-                    crossAxisAlignment: CrossAxisAlignment.baseline,
-                    textBaseline: TextBaseline.alphabetic,
-                    children: [
-                      Expanded(
-                        child: Text(
-                          day.replaceAll('-', '/'),
-                          style: Theme.of(context).textTheme.bodyMedium
-                              ?.copyWith(
-                                fontFeatures: const [
-                                  FontFeature.tabularFigures(),
-                                ],
-                              ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Text(
-                        readingTimeLabel(context, daily[day]!),
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          fontFeatures: const [FontFeature.tabularFigures()],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
+              ReadingHistory(daily: daily),
             ],
           ),
         ),

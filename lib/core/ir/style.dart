@@ -35,6 +35,7 @@ class TextStyle {
 
   /// Multiplier on the reader's base font size (1.0 = unchanged).
   final double sizeScale;
+  final double? keywordSizeScale;
 
   /// Foreground color as ARGB int; null = inherit reader foreground.
   final int? color;
@@ -43,6 +44,8 @@ class TextStyle {
   final LinkRole linkRole;
   final InlineRole inlineRole;
   final HyphenationMode hyphenation;
+  final int inlineCitation;
+  final bool website;
 
   const TextStyle({
     this.bold = false,
@@ -53,11 +56,14 @@ class TextStyle {
     this.underline = false,
     this.strikethrough = false,
     this.sizeScale = 1.0,
+    this.keywordSizeScale,
     this.color,
     this.baseline = TextBaselineShift.none,
     this.linkRole = LinkRole.normal,
     this.inlineRole = InlineRole.normal,
     this.hyphenation = HyphenationMode.auto,
+    this.inlineCitation = 0,
+    this.website = false,
   });
 
   static const TextStyle plain = TextStyle();
@@ -66,6 +72,10 @@ class TextStyle {
   /// [overlay]'s defaults (false / 1.0 / null) mean "no change".
   TextStyle merge(TextStyle overlay) {
     return TextStyle(
+      inlineCitation: overlay.inlineCitation != 0
+          ? overlay.inlineCitation
+          : inlineCitation,
+      website: website || overlay.website,
       bold: bold || overlay.bold,
       italic: italic || overlay.italic,
       emphasis: emphasis || overlay.emphasis,
@@ -74,6 +84,7 @@ class TextStyle {
       underline: underline || overlay.underline,
       strikethrough: strikethrough || overlay.strikethrough,
       sizeScale: sizeScale * overlay.sizeScale,
+      keywordSizeScale: overlay.keywordSizeScale ?? keywordSizeScale,
       color: overlay.color ?? color,
       baseline: overlay.baseline != TextBaselineShift.none
           ? overlay.baseline
@@ -99,13 +110,19 @@ class TextStyle {
     bool? underline,
     bool? strikethrough,
     double? sizeScale,
+    double? keywordSizeScale,
+    bool clearKeywordSize = false,
     int? color,
     bool clearColor = false,
     TextBaselineShift? baseline,
     LinkRole? linkRole,
     InlineRole? inlineRole,
     HyphenationMode? hyphenation,
+    int? inlineCitation,
+    bool? website,
   }) => TextStyle(
+    inlineCitation: inlineCitation ?? this.inlineCitation,
+    website: website ?? this.website,
     bold: bold ?? this.bold,
     italic: italic ?? this.italic,
     emphasis: emphasis ?? this.emphasis,
@@ -114,6 +131,9 @@ class TextStyle {
     underline: underline ?? this.underline,
     strikethrough: strikethrough ?? this.strikethrough,
     sizeScale: sizeScale ?? this.sizeScale,
+    keywordSizeScale: clearKeywordSize
+        ? null
+        : keywordSizeScale ?? this.keywordSizeScale,
     color: clearColor ? null : (color ?? this.color),
     baseline: baseline ?? this.baseline,
     linkRole: linkRole ?? this.linkRole,
@@ -124,6 +144,8 @@ class TextStyle {
   @override
   bool operator ==(Object other) =>
       other is TextStyle &&
+      other.inlineCitation == inlineCitation &&
+      other.website == website &&
       other.bold == bold &&
       other.italic == italic &&
       other.emphasis == emphasis &&
@@ -132,6 +154,7 @@ class TextStyle {
       other.underline == underline &&
       other.strikethrough == strikethrough &&
       other.sizeScale == sizeScale &&
+      other.keywordSizeScale == keywordSizeScale &&
       other.color == color &&
       other.baseline == baseline &&
       other.linkRole == linkRole &&
@@ -166,6 +189,7 @@ class BlockStyle {
   /// Alignment explicitly authored by the publication. Null means [align]
   /// only contains the parser/default value.
   final BlockAlign? authoredAlignment;
+  final BlockAlign? semanticAlignment;
 
   /// Space before / after the block, logical px.
   final double marginBefore;
@@ -192,6 +216,7 @@ class BlockStyle {
   const BlockStyle({
     this.align = BlockAlign.start,
     this.authoredAlignment,
+    this.semanticAlignment,
     this.marginBefore = 0,
     this.marginAfter = 0,
     this.marginStart = 0,
@@ -207,6 +232,7 @@ class BlockStyle {
   BlockStyle copyWith({
     BlockAlign? align,
     BlockAlign? authoredAlignment,
+    BlockAlign? semanticAlignment,
     bool clearAuthoredAlignment = false,
     double? marginBefore,
     double? marginAfter,
@@ -219,6 +245,7 @@ class BlockStyle {
   }) {
     return BlockStyle(
       align: align ?? this.align,
+      semanticAlignment: semanticAlignment ?? this.semanticAlignment,
       authoredAlignment: clearAuthoredAlignment
           ? null
           : (authoredAlignment ?? this.authoredAlignment),

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -98,6 +99,28 @@ Uint8List _buildEpub({
 }
 
 void main() {
+  test(
+    'subsequent chapters parse in worker while the UI event queue runs',
+    () async {
+      final source = await EpubBookSource.fromBytesInBackground(
+        _buildEpub(
+          chapter2Text:
+              '<html><body>${'<p>Worker chapter text.</p>' * 2000}</body></html>',
+        ),
+      );
+      addTearDown(source.dispose);
+      var serviced = false;
+      Timer.run(() => serviced = true);
+      final pending = source.parseSection(1);
+      final duplicate = source.parseSection(1);
+      final result = await pending;
+      expect(serviced, isTrue);
+      expect(result.blocks, hasLength(2000));
+      expect(identical(result, await duplicate), isTrue);
+      source.dispose();
+      await expectLater(source.parseSection(0), throwsStateError);
+    },
+  );
   test('opens: id, metadata, spine, cover', () async {
     final bytes = _buildEpub();
     final source = await EpubBookSource.fromBytes(bytes);

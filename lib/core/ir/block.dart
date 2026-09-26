@@ -117,7 +117,23 @@ class MathInline extends Inline {
   final bool display;
   final double sizeScale;
 
-  const MathInline(this.latex, {this.display = false, this.sizeScale = 1.0});
+  /// AI conversion keeps the exact original styled characters for source
+  /// positions, book typography and ordinary copy/search.
+  final List<TextRun>? original;
+  final String? originalImage;
+  final InlineImageRun? originalInlineImage;
+  final String? equationNumber;
+  String get sourceText => original?.map((run) => run.text).join() ?? '';
+
+  const MathInline(
+    this.latex, {
+    this.display = false,
+    this.sizeScale = 1.0,
+    this.original,
+    this.originalImage,
+    this.originalInlineImage,
+    this.equationNumber,
+  });
 }
 
 enum InlineImageAlignment {
@@ -217,8 +233,8 @@ class TextBlock extends Block {
           buf.write(text);
         case BreakInline(:final synthetic):
           if (!synthetic) buf.write('\n');
-        case MathInline():
-          break;
+        case MathInline(:final sourceText):
+          buf.write(sourceText);
         case InlineImageRun():
           break;
       }
@@ -268,21 +284,38 @@ class NoteBlock extends Block {
 /// as HTML; layout clamps malformed values to a safe range.
 class TableBlock extends Block {
   final List<TableRow> rows;
+  final List<TextBlock> before;
+  final List<TextBlock> after;
   final BlockStyle style;
   final SourceRange? source;
 
   const TableBlock({
     required this.rows,
+    this.before = const [],
+    this.after = const [],
     this.style = BlockStyle.normal,
     this.source,
   });
 
   int get textLength => rows.fold(
-    0,
+    [
+      ...before,
+      ...after,
+    ].fold<int>(0, (sum, text) => sum + text.plainText.runes.length),
     (total, row) =>
         total +
         row.cells.fold(0, (sum, cell) => sum + cell.plainText.runes.length),
   );
+
+  /// Stable translation segment order: cells retain their old indices.
+  /// Reading order is represented separately by before / rows / after.
+  List<({List<Inline> inlines, String nodeId})> get translationSegments => [
+    for (final row in rows)
+      for (final cell in row.cells)
+        (inlines: cell.inlines, nodeId: cell.nodeId),
+    for (final text in [...before, ...after])
+      (inlines: text.inlines, nodeId: text.nodeId),
+  ];
 }
 
 class TableRow {
@@ -320,8 +353,8 @@ class TableCell {
           buffer.write(text);
         case BreakInline():
           buffer.write('\n');
-        case MathInline():
-          break;
+        case MathInline(:final sourceText):
+          buffer.write(sourceText);
         case InlineImageRun():
           break;
       }
@@ -341,6 +374,7 @@ class ImageBlock extends Block {
   /// center these within the whole reading area; ordinary book illustrations
   /// remain in normal document flow.
   final bool fixedPage;
+  final MathInline? formula;
 
   const ImageBlock({
     required this.href,
@@ -348,6 +382,7 @@ class ImageBlock extends Block {
     this.style = ImageStyle.normal,
     this.source,
     this.fixedPage = false,
+    this.formula,
   });
 }
 
@@ -356,18 +391,23 @@ enum CaptionPosition { before, after }
 /// One or more authored images kept together with their semantic caption.
 class FigureBlock extends Block {
   final List<ImageBlock> images;
-  final List<TextBlock> captions;
+  final List<TextBlock> primaryCaptions;
+  final List<TextBlock> afterCaptions;
+  List<TextBlock> get captions => afterCaptions.isEmpty
+      ? primaryCaptions
+      : [...primaryCaptions, ...afterCaptions];
   final CaptionPosition captionPosition;
   final BlockStyle style;
   final SourceRange? source;
 
   const FigureBlock({
     required this.images,
-    this.captions = const [],
+    List<TextBlock> captions = const [],
+    this.afterCaptions = const [],
     this.captionPosition = CaptionPosition.after,
     this.style = BlockStyle.normal,
     this.source,
-  });
+  }) : primaryCaptions = captions;
 
   int get textLength => captions.fold(
     0,

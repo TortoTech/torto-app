@@ -16,6 +16,26 @@ void main() {
 
   tearDown(() => temporary.delete(recursive: true));
 
+  test(
+    'reads legacy large transfer cache without a full CursorWindow row',
+    () async {
+      final store = await SyncStore.openAt(
+        '${temporary.path}/large.sqlite3',
+        'device',
+        factory: databaseFactoryFfi,
+      );
+      addTearDown(store.close);
+      final value = 'a' * (256 * 1024 - 1) + '汉🙂\u0000' * 500000;
+      await store.cacheSet('account', 'statistics', value);
+      expect(await store.cacheGet('account', 'statistics'), value);
+      expect(await store.cacheGet('other-account', 'statistics'), isNull);
+      await store.cacheSet('account', 'empty', '');
+      expect(await store.cacheGet('account', 'empty'), '');
+      await store.cacheRemove('account', 'statistics');
+      expect(await store.cacheGet('account', 'statistics'), isNull);
+    },
+  );
+
   test('upgrades the phase-one database without losing its tables', () async {
     final path = '${temporary.path}${Platform.pathSeparator}sync.sqlite3';
     final old = await databaseFactoryFfi.openDatabase(

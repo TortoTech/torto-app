@@ -18,6 +18,8 @@ String translationSystemPrompt(
 
 # 翻译任务
 - 把输入 JSON 对象中的每个值翻译为$targetLanguage。
+- 不要直译，按$targetLanguage语言习惯翻译。
+- 保留 <torto-size scale="...">...</torto-size> 字号标签及其数值，翻译标签内文字，不得删除、复制或修改字号。
 - 忠实保留原文语气、事实、专名所指与段落结构。
 
 # 中文表达（目标语言为中文时）
@@ -30,6 +32,7 @@ String translationSystemPrompt(
 - <torto-math-0/>、<torto-math-1/> 等自闭合标签是不可修改的公式占位符。可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。
 $fixedPageSection
 # 输出格式
+- <torto-protected-0/> 等是文献引用或网址的原文占位符。可随语序移动，每个必须原样保留恰好一次，不得翻译、展开、删除或重编号。
 - 只返回一个 JSON 对象，保留完全相同的键；每个值只能是对应译文字符串。''';
 }
 
@@ -73,6 +76,64 @@ String preserveLeadingListMarker(String source, String translation) {
 }
 
 class OpenAiCompatibleClient {
+  Future<Map<String, dynamic>> recognizeLayout({
+    required AiProviderConfig provider,
+    required String model,
+    required String prompt,
+    required Map<String, dynamic> input,
+    required Map<String, dynamic> schema,
+    List<Map<String, dynamic>> images = const [],
+    String schemaName = 'ebook_semantic_groups',
+    int? maxTokens,
+    ReasoningEffort reasoningEffort = ReasoningEffort.defaultLevel,
+  }) async {
+    _validateProvider(provider, model);
+    final response = await _client
+        .post(
+          _chatCompletionsUri(provider.baseUrl),
+          headers: {
+            ..._headers(provider.apiKey),
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'model': model,
+            'max_tokens': ?maxTokens,
+            if (reasoningEffort.apiValue != null)
+              'reasoning_effort': reasoningEffort.apiValue,
+            'temperature': 0,
+            'messages': [
+              {'role': 'system', 'content': prompt},
+              {
+                'role': 'user',
+                'content': images.isEmpty
+                    ? jsonEncode(input)
+                    : [
+                        {'type': 'text', 'text': jsonEncode(input)},
+                        ...images,
+                      ],
+              },
+            ],
+            'response_format': {
+              'type': 'json_schema',
+              'json_schema': {
+                'name': schemaName,
+                'strict': true,
+                'schema': schema,
+              },
+            },
+          }),
+        )
+        .timeout(const Duration(seconds: 90));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw StateError('AI layout HTTP ${response.statusCode}');
+    }
+    final result = jsonDecode(_messageContent(response.body));
+    if (result is! Map<String, dynamic>) {
+      throw const FormatException('Invalid AI layout response');
+    }
+    return result;
+  }
+
   static const _maxTranslationChars = 2000;
   static const _maxAttempts = 2;
 

@@ -15,6 +15,9 @@ import 'package:characters/characters.dart';
 import 'package:flutter/foundation.dart';
 
 import '../ir/ir.dart';
+import '../ir/inline_content.dart';
+import '../semantic_layout/web_links.dart';
+import '../render/formula_rasterizer.dart';
 import '../linebreak/english_hyphenator.dart';
 import '../linebreak/paragraph_optimizer.dart';
 import '../linebreak/measurement.dart';
@@ -83,7 +86,8 @@ List<_SemanticTextSegment> _semanticTextSegments(
   required bool unified,
   required WritingSystem fallbackWritingSystem,
 }) {
-  final semantic = style.emphasis || style.alternateVoice || style.citation;
+  final semantic =
+      style.emphasis || style.alternateVoice || style.citation || style.italic;
   if (!unified || !semantic || text.isEmpty) {
     return [_SemanticTextSegment(0, text.length, style)];
   }
@@ -130,7 +134,11 @@ List<_SemanticTextSegment> _semanticTextSegments(
     var resolved = style;
     if (cluster.script == _SemanticScriptClass.cjk) {
       resolved = resolved.copyWith(
-        bold: resolved.bold || resolved.emphasis || resolved.alternateVoice,
+        bold:
+            resolved.bold ||
+            resolved.emphasis ||
+            resolved.alternateVoice ||
+            (resolved.italic && !resolved.citation),
         italic: false,
       );
     } else {
@@ -190,6 +198,7 @@ bool _isSemanticOpeningPunctuation(int? rune) => const {
 
 class LayoutEngine {
   final ParagraphHyphenator? hyphenator;
+  final FormulaRaster? Function(MathInline, int)? formulaResolver;
   @visibleForTesting
   final bool cacheHyphenMeasurements;
   @visibleForTesting
@@ -197,6 +206,7 @@ class LayoutEngine {
 
   const LayoutEngine({
     this.hyphenator,
+    this.formulaResolver,
     this.cacheHyphenMeasurements = true,
     this.onHyphenMeasurement,
   });
@@ -307,6 +317,7 @@ class LayoutEngine {
     RenditionLayout renditionLayout = RenditionLayout.reflowable,
     Duration timeSlice = const Duration(milliseconds: 4),
     bool Function()? shouldPause,
+    bool Function()? shouldCancel,
   }) async {
     List<PageLayout> result = const [];
     final steps = _paginateSteps(
@@ -317,10 +328,11 @@ class LayoutEngine {
       imageSizeResolver: imageSizeResolver,
       coverHref: coverHref,
       renditionLayout: renditionLayout,
+      shouldCancel: shouldCancel,
     ).iterator;
     final slice = Stopwatch()..start();
     while (true) {
-      while (shouldPause?.call() == true) {
+      while (shouldPause?.call() == true && shouldCancel?.call() != true) {
         await Future<void>.delayed(const Duration(milliseconds: 16));
         slice.reset();
       }
@@ -341,6 +353,7 @@ class LayoutEngine {
     ui.Size? Function(String href)? imageSizeResolver,
     String? coverHref,
     RenditionLayout renditionLayout = RenditionLayout.reflowable,
+    bool Function()? shouldCancel,
   }) sync* {
     if (section.blocks.isEmpty) return;
     final flowBlocks = _collectFlowBlocks(section.blocks, style);
@@ -387,6 +400,7 @@ class LayoutEngine {
 
     var blockIndex = 0;
     while (blockIndex < flowBlocks.length) {
+      if (shouldCancel?.call() == true) break;
       final block = flowBlocks[blockIndex];
       if (style.typesettingMode == TypesettingMode.unified &&
           block is ImageBlock &&
@@ -470,15 +484,44 @@ class LayoutEngine {
         case LineBreakBlock():
           paginator.addSemanticSpacing(style.baseFontSize * style.lineHeight);
         case TableBlock():
+          var attachedOffset = textStartOf[block] ?? 0;
+          List<_PreparedText> prepareAttached(List<TextBlock> texts) {
+            final output = <_PreparedText>[];
+            for (final text in texts) {
+              final value = _prepareTableAnnotation(
+                text,
+                style,
+                section.spineIndex,
+                contentLeft,
+                contentWidth,
+                attachedOffset,
+                imageSizeResolver,
+              );
+              if (value != null) output.add(value);
+              attachedOffset += text.plainText.runes.length;
+            }
+            return output;
+          }
+          final before = prepareAttached(block.before);
           final prepared = _prepareTable(
             block,
             style,
             section.spineIndex,
             contentWidth,
-            textStartOf[block] ?? 0,
+            attachedOffset,
             imageSizeResolver,
           );
-          if (prepared != null) paginator.pushTable(prepared);
+          attachedOffset += block.rows
+              .expand((row) => row.cells)
+              .fold<int>(0, (sum, cell) => sum + cell.plainText.runes.length);
+          final after = prepareAttached(block.after);
+          if (prepared != null) {
+            paginator.pushTable(prepared, before: before, after: after);
+          } else {
+            for (final text in [...before, ...after]) {
+              paginator.pushText(text);
+            }
+          }
         case QuoteBlock():
           _pushQuote(
             paginator,
@@ -488,6 +531,7 @@ class LayoutEngine {
             contentWidth,
             section.spineIndex,
             textStartOf[block] ?? 0,
+            imageSizeResolver,
           );
         case NoteBlock():
           // Note blocks are filtered or flattened by [_collectFlowBlocks].
@@ -498,6 +542,15 @@ class LayoutEngine {
     }
 
     final rawPages = paginator.finish();
+    if (shouldCancel?.call() == true) {
+      PageLayout(
+        viewport: viewport,
+        firstAnchor: null,
+        progression: 0,
+        items: rawPages.expand((items) => items).toList(),
+      ).dispose();
+      return;
+    }
     if (rawPages.isEmpty) return;
 
     final pages = <PageLayout>[];
@@ -600,6 +653,104 @@ class LayoutEngine {
 
   /// Builds and lays out one paragraph for [block], or null when the block
   /// has no renderable text.
+  List<Inline> _presentationInlines(List<Inline> values, ReaderStyle style) {
+    final unified = style.typesettingMode == TypesettingMode.unified;
+    final out = <Inline>[];
+    for (final value in values) {
+      if (value is MathInline &&
+          (!unified ||
+              formulaResolver?.call(value, style.foreground) == null)) {
+        if (value.original != null) {
+          out.addAll(value.original!);
+          continue;
+        }
+        if (value.originalInlineImage != null) {
+          out.add(value.originalInlineImage!);
+          continue;
+        }
+      }
+      if (unified && value is InlineImageRun && value.image.formula != null) {
+        final formula = value.image.formula!;
+        final converted = MathInline(
+          formula.latex,
+          originalImage: value.image.href,
+          originalInlineImage: value,
+          equationNumber: formula.equationNumber,
+        );
+        if (formulaResolver?.call(converted, style.foreground) != null) {
+          out.add(converted);
+          continue;
+        }
+      }
+      if (!unified && value is TextRun) {
+        out.add(
+          withRun(
+            value,
+            value.text,
+            style: value.style.copyWith(inlineCitation: 0, website: false),
+          ),
+        );
+      } else {
+        out.add(value);
+      }
+    }
+    return unified ? coalesceReferences(detectWebLinks(out)) : out;
+  }
+
+  bool _appendMath(
+    ui.ParagraphBuilder builder,
+    MathInline value,
+    double fontSize,
+    double width,
+    int color,
+    int offset,
+    List<InlineImageRange> images,
+    List<TextLinkRange> links,
+  ) {
+    final raster = formulaResolver?.call(value, color);
+    if (raster == null || value.latex.isEmpty) return false;
+    final scale = math.min(
+      fontSize / FormulaRasterizer.em,
+      width / raster.width,
+    );
+    final w = raster.width * scale, h = raster.height * scale;
+    builder.addPlaceholder(
+      w,
+      h,
+      ui.PlaceholderAlignment.baseline,
+      baseline: ui.TextBaseline.alphabetic,
+      baselineOffset: raster.baseline * scale,
+    );
+    if (value.latex.length > 1) {
+      builder.pushStyle(
+        ui.TextStyle(fontSize: 0, color: const ui.Color(0x00000000)),
+      );
+      builder.addText('\u200b' * (value.latex.length - 1));
+      builder.pop();
+    }
+    images.add(
+      InlineImageRange(
+        start: offset,
+        end: offset + 1,
+        href: raster.href,
+        width: w,
+        height: h,
+      ),
+    );
+    links.add(
+      TextLinkRange(
+        start: offset,
+        end: offset + 1,
+        href: '',
+        marker: '',
+        role: LinkRole.normal,
+        latex: value.latex,
+        originalImage: value.originalImage,
+      ),
+    );
+    return true;
+  }
+
   _PreparedText? _prepareText(
     TextBlock block,
     ReaderStyle style,
@@ -609,7 +760,13 @@ class LayoutEngine {
     double sectionTextOffset, {
     BlockAlign? unifiedAlignmentOverride,
     ui.Size? Function(String href)? imageSizeResolver,
+    bool semanticAnnotation = false,
   }) {
+    block = withInlines(block, _presentationInlines(block.inlines, style));
+    final displayMath =
+        block.inlines.length == 1 &&
+        block.inlines.single is MathInline &&
+        (block.inlines.single as MathInline).display;
     final displaySystem = block.inlines
         .whereType<TextRun>()
         .map((run) => run.displayWritingSystem)
@@ -626,7 +783,7 @@ class LayoutEngine {
     final isQuote =
         block.kind == TextBlockKind.blockquote ||
         block.kind == TextBlockKind.quoteAttribution;
-    final isCaption = block.kind == TextBlockKind.caption;
+    final isCaption = block.kind == TextBlockKind.caption || semanticAnnotation;
     final isDefinitionTerm = block.kind == TextBlockKind.definitionTerm;
     final isDefinitionDescription =
         block.kind == TextBlockKind.definitionDescription;
@@ -691,6 +848,11 @@ class LayoutEngine {
     if (block.style.hardBreakAfter) {
       marginAfter += baseSize * paragraphLineHeight;
     }
+    if (unified && displayMath) {
+      resolvedAlign = BlockAlign.center;
+      marginBefore = baseSize * .7;
+      marginAfter = baseSize * .7;
+    }
 
     var marker = '';
     var markerWidth = 0.0;
@@ -739,7 +901,8 @@ class LayoutEngine {
       ),
     );
 
-    final indentWidth = isList
+    final indentWidth =
+        isList || (unified && (displayMath || semanticAnnotation))
         ? 0.0
         : switch ((unified, block.kind)) {
             (true, TextBlockKind.paragraph) =>
@@ -774,19 +937,26 @@ class LayoutEngine {
       }
     }
 
+    final gluedRuns = _footnoteGlueRuns(block.inlines);
     for (final inline in block.inlines) {
       switch (inline) {
         case TextRun(:final text, style: final runStyle, :final link):
           if (text.isEmpty) continue;
           final footnoteIcon = _usesFootnoteIcon(runStyle, link);
           if (footnoteIcon) {
+            builder.addText('\u2060');
+            paragraphOffset++;
+            normalDisplayToSource.add(sourceOffset);
             final authoredScale = unified
                 ? blockScale
                 : runStyle.sizeScale * blockScale;
             _appendFootnotePlaceholder(
               builder,
               text,
-              (baseSize * authoredScale * 0.78).clamp(8.0, 12.0),
+              _referenceSize(
+                runStyle,
+                (baseSize * authoredScale * 0.78).clamp(8.0, 12.0),
+              ),
             );
             links.add(
               TextLinkRange(
@@ -796,7 +966,11 @@ class LayoutEngine {
                 marker: link == null ? '' : text.trim(),
                 role: runStyle.linkRole,
                 footnoteIcon: true,
-                inlineNote: runStyle.inlineRole == InlineRole.footnote
+                citationOrdinal: runStyle.inlineCitation,
+                websiteIcon: runStyle.website,
+                inlineNote:
+                    runStyle.inlineCitation > 0 ||
+                        runStyle.inlineRole == InlineRole.footnote
                     ? text.trim()
                     : null,
               ),
@@ -827,7 +1001,10 @@ class LayoutEngine {
                 isDefinitionTerm: isDefinitionTerm,
               ),
             );
-            builder.addText(text.substring(segment.start, segment.end));
+            final displayText = gluedRuns.contains(inline)
+                ? _glueTrailingSpaces(text)
+                : text;
+            builder.addText(displayText.substring(segment.start, segment.end));
             builder.pop();
           }
           if (link != null) {
@@ -847,6 +1024,25 @@ class LayoutEngine {
           if (latex.isEmpty) continue;
           final scale = unified ? blockScale : sizeScale * blockScale;
           final fontSize = baseSize * scale;
+          if (_appendMath(
+            builder,
+            inline,
+            fontSize,
+            contentWidth,
+            style.foreground,
+            paragraphOffset,
+            inlineImages,
+            links,
+          )) {
+            paragraphOffset += latex.length;
+            normalDisplayToSource.addAll(
+              List.filled(latex.length, sourceOffset),
+            );
+            sourceOffset += inline.sourceText.runes.length;
+            normalDisplayToSource[normalDisplayToSource.length - 1] =
+                sourceOffset;
+            continue;
+          }
           builder.pushStyle(
             ui.TextStyle(
               color: foreground,
@@ -1163,7 +1359,10 @@ class LayoutEngine {
           semanticCjkEmphasis ||
           isHeading ||
           isDefinitionTerm,
-      italic: runStyle.italic && (!clearItalic || semantic),
+      italic:
+          !(unified && isQuote) &&
+          runStyle.italic &&
+          (!clearItalic || semantic),
       underline: !unified && runStyle.underline,
       strikethrough: runStyle.strikethrough,
     );
@@ -1278,7 +1477,10 @@ class LayoutEngine {
                 language: language,
                 footnoteIcon: footnoteIcon,
                 footnoteSize: footnoteIcon
-                    ? (baseSize * authoredScale * 0.78).clamp(8.0, 12.0)
+                    ? _referenceSize(
+                        runStyle,
+                        (baseSize * authoredScale * 0.78).clamp(8.0, 12.0),
+                      )
                     : 0,
                 fontSize: _resolvedFontSize(
                   segmentStyle,
@@ -1292,7 +1494,9 @@ class LayoutEngine {
       }
     }
     final sourceText = text.toString();
-    if (sourceText.isEmpty || slices.isEmpty) return null;
+    if (sourceText.isEmpty || slices.isEmpty || sourceText.length > 4096) {
+      return null;
+    }
     final legalBreaks = Icu4xLineBreaker.instance.breakOpportunities(
       sourceText,
     );
@@ -1794,7 +1998,11 @@ class LayoutEngine {
           marker: sourceText.substring(slice.start, slice.end).trim(),
           role: slice.style.linkRole,
           footnoteIcon: slice.footnoteIcon,
-          inlineNote: slice.style.inlineRole == InlineRole.footnote
+          citationOrdinal: slice.style.inlineCitation,
+          websiteIcon: slice.style.website,
+          inlineNote:
+              slice.style.inlineCitation > 0 ||
+                  slice.style.inlineRole == InlineRole.footnote
               ? sourceText.substring(slice.start, slice.end).trim()
               : null,
         ),
@@ -1864,8 +2072,17 @@ class LayoutEngine {
     required double blockScale,
     required double baseSize,
   }) {
-    var scale = unified ? blockScale : style.sizeScale * blockScale;
-    if (style.baseline != TextBaselineShift.none) scale *= 0.7;
+    final keyword = style.keywordSizeScale;
+    var scale = unified
+        ? (keyword != null && keyword.isFinite && keyword > 0
+              ? keyword
+              : blockScale)
+        : style.sizeScale * blockScale;
+    if (style.baseline != TextBaselineShift.none) {
+      scale *= unified && style.baseline == TextBaselineShift.subscript
+          ? 0.75
+          : 0.7;
+    }
     final resolved = baseSize * scale;
     return unified
         ? resolved
@@ -1933,12 +2150,45 @@ class LayoutEngine {
       (rune >= 0xac00 && rune <= 0xd7af) ||
       (rune >= 0xf900 && rune <= 0xfaff);
 
+  static double _referenceSize(TextStyle style, double size) =>
+      style.inlineCitation > 0
+      ? size * (style.inlineCitation.toString().length + 2) * 0.55
+      : size;
+
   static bool _usesFootnoteIcon(TextStyle style, String? link) {
+    if (style.inlineCitation > 0 || style.website) return true;
     if (style.inlineRole == InlineRole.footnote) return true;
     if (link == null || !link.contains('#')) return false;
     return style.linkRole == LinkRole.footnoteReference ||
         (style.linkRole == LinkRole.normal &&
             style.baseline == TextBaselineShift.superscript);
+  }
+
+  static final _trailingSpaces = RegExp(r'[ \u2000-\u200a\u3000]+$');
+
+  static String _glueTrailingSpaces(String text) => text.replaceFirstMapped(
+    _trailingSpaces,
+    (match) => '\u00a0' * match.group(0)!.length,
+  );
+
+  static Set<TextRun> _footnoteGlueRuns(List<Inline> inlines) {
+    final result = <TextRun>{};
+    var followedByNote = false;
+    for (final inline in inlines.reversed) {
+      if (inline is! TextRun) {
+        followedByNote = false;
+        continue;
+      }
+      if (inline.text.isEmpty) continue;
+      if (_usesFootnoteIcon(inline.style, inline.link)) {
+        followedByNote = true;
+      } else if (followedByNote) {
+        result.add(inline);
+        followedByNote =
+            _trailingSpaces.stringMatch(inline.text) == inline.text;
+      }
+    }
+    return result;
   }
 
   static void _appendFootnotePlaceholder(
@@ -2035,6 +2285,41 @@ class LayoutEngine {
       baselineOffset: aboveBaseline,
       paintOffsetY: aboveBaseline + shift - height,
     );
+  }
+
+  _PreparedText? _prepareTableAnnotation(
+    TextBlock text,
+    ReaderStyle style,
+    int spineIndex,
+    double left,
+    double width,
+    double offset,
+    ui.Size? Function(String href)? imageSizeResolver,
+  ) {
+    final unified = style.typesettingMode == TypesettingMode.unified;
+    _PreparedText? prepare(BlockAlign? alignment) => _prepareText(
+      text,
+      style,
+      spineIndex,
+      left,
+      width,
+      offset,
+      imageSizeResolver: imageSizeResolver,
+      unifiedAlignmentOverride: alignment,
+      semanticAnnotation: true,
+    );
+    var result = prepare(
+      unified && text.kind != TextBlockKind.caption ? BlockAlign.start : null,
+    );
+    if (unified &&
+        text.kind == TextBlockKind.caption &&
+        result != null &&
+        result.metrics.length > 1) {
+      result.paragraph.dispose();
+      result.markerParagraph?.dispose();
+      result = prepare(BlockAlign.start);
+    }
+    return result;
   }
 
   _PreparedTable? _prepareTable(
@@ -2269,6 +2554,16 @@ class LayoutEngine {
     double lineHeight,
     ui.Size? Function(String href)? imageSizeResolver,
   ) {
+    cell = TableCell(
+      inlines: _presentationInlines(cell.inlines, style),
+      header: cell.header,
+      columnSpan: cell.columnSpan,
+      rowSpan: cell.rowSpan,
+      authoredAlignment: cell.authoredAlignment,
+      style: cell.style,
+      source: cell.source,
+      nodeId: cell.nodeId,
+    );
     final displaySystem = cell.inlines
         .whereType<TextRun>()
         .map((run) => run.displayWritingSystem)
@@ -2315,7 +2610,10 @@ class LayoutEngine {
             _appendFootnotePlaceholder(
               builder,
               text,
-              (style.baseFontSize * authoredScale * 0.78).clamp(8.0, 12.0),
+              _referenceSize(
+                runStyle,
+                (style.baseFontSize * authoredScale * 0.78).clamp(8.0, 12.0),
+              ),
             );
             links.add(
               TextLinkRange(
@@ -2325,7 +2623,11 @@ class LayoutEngine {
                 marker: link == null ? '' : text.trim(),
                 role: runStyle.linkRole,
                 footnoteIcon: true,
-                inlineNote: runStyle.inlineRole == InlineRole.footnote
+                citationOrdinal: runStyle.inlineCitation,
+                websiteIcon: runStyle.website,
+                inlineNote:
+                    runStyle.inlineCitation > 0 ||
+                        runStyle.inlineRole == InlineRole.footnote
                     ? text.trim()
                     : null,
               ),
@@ -2340,14 +2642,12 @@ class LayoutEngine {
             fallbackWritingSystem: style.writingSystem,
           )) {
             final segmentStyle = segment.style;
-            var scale = unified
-                ? fontScale
-                : fontScale * segmentStyle.sizeScale;
-            if (segmentStyle.baseline != TextBaselineShift.none) scale *= 0.7;
-            final resolvedFontSize = style.baseFontSize * scale;
-            final fontSize = unified
-                ? resolvedFontSize
-                : math.max(ReaderTypography.minimumFontSize, resolvedFontSize);
+            final fontSize = _resolvedFontSize(
+              segmentStyle,
+              unified: unified,
+              blockScale: fontScale,
+              baseSize: style.baseFontSize,
+            );
             final weight = cell.header || segmentStyle.bold
                 ? math.max(700, typography.fontWeight)
                 : typography.fontWeight;
@@ -2396,6 +2696,19 @@ class LayoutEngine {
         case MathInline(:final latex, :final sizeScale):
           if (latex.isEmpty) continue;
           final resolvedFontSize = style.baseFontSize * fontScale * sizeScale;
+          if (_appendMath(
+            builder,
+            inline,
+            resolvedFontSize,
+            width,
+            style.foreground,
+            paragraphOffset,
+            inlineImages,
+            links,
+          )) {
+            paragraphOffset += latex.length;
+            continue;
+          }
           builder.pushStyle(
             ui.TextStyle(
               color: foreground,
@@ -2458,6 +2771,7 @@ class LayoutEngine {
     double contentWidth,
     int spineIndex,
     double sectionTextOffset,
+    ui.Size? Function(String href)? imageSizeResolver,
   ) {
     final unified = style.typesettingMode == TypesettingMode.unified;
     final horizontalPadding = unified
@@ -2476,6 +2790,7 @@ class LayoutEngine {
         quoteLeft,
         quoteWidth,
         offset,
+        imageSizeResolver: imageSizeResolver,
       );
       if (value != null &&
           unified &&
@@ -2495,6 +2810,7 @@ class LayoutEngine {
         quoteLeft,
         quoteWidth,
         offset,
+        imageSizeResolver: imageSizeResolver,
       );
       if (value != null) prepared.add(value);
     }
@@ -2533,6 +2849,32 @@ class LayoutEngine {
     double contentHeight,
     double viewportWidth,
   ) {
+    final mathValue = block.formula;
+    if (mathValue != null && style.typesettingMode == TypesettingMode.unified) {
+      final display = MathInline(
+        mathValue.latex,
+        display: true,
+        originalImage: block.href,
+        equationNumber: mathValue.equationNumber,
+      );
+      final raster = formulaResolver?.call(display, style.foreground);
+      if (raster != null) {
+        final scale = math.min(
+          style.baseFontSize / FormulaRasterizer.em,
+          math.min(contentWidth / raster.width, contentHeight / raster.height),
+        );
+        paginator.pushImage(
+          raster.href,
+          raster.width * scale,
+          raster.height * scale,
+          marginBefore: style.baseFontSize * .7,
+          marginAfter: style.baseFontSize * .7,
+          latex: display.latex,
+          originalImage: block.href,
+        );
+        return;
+      }
+    }
     final prepared = _prepareImage(
       block,
       style,
@@ -2657,18 +2999,43 @@ class LayoutEngine {
         )
         .toList();
     final captions = <_PreparedText>[];
-    var captionOffset = sectionTextOffset;
-    for (final caption in figure.captions) {
-      final prepared = _prepareFigureCaption(
-        caption,
-        style,
-        spineIndex,
-        contentLeft,
-        contentWidth,
-        captionOffset,
-      );
-      if (prepared != null) captions.add(prepared);
-      captionOffset += caption.plainText.runes.length;
+    var primaryCount = 0;
+    void prepareCaptions({BlockAlign? alignment}) {
+      primaryCount = 0;
+      var captionOffset = sectionTextOffset;
+      for (final caption in figure.captions) {
+        final prepared = _prepareText(
+          caption,
+          style,
+          spineIndex,
+          contentLeft,
+          contentWidth,
+          captionOffset,
+          imageSizeResolver: imageSizeResolver,
+          unifiedAlignmentOverride:
+              unified && caption.kind != TextBlockKind.caption
+              ? BlockAlign.start
+              : alignment,
+          semanticAnnotation: true,
+        );
+        if (prepared != null) {
+          captions.add(prepared);
+          if (figure.primaryCaptions.contains(caption)) primaryCount++;
+        }
+        captionOffset += caption.plainText.runes.length;
+      }
+    }
+
+    prepareCaptions();
+    if (unified &&
+        captions.fold<int>(0, (sum, caption) => sum + caption.metrics.length) >
+            1) {
+      for (final caption in captions) {
+        caption.paragraph.dispose();
+        caption.markerParagraph?.dispose();
+      }
+      captions.clear();
+      prepareCaptions(alignment: BlockAlign.start);
     }
 
     final em = style.baseFontSize;
@@ -2701,7 +3068,11 @@ class LayoutEngine {
     final internalImageGaps = captionGap * math.max(0, images.length - 1);
     final imageCaptionGap = images.isEmpty || captions.isEmpty
         ? 0.0
-        : captionGap;
+        : captionGap *
+              (figure.captionPosition == CaptionPosition.before &&
+                      figure.afterCaptions.isNotEmpty
+                  ? 2
+                  : 1);
     paginator.prepareGroup(
       imageHeight + captionHeight + internalImageGaps + imageCaptionGap,
       outerGap,
@@ -2723,65 +3094,31 @@ class LayoutEngine {
       }
     }
 
-    void pushCaptions() {
-      for (final caption in captions) {
+    void pushCaptions(Iterable<_PreparedText> values) {
+      for (final caption in values) {
         paginator.pushText(caption);
       }
     }
 
     switch (figure.captionPosition) {
       case CaptionPosition.before:
-        pushCaptions();
+        pushCaptions(captions.take(primaryCount));
         if (captions.isNotEmpty && images.isNotEmpty) {
           paginator.addSemanticSpacing(captionGap);
         }
         pushImages();
+        if (captions.length > primaryCount) {
+          paginator.addSemanticSpacing(captionGap);
+          pushCaptions(captions.skip(primaryCount));
+        }
       case CaptionPosition.after:
         pushImages();
         if (captions.isNotEmpty && images.isNotEmpty) {
           paginator.addSemanticSpacing(captionGap);
         }
-        pushCaptions();
+        pushCaptions(captions);
     }
     paginator.finishGroup(outerGap);
-  }
-
-  _PreparedText? _prepareFigureCaption(
-    TextBlock caption,
-    ReaderStyle style,
-    int spineIndex,
-    double contentLeft,
-    double contentWidth,
-    double sectionTextOffset,
-  ) {
-    // Desktop rule: probe with centered layout first. A one-line caption
-    // stays centered; a multi-line caption is rebuilt start-aligned through
-    // the whole-paragraph optimizer (including ICU and hyphenation).
-    var prepared = _prepareText(
-      caption,
-      style,
-      spineIndex,
-      contentLeft,
-      contentWidth,
-      sectionTextOffset,
-    );
-    if (prepared == null ||
-        style.typesettingMode != TypesettingMode.unified ||
-        prepared.metrics.length <= 1) {
-      return prepared;
-    }
-    prepared.paragraph.dispose();
-    prepared.markerParagraph?.dispose();
-    prepared = _prepareText(
-      caption,
-      style,
-      spineIndex,
-      contentLeft,
-      contentWidth,
-      sectionTextOffset,
-      unifiedAlignmentOverride: BlockAlign.start,
-    );
-    return prepared;
   }
 
   static double _preparedTextHeight(_PreparedText prepared) =>
@@ -2811,6 +3148,10 @@ class LayoutEngine {
     BlockAlign? override,
   }) {
     if (override != null) return override;
+    final semantic = block.style.semanticAlignment;
+    if (semantic != null) {
+      return semantic == BlockAlign.start ? BlockAlign.justify : semantic;
+    }
     final prose =
         block.kind == TextBlockKind.paragraph ||
         block.kind == TextBlockKind.blockquote;
@@ -3200,7 +3541,42 @@ class _Paginator {
     _setMarginAfter(prepared.marginAfter);
   }
 
-  void pushTable(_PreparedTable table) {
+  void pushTable(
+    _PreparedTable table, {
+    List<_PreparedText> before = const [],
+    List<_PreparedText> after = const [],
+  }) {
+    double textHeight(List<_PreparedText> texts) => texts.fold(
+      0.0,
+      (sum, text) =>
+          sum +
+          LayoutEngine._preparedTextHeight(text) +
+          math.max(0, text.marginBefore) +
+          math.max(0, text.marginAfter),
+    );
+    int groupEndAt(int row) {
+      var end = row + 1;
+      var previous = row;
+      while (previous != end) {
+        previous = end;
+        for (final cell in table.cells) {
+          if (cell.grid.row >= row && cell.grid.row < end) {
+            end = math.max(end, cell.grid.row + cell.grid.rowSpan);
+          }
+        }
+      }
+      return end;
+    }
+
+    if (before.isNotEmpty) {
+      final firstHeight = table.rowHeights
+          .take(groupEndAt(0))
+          .fold(0.0, (sum, height) => sum + height);
+      prepareGroup(textHeight(before) + table.marginBefore + firstHeight, 0);
+      for (final text in before) {
+        pushText(text);
+      }
+    }
     _collapseMargin(table.marginBefore);
     var row = 0;
     while (row < table.rowHeights.length) {
@@ -3222,6 +3598,9 @@ class _Paginator {
           .skip(row)
           .take(groupEnd - row)
           .fold(0.0, (sum, height) => sum + height);
+      if (groupEnd == table.rowHeights.length && after.isNotEmpty) {
+        prepareGroup(groupHeight + table.marginAfter + textHeight(after), 0);
+      }
       if (groupHeight > remaining + _eps && hasContent) advance();
       final groupTop = cursorY;
 
@@ -3270,6 +3649,9 @@ class _Paginator {
       row = groupEnd;
     }
     _setMarginAfter(table.marginAfter);
+    for (final text in after) {
+      pushText(text);
+    }
   }
 
   void pushImage(
@@ -3280,6 +3662,8 @@ class _Paginator {
     required double marginAfter,
     bool centerVertically = false,
     bool fillViewportWidth = false,
+    String? latex,
+    String? originalImage,
   }) {
     _collapseMargin(marginBefore);
     if (height > remaining + _eps && hasContent) advance();
@@ -3288,7 +3672,12 @@ class _Paginator {
         ? top + math.max(0, (bottom - top - height) / 2)
         : cursorY;
     items.add(
-      ImagePlacement(href: href, rect: ui.Rect.fromLTWH(x, y, width, height)),
+      ImagePlacement(
+        href: href,
+        rect: ui.Rect.fromLTWH(x, y, width, height),
+        latex: latex,
+        originalImage: originalImage,
+      ),
     );
     hasContent = true;
     cursorY = y + height;

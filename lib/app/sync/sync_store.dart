@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
@@ -83,8 +84,33 @@ class SyncStore {
   Future<void> close() => database.close();
 
   /// Account-scoped, regenerable transfer state; never part of cloud data.
-  Future<String?> cacheGet(String account, String key) =>
-      _meta(database, 'transfer:$account:$key');
+  Future<String?> cacheGet(String account, String key) => database.transaction((
+    txn,
+  ) async {
+    // Android CursorWindow cannot return multi-megabyte TEXT rows. Slice the
+    // existing cache in SQL so old databases recover without deleting data.
+    // BLOB slices bound UTF-8 bytes and preserve NUL and split Unicode codepoints.
+    const chunkBytes = 256 * 1024;
+    final cacheKey = 'transfer:$account:$key';
+    final first = await txn.rawQuery(
+      'SELECT length(CAST(value AS BLOB)) AS size, '
+      'substr(CAST(value AS BLOB), 1, ?) AS chunk FROM meta WHERE key = ?',
+      [chunkBytes, cacheKey],
+    );
+    if (first.isEmpty) return null;
+    final size = first.single['size'] as int;
+    if (size == 0) return '';
+    final bytes = BytesBuilder(copy: false)
+      ..add(first.single['chunk'] as List<int>);
+    for (var offset = chunkBytes; offset < size; offset += chunkBytes) {
+      final rows = await txn.rawQuery(
+        'SELECT substr(CAST(value AS BLOB), ?, ?) AS chunk FROM meta WHERE key = ?',
+        [offset + 1, chunkBytes, cacheKey],
+      );
+      bytes.add(rows.single['chunk'] as List<int>);
+    }
+    return utf8.decode(bytes.takeBytes());
+  });
 
   Future<void> cacheSet(String account, String key, String value) =>
       _setMeta(database, 'transfer:$account:$key', value);

@@ -1,3 +1,9 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:ui' as ui;
+import 'package:path_provider/path_provider.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'core/diagnostics.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
@@ -21,6 +27,20 @@ void main() {
       systemNavigationBarContrastEnforced: false,
     ),
   );
+  unawaited(_initializeDiagnostics());
+  final original = FlutterError.onError;
+  FlutterError.onError = (details) {
+    ReaderDiagnostics.instance.event('flutter.error', {
+      'type': details.exception.runtimeType.toString(),
+    });
+    original?.call(details);
+  };
+  ui.PlatformDispatcher.instance.onError = (error, stack) {
+    ReaderDiagnostics.instance.event('async.error', {
+      'type': error.runtimeType.toString(),
+    });
+    return false;
+  };
   runApp(const TortoApp());
 }
 
@@ -118,5 +138,59 @@ class _TortoAppState extends State<TortoApp> {
       ),
       useMaterial3: true,
     );
+  }
+}
+
+Future<void> _initializeDiagnostics() async {
+  try {
+    final root = await getApplicationSupportDirectory();
+    await ReaderDiagnostics.instance.initialize(
+      Directory('${root.path}/diagnostics'),
+    );
+    final info = await PackageInfo.fromPlatform();
+    ReaderDiagnostics.instance.event('app.start', {
+      'version': info.version,
+      'build': info.buildNumber,
+    });
+    WidgetsBinding.instance.addTimingsCallback((timings) {
+      for (final timing in timings) {
+        if (timing.totalSpan.inMilliseconds >= 100) {
+          ReaderDiagnostics.instance.event('frame.slow', {
+            'build_ms': timing.buildDuration.inMilliseconds,
+            'raster_ms': timing.rasterDuration.inMilliseconds,
+            'total_ms': timing.totalSpan.inMilliseconds,
+          });
+        }
+      }
+    });
+    if (Platform.isAndroid) {
+      try {
+        final exits = await const MethodChannel(
+          'torto/diagnostics',
+        ).invokeListMethod<Object?>('exitInfo');
+        for (final exit in exits ?? const []) {
+          if (exit is Map) {
+            ReaderDiagnostics.instance.event(
+              'android.exit',
+              exit.map((key, value) => MapEntry(key.toString(), value)),
+            );
+          }
+        }
+      } catch (_) {}
+    }
+    var last = DateTime.now();
+    Timer.periodic(const Duration(seconds: 1), (_) {
+      final now = DateTime.now();
+      final elapsed = now.difference(last).inMilliseconds;
+      last = now;
+      if (elapsed > 1500 &&
+          WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed) {
+        ReaderDiagnostics.instance.event('event_loop.delay', {
+          'elapsed_ms': elapsed,
+        });
+      }
+    });
+  } catch (_) {
+    /* Diagnostics must never prevent startup. */
   }
 }

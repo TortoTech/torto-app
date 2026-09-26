@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:ui' as ui;
+import 'package:archive/archive.dart';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -11,6 +12,66 @@ import 'package:torto/core/render/page_painter.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('inline quote and table images survive page-cache eviction', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'torto-inline-image-',
+    );
+    addTearDown(() => directory.delete(recursive: true));
+    final recorder = ui.PictureRecorder();
+    ui.Canvas(recorder).drawRect(
+      const ui.Rect.fromLTWH(0, 0, 8, 4),
+      ui.Paint()..color = const ui.Color(0xff123456),
+    );
+    final picture = recorder.endRecording();
+    final image = await picture.toImage(8, 4);
+    final png = (await image.toByteData(
+      format: ui.ImageByteFormat.png,
+    ))!.buffer.asUint8List();
+    image.dispose();
+    picture.dispose();
+    final archive = Archive();
+    void add(String path, String text) =>
+        archive.addFile(ArchiveFile.string(path, text));
+    add('mimetype', 'application/epub+zip');
+    add(
+      'META-INF/container.xml',
+      '<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>',
+    );
+    add(
+      'book.opf',
+      '<package><metadata><title>Inline image fixture</title></metadata><manifest>'
+          '${List.generate(4, (i) => '<item id="s$i" href="s$i.xhtml" media-type="application/xhtml+xml"/>').join()}'
+          '</manifest><spine>${List.generate(4, (i) => '<itemref idref="s$i"/>').join()}</spine></package>',
+    );
+    for (var i = 0; i < 4; i++) {
+      final content = i == 0
+          ? '<blockquote><p>Quote <img src="image0.png" style="height:1em"/> text</p></blockquote>'
+          : i == 3
+          ? '<table><tr><td>Cell <img src="image3.png" style="height:1em"/> text</td></tr></table>'
+          : '<p>Section $i</p>';
+      add('s$i.xhtml', '<html><body>$content</body></html>');
+      archive.addFile(ArchiveFile('image$i.png', png.length, png));
+    }
+    final file = File('${directory.path}/fixture.epub');
+    await file.writeAsBytes(ZipEncoder().encodeBytes(archive));
+    SharedPreferences.setMockInitialValues({});
+    final controller = ReaderController(
+      progressStore: ProgressStore(await SharedPreferences.getInstance()),
+    );
+    addTearDown(controller.dispose);
+    await controller.open(
+      file,
+      const LayoutViewport(width: 400, height: 700),
+      const ReaderStyle(),
+    );
+    expect(controller.resolveImage('image0.png'), isNotNull);
+    await controller.goToSection(1);
+    expect(controller.resolveImage('image0.png'), isNotNull);
+    await controller.goToSection(3);
+    expect(controller.resolveImage('image3.png'), isNotNull);
+    expect(controller.resolveImage('image0.png'), isNull);
+  });
 
   for (final fixture in const [
     ('../torto/test-data/Thinking in Systems A Primer.epub', 0, true),

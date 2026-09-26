@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:torto/core/ir/ir.dart';
@@ -28,6 +29,13 @@ class _Source implements BookSource {
   Future<Uint8List?> resource(String href) async => null;
 }
 
+class _DelayedSource extends _Source {
+  final gate = Completer<Section>();
+  _DelayedSource(super.section);
+  @override
+  Future<Section> parseSection(int index) => gate.future;
+}
+
 TextBlock _text(
   String value,
   String node, {
@@ -52,6 +60,86 @@ TextBlock _text(
 );
 
 void main() {
+  test(
+    'clear invalidates validation and input jobs already waiting on a section',
+    () async {
+      final section = Section(
+        id: const SpineItemId.generated(0),
+        spineIndex: 0,
+        href: 'chapter.xhtml',
+        blocks: [_text('Original', 'n0')],
+      );
+      final original = _DelayedSource(section);
+      final source = TranslationBookSource(original);
+      final store = source.storeBatch(0, const [
+        BlockTranslation(blockIndex: 0, text: 'Old result'),
+      ]);
+      final inputs = source.untranslatedBlocksForNodes(0, {'n0'});
+      source.clear();
+      original.gate.complete(section);
+      await store;
+      expect(source.hasTranslations(0), isFalse);
+      expect(await inputs, isEmpty);
+    },
+  );
+
+  test(
+    'one large quotation also uses background validation and composition',
+    () async {
+      final section = Section(
+        id: const SpineItemId.generated(0),
+        spineIndex: 0,
+        href: 'chapter.xhtml',
+        blocks: [
+          QuoteBlock(body: [_text('Long quotation. ' * 1000, 'q')]),
+        ],
+      );
+      final source = TranslationBookSource(_Source(section))..enabled = true;
+      var serviced = false;
+      Timer.run(() => serviced = true);
+      await source.storeBatch(0, const [
+        BlockTranslation(
+          blockIndex: 0,
+          segmentIndex: 0,
+          text: 'Translated quote',
+        ),
+      ]);
+      expect(serviced, isTrue);
+      final rendered = await source.parseSection(0);
+      expect(
+        (rendered.blocks.single as QuoteBlock).body.single.plainText,
+        'Translated quote',
+      );
+    },
+  );
+  test(
+    'large translated chapters compose off-thread and retain canonical anchors',
+    () async {
+      final original = _Source(
+        Section(
+          id: const SpineItemId.generated(0),
+          spineIndex: 0,
+          href: 'chapter.xhtml',
+          blocks: [for (var i = 0; i < 60; i++) _text('Original $i', 'n$i')],
+        ),
+      );
+      final source = TranslationBookSource(
+        original,
+        mode: TranslationMode.bilingual,
+      )..enabled = true;
+      final inputs = await source.untranslatedBlocksForNodes(0, {'n59'});
+      expect(inputs.single.blockIndex, 59);
+      await source.storeBatch(0, const [
+        BlockTranslation(blockIndex: 59, text: 'Translated'),
+      ]);
+      final result = await source.parseSection(0);
+      expect(result.blocks, hasLength(61));
+      final translated = result.blocks.last as TextBlock;
+      expect(translated.plainText, 'Translated');
+      expect(translated.source?.start.node, 'n59');
+      expect(identical(result, await source.parseSection(0)), isTrue);
+    },
+  );
   test(
     'translation structures are reused until the batch or display mode changes',
     () async {

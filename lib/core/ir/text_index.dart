@@ -27,7 +27,12 @@ Iterable<BookTextNode> sectionTextNodes(
             block.source!,
             block.plainText,
             displayId: block.nodeId,
-            selectable: !block.inlines.any((run) => run is MathInline),
+            selectable: !block.inlines.any(
+              (run) =>
+                  run is MathInline &&
+                  run.original == null &&
+                  run.originalImage == null,
+            ),
           );
         }
       case QuoteBlock():
@@ -36,6 +41,9 @@ Iterable<BookTextNode> sectionTextNodes(
         }
         if (block.attribution != null) yield* visit(block.attribution!);
       case TableBlock():
+        for (final text in block.before) {
+          yield* visit(text);
+        }
         for (final row in block.rows) {
           for (final cell in row.cells) {
             if (cell.source != null) {
@@ -43,10 +51,18 @@ Iterable<BookTextNode> sectionTextNodes(
                 cell.source!,
                 cell.plainText,
                 displayId: cell.nodeId,
-                selectable: !cell.inlines.any((run) => run is MathInline),
+                selectable: !cell.inlines.any(
+                  (run) =>
+                      run is MathInline &&
+                      run.original == null &&
+                      run.originalImage == null,
+                ),
               );
             }
           }
+        }
+        for (final text in block.after) {
+          yield* visit(text);
         }
       case FigureBlock():
         for (final caption in block.captions) {

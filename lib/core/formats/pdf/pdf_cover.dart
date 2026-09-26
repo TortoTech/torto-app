@@ -1,20 +1,23 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'pdf_book_source.dart';
+import '../../ir/ir.dart';
 
-import 'package:pdf_document/pdf_document.dart' as pdf;
-
-import 'pdf_rasterizer.dart';
-
-/// Renders the first page as a shelf thumbnail without a platform channel.
+/// Covers use the same bounded background worker as reader pages.
 Future<Uint8List?> renderPdfCover(String filePath) async {
+  BookSource? source;
   try {
-    final bytes = await File(filePath).readAsBytes();
-    final document = pdf.PdfDocument.open(bytes);
-    if (document.pageCount == 0) return null;
-    return await encodePdfPagePng(document.page(0), maxDimension: 384);
+    source = await openPdf(
+      await File(filePath).readAsBytes(),
+      filePath,
+      filePath: filePath,
+    );
+    return await source.resource('Cover/thumbnail.png');
   } catch (_) {
     return null;
   } finally {
-    clearPdfRasterCache();
+    if (source is DisposableBookSource) {
+      (source as DisposableBookSource).dispose();
+    }
   }
 }

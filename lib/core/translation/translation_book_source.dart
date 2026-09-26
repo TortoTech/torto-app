@@ -1,4 +1,6 @@
 import 'dart:typed_data';
+import 'dart:isolate';
+import '../diagnostics.dart';
 
 import '../ir/ir.dart';
 import 'translation_markup.dart';
@@ -10,6 +12,8 @@ class TranslationBookSource implements BookSource {
   final Map<int, (Section, List<TranslationBlockInput>)> _inputCache = {};
   final Map<int, (Section, TranslationMode, String, Section)> _renderCache = {};
 
+  int _revision = 0;
+  int _clearEpoch = 0;
   bool enabled = false;
   TranslationMode mode;
   String targetLanguageCode = 'zh-CN';
@@ -20,23 +24,40 @@ class TranslationBookSource implements BookSource {
   Book get book => inner.book;
 
   void clear() {
+    _clearEpoch++;
+    _revision++;
     _sections.clear();
     _inputCache.clear();
     _renderCache.clear();
   }
 
   bool hasTranslations(int index) => _sections[index]?.isNotEmpty == true;
+  void invalidateBlocks(int section, Set<int> blocks) {
+    _revision++;
+    for (final block in blocks) {
+      _sections[section]?.remove(block);
+    }
+    _inputCache.remove(section);
+    _renderCache.remove(section);
+  }
 
   Future<List<TranslationBlockInput>> untranslatedBlocksForNodes(
     int sectionIndex,
     Set<String> visibleNodes,
   ) async {
+    final epoch = _clearEpoch;
     final section = await inner.parseSection(sectionIndex);
-    final stored = _sections[sectionIndex];
     var cached = _inputCache.remove(sectionIndex);
     if (cached == null || !identical(cached.$1, section)) {
-      cached = (section, _translatableBlocks(section));
+      cached = (
+        section,
+        _needsWorker(section)
+            ? await Isolate.run(() => _translatableBlocks(section))
+            : _translatableBlocks(section),
+      );
     }
+    if (epoch != _clearEpoch) return const [];
+    final stored = _sections[sectionIndex];
     _inputCache[sectionIndex] = cached;
     while (_inputCache.length > 6) {
       _inputCache.remove(_inputCache.keys.first);
@@ -55,7 +76,10 @@ class TranslationBookSource implements BookSource {
     int sectionIndex,
     List<BlockTranslation> translations,
   ) async {
+    final epoch = _clearEpoch;
     await validateBatch(sectionIndex, translations);
+    if (epoch != _clearEpoch) return;
+    _revision++;
     _renderCache.remove(sectionIndex);
     final values = _sections.putIfAbsent(sectionIndex, () => {});
     for (final translation in translations) {
@@ -77,6 +101,22 @@ class TranslationBookSource implements BookSource {
     List<BlockTranslation> translations,
   ) async {
     final section = await inner.parseSection(sectionIndex);
+    final language = targetLanguageCode;
+    if (_needsWorker(section) ||
+        translations.any((value) => value.text.length > 4096)) {
+      await Isolate.run(
+        () => _validateTranslations(section, translations, language),
+      );
+    } else {
+      _validateTranslations(section, translations, language);
+    }
+  }
+
+  static void _validateTranslations(
+    Section section,
+    List<BlockTranslation> translations,
+    String language,
+  ) {
     for (final translation in translations) {
       final original = _segmentInlines(
         section,
@@ -89,7 +129,8 @@ class TranslationBookSource implements BookSource {
       TranslationMarkupCodec.decode(
         translation.text,
         original,
-        language: targetLanguageCode,
+        language: language,
+        requireSizeMarkup: true,
       );
     }
   }
@@ -107,6 +148,53 @@ class TranslationBookSource implements BookSource {
       _renderCache[index] = cached;
       return cached.$4;
     }
+    final renderMode = mode;
+    final language = targetLanguageCode;
+    final revision = _revision;
+    final rendered = _needsWorker(section)
+        ? await ReaderDiagnostics.instance.measure(
+            'translation.compose',
+            () => Isolate.run(
+              () => _composeTranslation(
+                section,
+                translations,
+                renderMode,
+                language,
+              ),
+            ),
+            {'section': index},
+          )
+        : _composeSection(section, translations);
+    if (revision != _revision ||
+        renderMode != mode ||
+        language != targetLanguageCode ||
+        !enabled) {
+      return rendered;
+    }
+    _renderCache[index] = (section, mode, targetLanguageCode, rendered);
+    while (_renderCache.length > 3) {
+      _renderCache.remove(_renderCache.keys.first);
+    }
+    return rendered;
+  }
+
+  static bool _needsWorker(Section section) =>
+      section.blocks.length > 40 ||
+      section.blocks.any(
+        (block) => switch (block) {
+          TextBlock(:final plainText) => plainText.length > 4096,
+          QuoteBlock(:final textLength) ||
+          TableBlock(:final textLength) ||
+          FigureBlock(:final textLength) ||
+          NoteBlock(:final textLength) => textLength > 4096,
+          _ => false,
+        },
+      );
+
+  Section _composeSection(
+    Section section,
+    Map<int, _StoredBlockTranslation> translations,
+  ) {
     final blocks = <Block>[];
     for (var blockIndex = 0; blockIndex < section.blocks.length; blockIndex++) {
       final block = section.blocks[blockIndex];
@@ -154,24 +242,19 @@ class TranslationBookSource implements BookSource {
           blocks.add(block);
       }
     }
-    final rendered = Section(
+    return Section(
       id: section.id,
       spineIndex: section.spineIndex,
       href: section.href,
       blocks: blocks,
       anchors: section.anchors,
     );
-    _renderCache[index] = (section, mode, targetLanguageCode, rendered);
-    while (_renderCache.length > 3) {
-      _renderCache.remove(_renderCache.keys.first);
-    }
-    return rendered;
   }
 
   @override
   Future<Uint8List?> resource(String href) => inner.resource(href);
 
-  List<TranslationBlockInput> _translatableBlocks(Section section) {
+  static List<TranslationBlockInput> _translatableBlocks(Section section) {
     final inputs = <TranslationBlockInput>[];
     for (var blockIndex = 0; blockIndex < section.blocks.length; blockIndex++) {
       final block = section.blocks[blockIndex];
@@ -185,21 +268,19 @@ class TranslationBookSource implements BookSource {
           }
         case TableBlock():
           var cellIndex = 0;
-          for (final row in block.rows) {
-            for (final cell in row.cells) {
-              final text = TranslationMarkupCodec.encode(cell.inlines);
-              if (text.trim().isNotEmpty && cell.nodeId.isNotEmpty) {
-                inputs.add(
-                  TranslationBlockInput(
-                    blockIndex: blockIndex,
-                    segmentIndex: cellIndex,
-                    nodeId: cell.nodeId,
-                    text: text,
-                  ),
-                );
-              }
-              cellIndex++;
+          for (final cell in block.translationSegments) {
+            final text = TranslationMarkupCodec.encode(cell.inlines);
+            if (text.trim().isNotEmpty && cell.nodeId.isNotEmpty) {
+              inputs.add(
+                TranslationBlockInput(
+                  blockIndex: blockIndex,
+                  segmentIndex: cellIndex,
+                  nodeId: cell.nodeId,
+                  text: text,
+                ),
+              );
             }
+            cellIndex++;
           }
         case FigureBlock():
           for (var index = 0; index < block.captions.length; index++) {
@@ -341,7 +422,21 @@ class TranslationBookSource implements BookSource {
       }
       rows.add(TableRow(cells));
     }
-    return TableBlock(rows: rows, style: table.style, source: table.source);
+    final before = [
+      for (final text in table.before)
+        ..._translatedPair(text, translation.segments[cellIndex++]),
+    ];
+    final after = [
+      for (final text in table.after)
+        ..._translatedPair(text, translation.segments[cellIndex++]),
+    ];
+    return TableBlock(
+      rows: rows,
+      before: before,
+      after: after,
+      style: table.style,
+      source: table.source,
+    );
   }
 
   FigureBlock _translatedFigure(
@@ -372,7 +467,8 @@ class TranslationBookSource implements BookSource {
     }
     return FigureBlock(
       images: figure.images,
-      captions: captions,
+      captions: captions.take(figure.primaryCaptions.length).toList(),
+      afterCaptions: captions.skip(figure.primaryCaptions.length).toList(),
       captionPosition: figure.captionPosition,
       style: figure.style,
       source: figure.source,
@@ -409,36 +505,49 @@ class TranslationBookSource implements BookSource {
         attribution: attribution == null ? null : translateText(attribution),
         source: source,
       ),
-      TableBlock(:final rows, :final style, :final source) => TableBlock(
-        rows: [
-          for (final row in rows)
-            TableRow([
-              for (final cell in row.cells)
-                TableCell(
-                  inlines: translateInlines(cell.inlines),
-                  header: cell.header,
-                  columnSpan: cell.columnSpan,
-                  rowSpan: cell.rowSpan,
-                  authoredAlignment: cell.authoredAlignment,
-                  style: cell.style,
-                  source: cell.source,
-                  nodeId: cell.nodeId,
-                ),
-            ]),
-        ],
-        style: style,
-        source: source,
-      ),
+      TableBlock(
+        :final rows,
+        :final style,
+        :final source,
+        :final before,
+        :final after,
+      ) =>
+        TableBlock(
+          rows: [
+            for (final row in rows)
+              TableRow([
+                for (final cell in row.cells)
+                  TableCell(
+                    inlines: translateInlines(cell.inlines),
+                    header: cell.header,
+                    columnSpan: cell.columnSpan,
+                    rowSpan: cell.rowSpan,
+                    authoredAlignment: cell.authoredAlignment,
+                    style: cell.style,
+                    source: cell.source,
+                    nodeId: cell.nodeId,
+                  ),
+              ]),
+          ],
+          style: style,
+          source: source,
+          before: before.map(translateText).toList(),
+          after: after.map(translateText).toList(),
+        ),
       FigureBlock(
         :final images,
-        :final captions,
+        :final primaryCaptions,
+        :final afterCaptions,
         :final captionPosition,
         :final style,
         :final source,
       ) =>
         FigureBlock(
           images: images,
-          captions: captions.map(translateText).toList(growable: false),
+          captions: primaryCaptions.map(translateText).toList(growable: false),
+          afterCaptions: afterCaptions
+              .map(translateText)
+              .toList(growable: false),
           captionPosition: captionPosition,
           style: style,
           source: source,
@@ -475,10 +584,7 @@ class TranslationBookSource implements BookSource {
         ?block.attribution,
       ].elementAtOrNull(segmentIndex)?.inlines,
       TableBlock() when segmentIndex != null =>
-        block.rows
-            .expand((row) => row.cells)
-            .elementAtOrNull(segmentIndex)
-            ?.inlines,
+        block.translationSegments.elementAtOrNull(segmentIndex)?.inlines,
       FigureBlock() when segmentIndex != null =>
         block.captions.elementAtOrNull(segmentIndex)?.inlines,
       NoteBlock() when segmentIndex != null => _noteTranslationSegments(
@@ -504,8 +610,8 @@ class TranslationBookSource implements BookSource {
         case QuoteBlock(:final body, :final attribution):
           body.forEach(addText);
           if (attribution != null) addText(attribution);
-        case TableBlock(:final rows):
-          for (final cell in rows.expand((row) => row.cells)) {
+        case TableBlock():
+          for (final cell in block.translationSegments) {
             output.add((inlines: cell.inlines, nodeId: cell.nodeId));
           }
         case FigureBlock(:final captions):
@@ -560,4 +666,29 @@ class _StoredBlockTranslation {
 
   bool contains(int? segmentIndex) =>
       segmentIndex == null ? whole != null : segments.containsKey(segmentIndex);
+}
+
+Section _composeTranslation(
+  Section section,
+  Map<int, _StoredBlockTranslation> translations,
+  TranslationMode mode,
+  String language,
+) {
+  final composer = TranslationBookSource(
+    _TranslationSectionSource(section),
+    mode: mode,
+  )..targetLanguageCode = language;
+  return composer._composeSection(section, translations);
+}
+
+class _TranslationSectionSource implements BookSource {
+  final Section section;
+  _TranslationSectionSource(this.section);
+  @override
+  Book get book =>
+      throw UnsupportedError('Composition does not read book metadata');
+  @override
+  Future<Section> parseSection(int index) async => section;
+  @override
+  Future<Uint8List?> resource(String href) async => null;
 }

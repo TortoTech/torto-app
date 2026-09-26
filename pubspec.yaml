@@ -43,12 +43,14 @@ dependencies:
   path_provider: ^2.1.6
   shared_preferences: ^2.5.5
   http: ^1.6.0
+  image: ^4.9.2
   flutter_secure_storage: ^10.0.0
   sqflite: ^2.4.3
   uuid: ^4.6.0
   # Pure-Dart PDF stack: COS/document semantics, text geometry, and the
   # Flutter Canvas renderer. This replaces the Android PdfRenderer channel.
   pdf_document: ^3.7.0
+  pdf_cos: ^3.7.0
   pdf_graphics: ^3.7.0
   # 3.5+ pulls flutter_secure_storage 11 (compileSdk 37) through editing-only
   # features. The public Canvas renderer used here is already present in 3.4;
@@ -69,6 +71,7 @@ dependencies:
   # Dictionary-backed discretionary English hyphenation. Only en-US/en-GB
   # dictionaries are bundled; paragraph layout and source mapping stay Dart.
   hyphen: ^0.3.1
+  flutter_math_fork: ^0.7.4
 
 dev_dependencies:
   flutter_test:
@@ -83,6 +86,9 @@ dev_dependencies:
   flutter_lints: ^6.0.0
 
 dependency_overrides:
+  # 3.7.0 with a bit-exact, parity-strided JPEG 2000 wavelet hot-loop patch.
+  pdf_cos:
+    path: third_party/pdf_cos
   # file_picker 12 -> file_picker_linux -> dbus pins xml ^6.6.1, conflicting
   # with our xml ^7.0.1. dbus is only used for Linux desktop builds; force
   # xml 7 for all targets. Remove when dbus supports xml 7.
@@ -100,6 +106,10 @@ flutter:
   uses-material-design: true
 
   assets:
+    - assets/ai/semantic_layout.md
+    - assets/ai/formula_images.md
+    - assets/ai/formula_transcribe.md
+    - assets/ai/formula_verify.md
     - android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
     - assets/hyphenation/hyph_en_US.dic
     - assets/hyphenation/hyph_en_GB.dic

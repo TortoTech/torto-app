@@ -16,8 +16,10 @@ List<int> inlineDisplayToSource(List<Inline> inlines) {
         }
       case BreakInline(:final synthetic):
         map.add(synthetic ? scalar : ++scalar);
-      case MathInline(:final latex):
+      case MathInline(:final latex, :final sourceText):
         map.addAll(List.filled(latex.length, scalar));
+        scalar += sourceText.runes.length;
+        map[map.length - 1] = scalar;
       case InlineImageRun():
         map.add(scalar);
     }

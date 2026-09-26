@@ -1,5 +1,8 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'package:pdf_document/pdf_document.dart' as pdf;
+import 'package:torto/core/formats/pdf/pdf_rasterizer.dart';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:torto/core/formats/pdf/pdf_book_source.dart';
@@ -61,6 +64,7 @@ void main() {
     final source =
         await openPdf(buildFixturePdf(), 'fallback.pdf') as PdfBookSource;
 
+    addTearDown(source.dispose);
     expect(source.book.metadata.title, 'Fixture PDF');
     expect(source.book.metadata.authors, ['Test Author']);
     expect(source.book.spine, hasLength(2));
@@ -90,7 +94,9 @@ void main() {
     tester,
   ) async {
     final source =
-        await openPdf(buildFixturePdf(), 'fixture.pdf') as PdfBookSource;
+        await tester.runAsync(() => openPdf(buildFixturePdf(), 'fixture.pdf'))
+            as PdfBookSource;
+    addTearDown(source.dispose);
     final section = await source.parseSection(0);
     final block = section.blocks.single as ImageBlock;
 
@@ -103,6 +109,20 @@ void main() {
     expect(image, isNotNull);
     expect(image!.width, 256);
     expect(image.height, 128);
+    final reference = await tester.runAsync(
+      () => rasterizePdfPage(
+        pdf.PdfDocument.open(buildFixturePdf()).page(0),
+        maxDimension: 256,
+      ),
+    );
+    addTearDown(() => reference?.dispose());
+    final pixels = await tester.runAsync(
+      () => image.toByteData(format: ui.ImageByteFormat.rawRgba),
+    );
+    final expectedPixels = await tester.runAsync(
+      () => reference!.toByteData(format: ui.ImageByteFormat.rawRgba),
+    );
+    expect(pixels!.buffer.asUint8List(), expectedPixels!.buffer.asUint8List());
 
     final cover = await tester.runAsync(
       () => source.resource(source.book.coverHref!),

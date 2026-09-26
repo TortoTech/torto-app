@@ -1,4 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:isolate';
+import '../../core/semantic_layout/batching.dart';
+import '../../core/semantic_layout/semantic_layout.dart';
+import '../../core/render/formula_rasterizer.dart';
+import '../../core/ir/inline_content.dart';
+import '../ai/semantic_layout_service.dart';
+import '../../core/diagnostics.dart';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
@@ -23,11 +31,25 @@ import '../ai/openai_compatible_client.dart';
 import '../progress_store.dart';
 import '../sync/derived_data_store.dart';
 
+// Keep the isolate closure outside controller methods: their closure contexts
+// can retain native UI resources and cannot cross an isolate boundary.
+Future<SemanticPlan> _prepareSemanticPlanInWorker(
+  Section section,
+  Set<String> nodes,
+) => Isolate.run(() => SemanticPlan(section, subsectionNodes: nodes));
+
 class ReaderFootnote {
   final String marker;
   final String text;
+  final List<Inline>? inlines;
+  final int citationOrdinal;
 
-  const ReaderFootnote({required this.marker, required this.text});
+  const ReaderFootnote({
+    required this.marker,
+    required this.text,
+    this.inlines,
+    this.citationOrdinal = 0,
+  });
 }
 
 enum ReaderTranslationStatus { off, translating, on, error }
@@ -206,13 +228,320 @@ class ReaderController extends ChangeNotifier {
   final AiSettingsStore aiSettingsStore;
   final OpenAiCompatibleClient translationClient;
   final bool _ownsTranslationClient;
-  final LayoutEngine _engine = LayoutEngine(
+  final SemanticLayoutService Function(
+    AiProviderConfig,
+    String,
+    ReasoningEffort,
+  )
+  _semanticServiceFactory;
+
+  static SemanticLayoutService _newSemanticService(
+    AiProviderConfig provider,
+    String model,
+    ReasoningEffort effort,
+  ) => SemanticLayoutService(provider, model, reasoningEffort: effort);
+  final FormulaRasterizer _formulaRasterizer = FormulaRasterizer();
+  late final LayoutEngine _engine = LayoutEngine(
     hyphenator: EnglishHyphenator.instance,
+    formulaResolver: _formulaRasterizer.lookup,
   );
 
   BookSource? _source;
   BookSource? _resourceSource;
   TranslationBookSource? _translationSource;
+  SemanticLayoutBookSource? _semanticSource;
+  AiSettings? _semanticSettings;
+  SemanticLayoutService? _semanticJob;
+  Timer? _semanticTimer;
+  int _semanticEpoch = 0;
+  int? _semanticTarget;
+  final Set<(int, String)> _semanticAttempted = {};
+  final Map<int, SemanticPlan> _semanticPlans = {};
+  final Set<int> _semanticImageUnavailable = {};
+  final Set<(int, String)> _semanticFailures = {};
+  String? _semanticIdentity;
+  SemanticBatch? _semanticBatch;
+  int? _semanticPreparing;
+  String? semanticLayoutError;
+  bool get semanticLayoutRunning => _semanticJob != null;
+
+  void _cancelSemantic() {
+    _semanticEpoch++;
+    _semanticPreparing = null;
+    _semanticBatch = null;
+    _semanticTimer?.cancel();
+    _semanticJob?.cancel();
+    _semanticJob = null;
+    _semanticTarget = null;
+  }
+
+  Future<void> reloadSemanticLayout() async {
+    if (_disposed || _format == BookFormat.pdf) return;
+    _cancelSemantic();
+    final epoch = _semanticEpoch;
+    _semanticSettings = null;
+    final settings = await aiSettingsStore.load();
+    if (_disposed || epoch != _semanticEpoch) return;
+    _semanticSettings = settings;
+    final selection = settings.semanticLayout,
+        provider = settings.provider(settings.semanticLayout.providerId);
+    final identity = jsonEncode([
+      _resourceSource?.book.id,
+      selection.toJson(),
+      provider?.baseUrl,
+      provider?.models,
+      provider?.apiKey,
+    ]);
+    if (identity == _semanticIdentity) {
+      _semanticAttempted.removeAll(_semanticFailures);
+      _semanticFailures.clear();
+      _semanticImageUnavailable.clear();
+      semanticLayoutError = null;
+      _queueSemantic();
+      _scheduleTranslationRefresh();
+      return;
+    }
+    _semanticIdentity = identity;
+    _semanticFailures.clear();
+    _semanticAttempted.clear();
+    _semanticPlans.clear();
+    _semanticImageUnavailable.clear();
+    semanticLayoutError = null;
+    final overlay = _semanticSource;
+    if (overlay != null) {
+      for (final index in overlay.annotations.keys) {
+        _translationSource?.invalidateBlocks(
+          index,
+          overlay.annotations[index]!.$2
+              .where(
+                (g) => const {
+                  'citation',
+                  'text_formula',
+                  'image_formula',
+                }.contains(g['kind']),
+              )
+              .map((g) => g['block'] as int)
+              .toSet(),
+        );
+        _sectionRevisions[index] = (_sectionRevisions[index] ?? 0) + 1;
+        _paginations.remove(index);
+        _translationDirty.add(index);
+      }
+      overlay.annotations.clear();
+    }
+    _scheduleTranslationRefresh();
+    _queueSemantic();
+  }
+
+  Set<int> _visibleSemanticBlocks(SemanticPlan plan) {
+    final nodes = <String>{};
+    final images = <String>{};
+    for (final item in currentPage?.items ?? []) {
+      switch (item) {
+        case TextPlacement(:final nodeId, :final source):
+          nodes.add(source?.start.node ?? nodeId);
+        case TableCellPlacement(:final nodeId, :final source):
+          nodes.add(source?.start.node ?? nodeId);
+        case ImagePlacement(:final href):
+          images.add(href);
+        default:
+          break;
+      }
+    }
+    if (currentPage?.firstAnchor case final anchor?) nodes.add(anchor.node);
+    return plan.visibleBlocks(nodes, images);
+  }
+
+  bool get _semanticVisiblePending {
+    if (_semanticSettings?.semanticLayout.enabled != true ||
+        _format == BookFormat.pdf ||
+        semanticLayoutError != null) {
+      return false;
+    }
+    final plan = _semanticPlans[sectionIndex];
+    if (plan == null) return true;
+    final visible = _visibleSemanticBlocks(plan);
+    return plan.batches.any(
+      (batch) =>
+          visible.any(batch.contains) &&
+          !_semanticAttempted.contains((sectionIndex, batch.key)),
+    );
+  }
+
+  void _queueSemantic() {
+    final settings = _semanticSettings;
+    if (_disposed ||
+        !opened ||
+        !_readerVisible ||
+        busy ||
+        _pageTurnActive ||
+        _format == BookFormat.pdf ||
+        settings == null ||
+        !settings.semanticLayout.enabled) {
+      return;
+    }
+    final selection = settings.semanticLayout;
+    final provider = settings.provider(selection.providerId);
+    if (provider == null ||
+        !provider.models.contains(selection.model) ||
+        provider.baseUrl.isEmpty ||
+        provider.apiKey.isEmpty) {
+      semanticLayoutError = 'AI layout model unavailable';
+      return;
+    }
+    final target = sectionIndex;
+    final plan = _semanticPlans[target];
+    if (plan == null) {
+      if (_semanticPreparing == target) return;
+      _cancelSemantic();
+      _semanticPreparing = target;
+      final epoch = _semanticEpoch;
+      final source = _resourceSource;
+      if (source == null) {
+        _semanticPreparing = null;
+        return;
+      }
+      unawaited(() async {
+        try {
+          final section = await source.parseSection(target);
+          final fragments = <String>{};
+          void collect(List<TocEntry> entries) {
+            for (final entry in entries) {
+              final (path, fragment) = splitPackageFragment(entry.href);
+              if (path == section.href && fragment != null) {
+                fragments.add(fragment);
+              }
+              collect(entry.children);
+            }
+          }
+
+          collect(_derivedToc.isNotEmpty ? _derivedToc : source.book.toc);
+          final nodes = {
+            for (final anchor in section.anchors)
+              if (fragments.contains(anchor.fragment)) anchor.source.node,
+          };
+          final prepared = await _prepareSemanticPlanInWorker(section, nodes);
+          if (_disposed || epoch != _semanticEpoch) return;
+          _semanticPlans[target] = prepared;
+        } catch (_) {
+          if (epoch == _semanticEpoch) {
+            semanticLayoutError =
+                'AI layout unavailable; original layout retained';
+          }
+        } finally {
+          if (epoch == _semanticEpoch) {
+            _semanticPreparing = null;
+            if (_semanticPlans.containsKey(target)) _queueSemantic();
+            _queueVisibleTranslation();
+          }
+        }
+      }());
+      return;
+    }
+    final visible = _visibleSemanticBlocks(plan);
+    final demand = demandedSemanticBatches(plan.batches, visible);
+    final pending = demand
+        .where((batch) => !_semanticAttempted.contains((target, batch.key)))
+        .toList();
+    final active = _semanticBatch;
+    if (_semanticJob != null || _semanticTimer?.isActive == true) {
+      if (_semanticTarget == target &&
+          active != null &&
+          demand.any(active.sameSubsection)) {
+        return;
+      }
+      if (pending.isEmpty) {
+        return; // No replacement work: allow the job to finish.
+      }
+      _cancelSemantic();
+    }
+    if (pending.isEmpty) return;
+    final batch = pending.first;
+    _semanticTarget = target;
+    _semanticBatch = batch;
+    _semanticTimer = Timer(const Duration(milliseconds: 350), () async {
+      if (_disposed || !_readerVisible || _pageTurnActive || busy) return;
+      final epoch = _semanticEpoch;
+      final overlay = _semanticSource;
+      if (overlay == null) return;
+      final job = _semanticServiceFactory(
+        provider,
+        selection.model,
+        selection.reasoningEffort,
+      );
+      if (!_semanticImageUnavailable.contains(target)) {
+        job.resource = _resourceSource!.resource;
+      }
+      job.validateFormulaRender = (formula) async =>
+          await _formulaRasterizer.render(formula, _style.foreground) == null
+          ? 'Formula rendering exceeds supported geometry'
+          : null;
+      _semanticJob = job;
+      try {
+        final groups = await job.recognize(
+          plan.section,
+          _resourceSource!.book.id.toString(),
+          batches: [batch],
+        );
+        if (_disposed || epoch != _semanticEpoch) return;
+        _semanticAttempted.add((target, batch.key));
+        final previous = overlay.annotations[target]?.$2 ?? <SemanticGroup>[];
+        if (groups.isNotEmpty) {
+          final merged = validateGroups(plan.section, [...previous, ...groups]);
+          if (!listEquals(
+            previous.map(jsonEncode).toList(),
+            merged.map(jsonEncode).toList(),
+          )) {
+            overlay.annotations[target] = (plan.section, merged);
+            _translationSource?.invalidateBlocks(
+              target,
+              groups
+                  .where(
+                    (g) => const {
+                      'citation',
+                      'text_formula',
+                      'image_formula',
+                    }.contains(g['kind']),
+                  )
+                  .map((g) => g['block'] as int)
+                  .toSet(),
+            );
+            _sectionRevisions[target] = (_sectionRevisions[target] ?? 0) + 1;
+            _paginations.remove(target);
+            _translationDirty.add(target);
+          }
+        }
+        for (final index in _semanticPlans.keys.toList()) {
+          if ((index - sectionIndex).abs() <= 2) continue;
+          _semanticPlans.remove(index);
+          overlay.annotations.remove(index);
+          _semanticAttempted.removeWhere((key) => key.$1 == index);
+        }
+        semanticLayoutError = null;
+      } catch (_) {
+        if (!_disposed && epoch == _semanticEpoch) {
+          _semanticAttempted.add((target, batch.key));
+          _semanticFailures.add((target, batch.key));
+          semanticLayoutError =
+              'AI layout unavailable; original layout retained';
+        }
+      } finally {
+        if (epoch == _semanticEpoch && job.imageInputUnavailable) {
+          _semanticImageUnavailable.add(target);
+        }
+        job.cancel();
+        if (identical(_semanticJob, job)) {
+          _semanticJob = null;
+          _semanticTarget = null;
+          _semanticBatch = null;
+          _queueVisibleTranslation();
+          _scheduleTranslationRefresh();
+          notifyListeners();
+        }
+      }
+    });
+  }
+
   BookFormat? _format;
   LayoutViewport _viewport = const LayoutViewport(width: 0, height: 0);
   ReaderStyle _style = const ReaderStyle();
@@ -240,6 +569,7 @@ class ReaderController extends ChangeNotifier {
       !busy &&
       _format == BookFormat.epub &&
       _activeAiSettings == null &&
+      _semanticSettings?.semanticLayout.enabled != true &&
       !translationEnabled &&
       !_translationRefreshing &&
       !_progressDirty &&
@@ -247,12 +577,16 @@ class ReaderController extends ChangeNotifier {
 
   void setReaderVisible(bool visible) {
     if (_disposed) return;
+    final wasVisible = _readerVisible;
     _readerVisible = visible;
     _pageTurnActive = false;
     if (!visible) {
+      _cancelSemantic();
       _translationRefreshTimer?.cancel();
       _saveTimer?.cancel();
     } else {
+      if (!wasVisible) unawaited(reloadSemanticLayout());
+      _queueSemantic();
       _scheduleTranslationRefresh();
     }
   }
@@ -319,6 +653,7 @@ class ReaderController extends ChangeNotifier {
     if (active) {
       _translationRefreshTimer?.cancel();
     } else {
+      _queueSemantic();
       _scheduleTranslationRefresh();
       if (_translationRecheckPending) _queueVisibleTranslation();
     }
@@ -335,8 +670,9 @@ class ReaderController extends ChangeNotifier {
   void _scheduleTranslationRefresh() {
     _translationRefreshTimer?.cancel();
     if (!_readerVisible ||
-        !translationEnabled ||
         _translationDirty.isEmpty ||
+        _translationInFlight ||
+        _semanticVisiblePending ||
         _pageTurnActive ||
         _translationRefreshing) {
       return;
@@ -349,7 +685,8 @@ class ReaderController extends ChangeNotifier {
   Future<void> _applyTranslationUpdates() async {
     if (!_readerVisible ||
         !opened ||
-        !translationEnabled ||
+        _translationInFlight ||
+        _semanticVisiblePending ||
         _pageTurnActive ||
         _translationRefreshing) {
       return;
@@ -432,10 +769,13 @@ class ReaderController extends ChangeNotifier {
     this.publicationIdHint,
     AiSettingsStore? aiSettingsStore,
     OpenAiCompatibleClient? translationClient,
+    SemanticLayoutService Function(AiProviderConfig, String, ReasoningEffort)?
+    semanticServiceFactory,
   }) : progressStore = progressStore ?? ProgressStore(),
        aiSettingsStore = aiSettingsStore ?? AiSettingsStore(),
        translationClient = translationClient ?? OpenAiCompatibleClient(),
-       _ownsTranslationClient = translationClient == null;
+       _ownsTranslationClient = translationClient == null,
+       _semanticServiceFactory = semanticServiceFactory ?? _newSemanticService;
 
   Book get _book => _source!.book;
 
@@ -500,7 +840,8 @@ class ReaderController extends ChangeNotifier {
   }
 
   /// Synchronous image resolver handed to the render stage.
-  ui.Image? resolveImage(String href) => _images[href];
+  ui.Image? resolveImage(String href) =>
+      _formulaRasterizer.image(href) ?? _images[href];
 
   /// Opens [file], restores the saved position (if any), and paginates the
   /// starting section. Throws when the file is not a readable e-book.
@@ -545,9 +886,18 @@ class ReaderController extends ChangeNotifier {
     }
     _resourceSource = source;
     final sourceMilliseconds = openingWatch.elapsedMilliseconds;
-    final translationSource = TranslationBookSource(source);
+    final annotations = <int, (Section, List<SemanticGroup>)>{};
+    final preparedSource = SemanticLayoutBookSource(
+      source,
+      annotations: annotations,
+      inlineOnly: true,
+    );
+    final translationSource = TranslationBookSource(preparedSource);
     _translationSource = translationSource;
-    _source = translationSource;
+    _source = _semanticSource = SemanticLayoutBookSource(
+      translationSource,
+      annotations: annotations,
+    );
     _style = style.copyWith(
       writingSystem: _book.metadata.writingSystem,
       publicationLanguage: _preferredHyphenationLanguage(
@@ -613,6 +963,7 @@ class ReaderController extends ChangeNotifier {
     // Generated/OCR TOC metadata is optional for the first paint. Load it
     // after the page is visible so a large metadata file cannot delay opening.
     unawaited(_loadDerivedToc(source, file.parent));
+    unawaited(reloadSemanticLayout());
   }
 
   Future<void> _loadDerivedToc(
@@ -742,11 +1093,15 @@ class ReaderController extends ChangeNotifier {
 
   void _queueVisibleTranslation() {
     if (!translationEnabled || !_readerVisible || _disposed) return;
+    if (_semanticVisiblePending) {
+      _translationRecheckPending = true;
+      _queueSemantic();
+      if (_semanticVisiblePending) return;
+    }
     if (_translationInFlight ||
         busy ||
         _pageTurnActive ||
-        _translationRefreshing ||
-        _translationDirty.contains(sectionIndex)) {
+        _translationRefreshing) {
       _translationRecheckPending = true;
       _scheduleTranslationRefresh();
       return;
@@ -795,6 +1150,7 @@ class ReaderController extends ChangeNotifier {
         if (requestedSection == null || blocks == null) return;
         if (generation != _translationGeneration || !translationEnabled) return;
         requested = true;
+        final semanticRevision = _sectionRevisions[requestedSection];
         notifyListeners();
         final translation = settings.translation;
         final provider = settings.provider(translation.providerId)!;
@@ -811,6 +1167,10 @@ class ReaderController extends ChangeNotifier {
               source.validateBatch(requestedSection!, translations),
         );
         if (generation != _translationGeneration || !translationEnabled) return;
+        if (semanticRevision != _sectionRevisions[requestedSection]) {
+          _translationRecheckPending = true;
+          return;
+        }
         await source.storeBatch(requestedSection, results);
         if (generation != _translationGeneration || !translationEnabled) return;
         succeeded = true;
@@ -832,6 +1192,7 @@ class ReaderController extends ChangeNotifier {
       } finally {
         if (generation == _translationGeneration) {
           _translationInFlight = false;
+          _scheduleTranslationRefresh();
           if (requested) notifyListeners();
           if ((succeeded ||
                   _translationRecheckPending ||
@@ -1123,13 +1484,18 @@ class ReaderController extends ChangeNotifier {
     _peekPreparing = true;
     try {
       var paginatedAny = false;
-      for (final direction in const [-1, 1]) {
+      final directions = _format == BookFormat.pdf
+          ? const [1, -1]
+          : const [-1, 1];
+      for (final direction in directions) {
         while (true) {
           final section = _peekCoordinate(direction).$1;
           if (section < 0 || _sections.containsKey(section)) break;
           await _paginate(section);
-          if (_pageTurnActive || !opened) break;
+          if (_disposed || _pageTurnActive || !opened || !_readerVisible) break;
           paginatedAny = true;
+          // Let the ready PDF neighbour paint before preparing the other side.
+          if (_format == BookFormat.pdf) notifyListeners();
           // If the section was empty, _peekCoordinate now skips it and the
           // loop prepares the next candidate as well.
         }
@@ -1264,7 +1630,57 @@ class ReaderController extends ChangeNotifier {
     return ReaderFootnote(
       marker: link.marker,
       text: _withoutFootnoteMarker(text.trim(), link.marker),
+      inlines: section.blocks
+          .expand(blockTexts)
+          .where(
+            (b) => (b.source?.start.node ?? b.nodeId) == anchor.source.node,
+          )
+          .firstOrNull
+          ?.inlines,
     );
+  }
+
+  Future<List<ReaderFootnote>> referenceNotes(TextLinkRange selected) async {
+    List<TextLinkRange>? owner;
+    for (final item in currentPage?.items ?? <PageItem>[]) {
+      final links = switch (item) {
+        TextPlacement(:final links) ||
+        TableCellPlacement(:final links) => links,
+        _ => <TextLinkRange>[],
+      };
+      if (links.contains(selected)) {
+        owner = links;
+        break;
+      }
+    }
+    final links = (owner ?? [selected])
+        .where(
+          (link) =>
+              !link.websiteIcon &&
+              (link.footnoteIcon || link.role == LinkRole.footnoteReference),
+        )
+        .toList();
+    links.sort(
+      (a, b) => a.citationOrdinal > 0 && b.citationOrdinal == 0
+          ? 1
+          : a.citationOrdinal == 0 && b.citationOrdinal > 0
+          ? -1
+          : a.start.compareTo(b.start),
+    );
+    final out = <ReaderFootnote>[];
+    for (final link in links) {
+      final note = link.inlineNote != null
+          ? ReaderFootnote(
+              marker: link.citationOrdinal > 0
+                  ? '[${link.citationOrdinal}]'
+                  : link.marker,
+              text: link.inlineNote!,
+              citationOrdinal: link.citationOrdinal,
+            )
+          : await resolveFootnote(link);
+      if (note != null) out.add(note);
+    }
+    return out;
   }
 
   /// Moves to the adjacent non-empty section, paginating on demand.
@@ -1320,7 +1736,8 @@ class ReaderController extends ChangeNotifier {
   Future<List<PageLayout>> _paginateFresh(int index, int generation) async {
     final revision = _sectionRevisions[index];
     final pages = await _layoutSection(index);
-    if (generation != _paginationGeneration ||
+    if (_disposed ||
+        generation != _paginationGeneration ||
         revision != _sectionRevisions[index]) {
       _disposePages(pages);
       return _sections[index] ?? const [];
@@ -1337,15 +1754,34 @@ class ReaderController extends ChangeNotifier {
     final viewport = _viewport;
     final style = _style;
     final watch = Stopwatch()..start();
-    final section = await source.parseSection(index);
+    final generation = _paginationGeneration;
+    final revision = _sectionRevisions[index];
+    bool cancelled() =>
+        _disposed ||
+        !identical(source, _source) ||
+        generation != _paginationGeneration ||
+        revision != _sectionRevisions[index];
+    ReaderDiagnostics.instance.event('layout.start', {
+      'section': index,
+      'generation': generation,
+      'translated': translationEnabled,
+    });
+    final section = await ReaderDiagnostics.instance.measure(
+      'section.parse',
+      () => source.parseSection(index),
+      {'section': index},
+    );
+    if (cancelled()) return const [];
     await Future.wait([
       _decodeSectionImages(section),
+      _formulaRasterizer.prepare(section, style.foreground),
       EnglishHyphenator.instance.ensureLoadedForSection(
         section,
         publicationLanguage: style.publicationLanguage,
       ),
     ]);
     await Future<void>.delayed(Duration.zero);
+    if (cancelled()) return const [];
     final pages = await _engine.paginateAsync(
       section,
       viewport,
@@ -1357,7 +1793,13 @@ class ReaderController extends ChangeNotifier {
           ? const Duration(milliseconds: 4)
           : const Duration(milliseconds: 10),
       shouldPause: () => opened && (_pageTurnActive || !_readerVisible),
+      shouldCancel: cancelled,
     );
+    ReaderDiagnostics.instance.event('layout.complete', {
+      'section': index,
+      'elapsed_ms': watch.elapsedMilliseconds,
+      'cancelled': cancelled(),
+    });
     if (watch.elapsedMilliseconds >= 32) {
       debugPrint(
         'TortoReader layout section=$index pages=${pages.length} elapsed_ms=${watch.elapsedMilliseconds} translated=$translationEnabled',
@@ -1380,6 +1822,11 @@ class ReaderController extends ChangeNotifier {
     final hrefs = <String>{};
     void collectInlines(List<Inline> inlines) {
       for (final inline in inlines) {
+        if (inline is MathInline &&
+            inline.originalImage != null &&
+            !_images.containsKey(inline.originalImage)) {
+          hrefs.add(inline.originalImage!);
+        }
         if (inline case InlineImageRun(:final image)) {
           if (!_images.containsKey(image.href)) hrefs.add(image.href);
         }
@@ -1396,7 +1843,10 @@ class ReaderController extends ChangeNotifier {
           for (final text in [...body, ?attribution]) {
             collectInlines(text.inlines);
           }
-        case TableBlock(:final rows):
+        case TableBlock(:final rows, :final before, :final after):
+          for (final text in [...before, ...after]) {
+            collectInlines(text.inlines);
+          }
           for (final cell in rows.expand((row) => row.cells)) {
             collectInlines(cell.inlines);
           }
@@ -1420,30 +1870,44 @@ class ReaderController extends ChangeNotifier {
 
     section.blocks.forEach(collectBlock);
     if (hrefs.isEmpty) return;
-    await Future.wait(
-      hrefs.map((href) async {
+    final decodeDimension = math.min(
+      2048,
+      math.max(1, math.sqrt(24 * 1024 * 1024 / (4 * hrefs.length)).floor()),
+    );
+    for (final href in hrefs) {
+      if (_disposed) return;
+      await (() async {
         try {
           final source = _resourceSource!;
           if (source is RasterResourceSource) {
             final rasterSource = source as RasterResourceSource;
             _images[href] = await rasterSource.rasterResource(
               href,
-              maxDimension: 2048,
+              maxDimension: decodeDimension,
             );
           } else {
             final bytes = await source.resource(href);
             _images[href] = bytes == null
                 ? null
-                : await _decodeReaderImage(bytes);
+                : await _decodeReaderImage(
+                    bytes,
+                    maxDimension: decodeDimension,
+                  );
           }
         } catch (error, stackTrace) {
           debugPrint(
             'Could not decode reader image $href: $error\n$stackTrace',
           );
+          if (_resourceSource is PdfBookSource) rethrow;
           _images[href] = null; // missing or undecodable: render without it
         }
-      }),
-    );
+      })();
+      if (_disposed) {
+        _images.remove(href)?.dispose();
+        return;
+      }
+      await Future<void>.delayed(Duration.zero);
+    }
   }
 
   ui.Size? _imageSize(String href) {
@@ -1452,8 +1916,10 @@ class ReaderController extends ChangeNotifier {
     return ui.Size(image.width.toDouble(), image.height.toDouble());
   }
 
-  static Future<ui.Image> _decodeReaderImage(Uint8List bytes) async {
-    const maxDimension = 2048;
+  static Future<ui.Image> _decodeReaderImage(
+    Uint8List bytes, {
+    int maxDimension = 2048,
+  }) async {
     final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
     // instantiateImageCodecWithSize takes ownership of [buffer] and disposes
     // it after creating the codec. Disposing it again here makes a successful
@@ -1495,7 +1961,18 @@ class ReaderController extends ChangeNotifier {
       for (final pages in _sections.values)
         for (final page in pages)
           for (final item in page.items)
-            if (item is ImagePlacement) item.href,
+            ...switch (item) {
+              ImagePlacement(:final href, :final originalImage) => [
+                href,
+                ?originalImage,
+              ],
+              TextPlacement(:final inlineImages, :final links) ||
+              TableCellPlacement(:final inlineImages, :final links) => [
+                for (final image in inlineImages) image.href,
+                for (final link in links) ?link.originalImage,
+              ],
+              _ => const <String>[],
+            },
     };
     final staleImages = _images.keys
         .where((href) => !retainedImages.contains(href))
@@ -1573,11 +2050,16 @@ class ReaderController extends ChangeNotifier {
 
   @override
   void notifyListeners() {
-    if (!_disposed) super.notifyListeners();
+    if (!_disposed) {
+      super.notifyListeners();
+      _queueSemantic();
+    }
   }
 
   @override
   void dispose() {
+    _formulaRasterizer.dispose();
+    _cancelSemantic();
     if (_disposed) return;
     _disposed = true;
     opened = false;
@@ -1733,7 +2215,10 @@ void _visitBlockText(
       for (final text in [...body, ?attribution]) {
         visit(text.source?.start.node ?? text.nodeId, text.inlines);
       }
-    case TableBlock(:final rows):
+    case TableBlock(:final rows, :final before, :final after):
+      for (final text in [...before, ...after]) {
+        visit(text.source?.start.node ?? text.nodeId, text.inlines);
+      }
       for (final cell in rows.expand((row) => row.cells)) {
         visit(cell.source?.start.node ?? cell.nodeId, cell.inlines);
       }
@@ -1765,6 +2250,11 @@ String? _textForSourceNodeInBlocks(List<Block> blocks, String nodeId) {
           return _readableInlineText(block.inlines);
         }
       case TableBlock():
+        final attached = _textForSourceNodeInBlocks([
+          ...block.before,
+          ...block.after,
+        ], nodeId);
+        if (attached != null) return attached;
         for (final row in block.rows) {
           for (final cell in row.cells) {
             if (cell.nodeId == nodeId) return _readableInlineText(cell.inlines);
@@ -1800,8 +2290,17 @@ String _readableInlineText(List<Inline> inlines) {
         if (style.linkRole != LinkRole.footnoteBacklink) buffer.write(text);
       case BreakInline():
         buffer.write('\n');
-      case MathInline(:final latex):
-        buffer.write(latex);
+      case MathInline(
+        :final latex,
+        :final original,
+        :final originalImage,
+        :final sourceText,
+      ):
+        if (original != null) {
+          buffer.write(sourceText);
+        } else if (originalImage == null) {
+          buffer.write(latex);
+        }
       case InlineImageRun():
         break;
     }

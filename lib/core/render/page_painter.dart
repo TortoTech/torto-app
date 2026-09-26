@@ -74,14 +74,17 @@ class PagePainter extends CustomPainter {
             item.width,
             item.height,
           );
-          canvas.drawRRect(
-            ui.RRect.fromRectAndRadius(rect, const ui.Radius.circular(3)),
-            Paint()..color = color.withAlpha(8),
-          );
+          // Match the desktop accent, without tinting the quote's background.
+          // Continuations extend to the page edge instead of restarting inset.
+          final inset = math.min(8.0, rect.height * 0.2);
+          final top = item.continuedBefore ? rect.top : rect.top + inset;
+          final bottom = item.continuedAfter
+              ? rect.bottom
+              : rect.bottom - inset;
           canvas.drawRRect(
             ui.RRect.fromRectAndRadius(
-              ui.Rect.fromLTWH(rect.left, rect.top, 3, rect.height),
-              const ui.Radius.circular(1.5),
+              ui.Rect.fromLTRB(rect.left + 6, top, rect.left + 10, bottom),
+              const ui.Radius.circular(2),
             ),
             Paint()..color = color,
           );
@@ -261,7 +264,58 @@ void _paintFootnoteIcons(Canvas canvas, List<PageItem> items, Color color) {
           paragraphOffset.dx + box.right,
           paragraphOffset.dy + box.bottom,
         ).intersect(clip);
-        if (!bounds.isEmpty) _drawFootnoteIcon(canvas, bounds, color);
+        if (!bounds.isEmpty) {
+          if (link.websiteIcon) {
+            final center = bounds.center,
+                r = math.min(bounds.width, bounds.height) * .45;
+            final paint = Paint()
+              ..color = color
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 1;
+            canvas.drawCircle(center, r, paint);
+            canvas.drawOval(
+              ui.Rect.fromCenter(center: center, width: r, height: r * 2),
+              paint,
+            );
+            canvas.drawLine(
+              center - ui.Offset(r, 0),
+              center + ui.Offset(r, 0),
+              paint,
+            );
+          } else if (link.citationOrdinal > 0) {
+            final builder =
+                ui.ParagraphBuilder(
+                    ui.ParagraphStyle(
+                      fontSize: math.min(bounds.height, 12),
+                      textAlign: ui.TextAlign.left,
+                    ),
+                  )
+                  ..pushStyle(
+                    ui.TextStyle(color: color, fontFamily: 'Literata'),
+                  )
+                  ..addText('[${link.citationOrdinal}]');
+            final paragraph = builder.build()
+              ..layout(const ui.ParagraphConstraints(width: 1000));
+            final scale = math.min(
+              1.0,
+              math.min(
+                bounds.width / paragraph.longestLine,
+                bounds.height / paragraph.height,
+              ),
+            );
+            canvas.save();
+            canvas.translate(bounds.center.dx, bounds.center.dy);
+            canvas.scale(scale);
+            canvas.drawParagraph(
+              paragraph,
+              ui.Offset(-paragraph.longestLine / 2, -paragraph.height / 2),
+            );
+            canvas.restore();
+            paragraph.dispose();
+          } else {
+            _drawFootnoteIcon(canvas, bounds, color);
+          }
+        }
         break;
       }
     }

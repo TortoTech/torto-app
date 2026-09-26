@@ -136,7 +136,10 @@ final class EnglishHyphenator implements ParagraphHyphenator {
       switch (block) {
         case TextBlock(:final inlines):
           collectInlines(inlines);
-        case TableBlock(:final rows):
+        case TableBlock(:final rows, :final before, :final after):
+          for (final text in [...before, ...after]) {
+            collectInlines(text.inlines);
+          }
           for (final row in rows) {
             for (final cell in row.cells) {
               collectInlines(cell.inlines);

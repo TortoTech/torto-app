@@ -142,7 +142,8 @@ class ParagraphOptimizer {
     required double firstLineIndent,
     required double defaultEm,
   }) {
-    if (text.isEmpty ||
+    if (clusters.length > 4096 ||
+        text.isEmpty ||
         clusters.isEmpty ||
         !lineWidth.isFinite ||
         lineWidth <= 0 ||
@@ -244,6 +245,25 @@ class ParagraphOptimizer {
       return ParagraphPlan(lines: lines, adjustments: adjustments);
     }
 
+    // Keep each note with its preceding anchor, including intervening spaces
+    // and adjacent note markers. Explicit newlines were split above.
+    final protectedBreaks = <int>{};
+    for (var index = 1; index < clusters.length; index++) {
+      if (!clusters[index].footnoteReference) continue;
+      var previous = index - 1;
+      while (true) {
+        protectedBreaks.add(clusters[previous].end);
+        final cluster = clusters[previous];
+        if (previous == 0 ||
+            !text
+                .substring(cluster.start, cluster.end)
+                .runes
+                .every(_isBreakableSpace)) {
+          break;
+        }
+        previous--;
+      }
+    }
     final items = <_Item>[];
     for (var index = 0; index < clusters.length; index++) {
       final cluster = clusters[index];
@@ -282,9 +302,12 @@ class ParagraphOptimizer {
       final breakableSpace = source.runes.every(_isBreakableSpace);
       final breakAfter =
           index == clusters.length - 1 ||
-          legalBreaks.contains(cluster.end) ||
-          hyphenBreaks.containsKey(cluster.end);
-      final hyphenWidth = legalBreaks.contains(cluster.end)
+          (!protectedBreaks.contains(cluster.end) &&
+              (legalBreaks.contains(cluster.end) ||
+                  hyphenBreaks.containsKey(cluster.end)));
+      final hyphenWidth =
+          protectedBreaks.contains(cluster.end) ||
+              legalBreaks.contains(cluster.end)
           ? 0.0
           : (hyphenBreaks[cluster.end] ?? 0.0);
       items.add(
@@ -329,6 +352,7 @@ class ParagraphOptimizer {
     final predecessor = List<int?>.filled(breakpoints.length, null);
     final selected = List<_CandidateLine?>.filled(breakpoints.length, null);
     best[0] = 0;
+    var remainingCandidates = 100000;
     for (
       var endCandidate = 1;
       endCandidate < breakpoints.length;
@@ -340,6 +364,7 @@ class ParagraphOptimizer {
         startCandidate >= 0;
         startCandidate--
       ) {
+        if (--remainingCandidates < 0) return null;
         final start = breakpoints[startCandidate];
         if (_cannotFit(
           items,

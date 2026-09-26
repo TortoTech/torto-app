@@ -2,6 +2,11 @@ import 'dart:ui' as ui;
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_math_fork/flutter_math.dart' as fm;
+import '../../core/ir/ir.dart' as ir;
+import '../../core/semantic_layout/web_links.dart';
+import 'reader_controller.dart' show ReaderFootnote;
 
 import '../../core/ir/book.dart';
 import '../../core/layout/layout_types.dart';
@@ -19,6 +24,8 @@ Future<void> showReaderFootnoteSheet(
   String publicationLanguage = '',
   WritingSystem writingSystem = WritingSystem.unknown,
   ReaderTypography typography = const ReaderTypography(),
+  List<ReaderFootnote> entries = const [],
+  int initialCitation = 0,
 }) async {
   await EnglishHyphenator.instance.ensureLoadedForLanguage(publicationLanguage);
   if (!context.mounted) return;
@@ -62,6 +69,8 @@ Future<void> showReaderFootnoteSheet(
         publicationLanguage: publicationLanguage,
         writingSystem: writingSystem,
         typography: typography,
+        entries: entries,
+        initialCitation: initialCitation,
       ),
     ),
   );
@@ -73,6 +82,8 @@ class ReaderFootnoteSheet extends StatelessWidget {
   final String publicationLanguage;
   final WritingSystem writingSystem;
   final ReaderTypography typography;
+  final List<ReaderFootnote> entries;
+  final int initialCitation;
 
   const ReaderFootnoteSheet({
     super.key,
@@ -81,6 +92,8 @@ class ReaderFootnoteSheet extends StatelessWidget {
     this.publicationLanguage = '',
     this.writingSystem = WritingSystem.unknown,
     this.typography = const ReaderTypography(),
+    this.entries = const [],
+    this.initialCitation = 0,
   });
 
   @override
@@ -93,29 +106,137 @@ class ReaderFootnoteSheet extends StatelessWidget {
         width: double.infinity,
         child: SingleChildScrollView(
           padding: const EdgeInsets.fromLTRB(24, 4, 24, 28),
-          child: OptimizedJustifiedText(
-            text,
-            publicationLanguage: publicationLanguage,
-            style: TextStyle(
-              color: foreground,
-              fontFamily: latinFont.family,
-              fontFamilyFallback: [cjkFont.family],
-              fontWeight:
-                  FontWeight.values[((typography.fontWeight / 100).round() - 1)
-                      .clamp(0, 8)],
-              fontVariations: latinFont == ReaderLatinFont.literata
-                  ? [
-                      ui.FontVariation(
-                        'wght',
-                        typography.fontWeight.toDouble(),
-                      ),
-                      const ui.FontVariation('opsz', 12.75),
-                    ]
-                  : null,
-              fontSize: 17,
-              height: 1.55,
-            ),
+          child: entries.isNotEmpty
+              ? _ReferenceRows(entries, initialCitation, foreground)
+              : OptimizedJustifiedText(
+                  text,
+                  publicationLanguage: publicationLanguage,
+                  style: TextStyle(
+                    color: foreground,
+                    fontFamily: latinFont.family,
+                    fontFamilyFallback: [cjkFont.family],
+                    fontWeight:
+                        FontWeight.values[((typography.fontWeight / 100)
+                                    .round() -
+                                1)
+                            .clamp(0, 8)],
+                    fontVariations: latinFont == ReaderLatinFont.literata
+                        ? [
+                            ui.FontVariation(
+                              'wght',
+                              typography.fontWeight.toDouble(),
+                            ),
+                            const ui.FontVariation('opsz', 12.75),
+                          ]
+                        : null,
+                    fontSize: 17,
+                    height: 1.55,
+                  ),
+                ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ReferenceRows extends StatefulWidget {
+  final List<ReaderFootnote> entries;
+  final int selected;
+  final Color color;
+  const _ReferenceRows(this.entries, this.selected, this.color);
+  @override
+  State<_ReferenceRows> createState() => _ReferenceRowsState();
+}
+
+class _ReferenceRowsState extends State<_ReferenceRows> {
+  final selected = GlobalKey();
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final context = selected.currentContext;
+      if (context != null) Scrollable.ensureVisible(context, alignment: .15);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    children: [
+      for (final note in widget.entries)
+        Padding(
+          key: widget.selected > 0 && note.citationOrdinal == widget.selected
+              ? selected
+              : null,
+          padding: const EdgeInsets.only(bottom: 16),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SizedBox(
+                width: 40,
+                child: Text(
+                  note.marker,
+                  style: TextStyle(color: widget.color, fontSize: 15),
+                ),
+              ),
+              Expanded(child: _NoteContent(note, widget.color)),
+            ],
           ),
+        ),
+    ],
+  );
+}
+
+class _NoteContent extends StatelessWidget {
+  final ReaderFootnote note;
+  final Color color;
+  const _NoteContent(this.note, this.color);
+  @override
+  Widget build(BuildContext context) {
+    final inlines = translationInlines(note.inlines ?? []);
+    if (!inlines.any((inline) => inline is ir.MathInline)) {
+      return OptimizedJustifiedText(
+        note.text,
+        style: TextStyle(color: color, fontSize: 17, height: 1.55),
+      );
+    }
+    return LayoutBuilder(
+      builder: (context, constraints) => Text.rich(
+        TextSpan(
+          style: TextStyle(color: color, fontSize: 17, height: 1.55),
+          children: [
+            for (final inline in inlines)
+              if (inline is ir.TextRun)
+                TextSpan(text: inline.text)
+              else if (inline is ir.BreakInline)
+                const TextSpan(text: '\n')
+              else if (inline is ir.MathInline)
+                WidgetSpan(
+                  alignment: PlaceholderAlignment.middle,
+                  child: GestureDetector(
+                    onLongPress: () =>
+                        Clipboard.setData(ClipboardData(text: inline.latex)),
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxWidth: constraints.maxWidth,
+                      ),
+                      child: FittedBox(
+                        fit: BoxFit.scaleDown,
+                        child: fm.Math.tex(
+                          inline.latex,
+                          mathStyle: fm.MathStyle.text,
+                          textStyle: TextStyle(color: color, fontSize: 17),
+                          onErrorFallback: (_) => Text(
+                            inline.sourceText.isEmpty
+                                ? inline.latex
+                                : inline.sourceText,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+          ],
         ),
       ),
     );

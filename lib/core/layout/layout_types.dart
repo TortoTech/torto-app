@@ -430,6 +430,10 @@ class TextLinkRange {
   final String marker;
   final LinkRole role;
   final bool footnoteIcon;
+  final int citationOrdinal;
+  final bool websiteIcon;
+  final String? latex;
+  final String? originalImage;
 
   /// Body of an inline footnote whose authored text was replaced by [footnoteIcon].
   final String? inlineNote;
@@ -441,6 +445,10 @@ class TextLinkRange {
     required this.marker,
     required this.role,
     this.footnoteIcon = false,
+    this.citationOrdinal = 0,
+    this.websiteIcon = false,
+    this.latex,
+    this.originalImage,
     this.inlineNote,
   });
 }
@@ -505,8 +513,15 @@ class ImagePlacement extends PageItem {
 
   /// Destination rectangle on the page, logical px.
   final ui.Rect rect;
+  final String? latex;
+  final String? originalImage;
 
-  const ImagePlacement({required this.href, required this.rect});
+  const ImagePlacement({
+    required this.href,
+    required this.rect,
+    this.latex,
+    this.originalImage,
+  });
 }
 
 /// Positioned thematic break (1 px horizontal rule).
@@ -561,6 +576,17 @@ class PageLayout {
       final ui.Offset paragraphOffset;
       final ui.Rect slice;
       switch (item) {
+        case ImagePlacement(:final latex, :final rect, :final originalImage)
+            when latex != null && rect.contains(position):
+          return TextLinkRange(
+            start: 0,
+            end: 0,
+            href: '',
+            marker: '',
+            role: LinkRole.normal,
+            latex: latex,
+            originalImage: originalImage,
+          );
         case TextPlacement():
           paragraph = item.paragraph;
           links = item.links;
