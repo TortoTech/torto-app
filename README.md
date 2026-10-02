@@ -55,9 +55,19 @@ The implementation is written independently in Dart. Shared concepts and the Web
 | **Unified or authored typography** | Use a consistent reader-controlled layout or follow the book's font sizes, spacing, indentation, alignment, and colors. | ✅ |
 | **Cover-first local library** | Import supported files, extract metadata and covers, resume recently used books first, and remove books with a long press. | ✅ |
 | **Reading navigation** | Turn pages by tap or swipe, browse a hierarchical table of contents, follow the active chapter, and restore durable reading progress. | ✅ |
+| **Subsection Focus Mode** | Swipe between subsections, scroll long ones, activate complete body units, and keep headings normally displayed. | ✅ |
+| **AI layout and translation** | Choose from multiple AI providers, recognize formulas and citations, and optionally remember book terminology with expert translation. | ✅ Optional |
+| **Reading assistant** | Discuss the active passage or search within the book, with streamed answers and optional web search with clickable sources. | ✅ Optional |
+| **PDF discovery** | Inspect pages on demand, retain drafts, and verify AI-discovered contents destinations before applying metadata. | ✅ Optional |
 | **Direct WebDAV sync** | Sync books and reading state directly with Jianguoyun, InfiniCLOUD, Koofr, HiDrive, Yandex Disk, or a custom WebDAV server. | ✅ Optional |
 
 ## Installation
+
+Configure AI providers under **Settings → AI providers** and choose the chat/PDF model under **Settings → Reading assistant**. Web search is off initially. [Focus Mode](docs/focus-mode.md) and the [0.7.1 implementation record](docs/desktop-071-sync-implementation-2026-10-02.md) describe the behavior and verification limits.
+
+See the [desktop prompt and search synchronization record](docs/desktop-prompt-search-implementation-2026-10-02.md) for request compatibility, search routing, assistant tools, PDF discovery, tests, and remaining OCR/update limitations.
+
+The [preview and cached-book performance record](docs/reader-preview-performance-2026-10-02.md) covers the updated overlays, reference markers, and before/after EPUB parsing measurements on the phone.
 
 Signed APKs are published on [GitHub Releases](https://github.com/TortoTech/torto-app/releases). Most Android phones should use the `arm64-v8a` build; the release also includes `armeabi-v7a` and `x86_64` variants.
 
@@ -76,6 +86,7 @@ The APK is written to `build/app/outputs/flutter-apk/app-debug.apk`. The current
 - Cloud sync is disabled until you configure and enable it.
 - WebDAV traffic goes directly from the device to the provider you choose; there is no Torto-operated relay.
 - The WebDAV app password is stored with Android-backed secure storage rather than ordinary preferences.
+- Optional AI requests send the relevant book text or PDF page previews to your selected provider. Enabled third-party search sends search queries to the configured service; AI and search API keys use secure storage.
 - Torto does not contain advertising or analytics code.
 
 ## Development

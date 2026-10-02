@@ -4,12 +4,18 @@ library;
 
 import '../ir/ir.dart';
 
-List<int> inlineDisplayToSource(List<Inline> inlines) {
+List<int> inlineDisplayToSource(
+  List<Inline> inlines, {
+  bool referenceLeading = false,
+}) {
   final map = <int>[0];
   var scalar = 0;
   for (final run in inlines) {
     switch (run) {
-      case TextRun(:final text):
+      case TextRun(:final text, :final style):
+        if (referenceLeading && style.referencePaintOffset != 0) {
+          map.add(scalar);
+        }
         for (final rune in text.runes) {
           if (rune > 0xffff) map.add(scalar);
           map.add(++scalar);

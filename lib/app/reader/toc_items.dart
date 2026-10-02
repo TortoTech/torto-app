@@ -8,6 +8,7 @@ class TocViewItem {
   /// Path-style id of dot-separated sibling indices, e.g. "0/2/1".
   final String id;
   final String label;
+  final String href;
 
   /// Jump target: spine index of the entry's href, when resolvable.
   /// Null marks a pure grouping node (or a dangling href).
@@ -21,6 +22,7 @@ class TocViewItem {
   const TocViewItem({
     required this.id,
     required this.label,
+    this.href = '',
     required this.spineIndex,
     required this.depth,
     required this.ancestors,
@@ -40,6 +42,7 @@ List<TocViewItem> flattenToc(List<TocEntry> entries) {
         TocViewItem(
           id: id,
           label: entry.label,
+          href: entry.href,
           spineIndex: entry.spineIndex,
           depth: depth,
           ancestors: List.unmodifiable(ancestors),
@@ -68,11 +71,21 @@ List<TocViewItem> visibleTocItems(
 ///
 /// torto computes this at fragment-anchor granularity; this v1 matches at
 /// section granularity (see design doc, "后续迭代").
-String? activeTocId(List<TocViewItem> items, int currentSection) {
+String? activeTocId(
+  List<TocViewItem> items,
+  int currentSection, {
+  Set<String>? reachedTargets,
+}) {
   String? best;
   for (final item in items) {
     final spine = item.spineIndex;
-    if (spine != null && spine <= currentSection) best = item.id;
+    if (spine != null &&
+        (spine < currentSection ||
+            spine == currentSection &&
+                (reachedTargets == null ||
+                    reachedTargets.contains(item.href)))) {
+      best = item.id;
+    }
   }
   return best;
 }

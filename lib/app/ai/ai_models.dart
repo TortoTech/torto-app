@@ -1,6 +1,22 @@
 import '../../core/translation/translation_models.dart';
 
-enum AiProviderKind { custom, openAi, deepSeek, openRouter, siliconFlow }
+enum AiProviderKind {
+  custom,
+  openAi,
+  deepSeek,
+  openRouter,
+  siliconFlow,
+  anthropic,
+  gemini,
+  xai,
+  groq,
+  mistral,
+  moonshot,
+  miniMax,
+  zai,
+  ollama,
+  llamaCpp,
+}
 
 extension AiProviderKindDetails on AiProviderKind {
   String get label => switch (this) {
@@ -9,6 +25,16 @@ extension AiProviderKindDetails on AiProviderKind {
     AiProviderKind.deepSeek => 'DeepSeek',
     AiProviderKind.openRouter => 'OpenRouter',
     AiProviderKind.siliconFlow => 'SiliconFlow',
+    AiProviderKind.anthropic => 'Anthropic',
+    AiProviderKind.gemini => 'Gemini',
+    AiProviderKind.xai => 'xAI',
+    AiProviderKind.groq => 'Groq',
+    AiProviderKind.mistral => 'Mistral',
+    AiProviderKind.moonshot => 'Moonshot',
+    AiProviderKind.miniMax => 'MiniMax',
+    AiProviderKind.zai => 'Z.ai',
+    AiProviderKind.ollama => 'Ollama',
+    AiProviderKind.llamaCpp => 'llama.cpp',
   };
 
   String? get defaultBaseUrl => switch (this) {
@@ -17,7 +43,34 @@ extension AiProviderKindDetails on AiProviderKind {
     AiProviderKind.deepSeek => 'https://api.deepseek.com',
     AiProviderKind.openRouter => 'https://openrouter.ai/api/v1',
     AiProviderKind.siliconFlow => 'https://api.siliconflow.cn/v1',
+    AiProviderKind.anthropic => 'https://api.anthropic.com',
+    AiProviderKind.gemini => 'https://generativelanguage.googleapis.com',
+    AiProviderKind.xai => 'https://api.x.ai/v1',
+    AiProviderKind.groq => 'https://api.groq.com/openai/v1',
+    AiProviderKind.mistral => 'https://api.mistral.ai/v1',
+    AiProviderKind.moonshot => 'https://api.moonshot.ai/v1',
+    AiProviderKind.miniMax => 'https://api.minimax.io/v1',
+    AiProviderKind.zai => 'https://api.z.ai/api/paas/v4',
+    AiProviderKind.ollama => 'http://localhost:11434',
+    AiProviderKind.llamaCpp => 'http://localhost:8080/v1',
   };
+
+  bool get requiresApiKey =>
+      this != AiProviderKind.ollama && this != AiProviderKind.llamaCpp;
+  bool matches(String query) =>
+      ('$label ${switch (this) {
+            AiProviderKind.anthropic => 'claude',
+            AiProviderKind.gemini => 'google 谷歌',
+            AiProviderKind.deepSeek => '深度求索',
+            AiProviderKind.moonshot => 'kimi 月之暗面',
+            AiProviderKind.miniMax => '海螺',
+            AiProviderKind.zai => 'glm 智谱',
+            AiProviderKind.siliconFlow => '硅基流动',
+            AiProviderKind.custom => '自定义 openai compatible',
+            _ => '',
+          }}')
+          .toLowerCase()
+          .contains(query.trim().toLowerCase());
 }
 
 class AiProviderConfig {
@@ -33,7 +86,7 @@ class AiProviderConfig {
     this.kind = AiProviderKind.custom,
     required this.name,
     this.baseUrl = '',
-    this.models = const ['gpt-4o-mini'],
+    this.models = const [],
     this.apiKey = '',
   });
 
@@ -77,14 +130,14 @@ class AiProviderConfig {
       kind: kind,
       name: json['name'] as String? ?? kind.label,
       baseUrl: json['base_url'] as String? ?? kind.defaultBaseUrl ?? '',
-      models: models.isEmpty ? const ['gpt-4o-mini'] : models,
+      models: models,
     );
   }
 }
 
 enum TranslationTarget { system, simplifiedChinese, english }
 
-enum ReasoningEffort { defaultLevel, none, minimal, low, medium, high }
+enum ReasoningEffort { defaultLevel, none, minimal, low, medium, high, max }
 
 extension ReasoningEffortDetails on ReasoningEffort {
   String get label => switch (this) {
@@ -94,6 +147,7 @@ extension ReasoningEffortDetails on ReasoningEffort {
     ReasoningEffort.low => 'low',
     ReasoningEffort.medium => 'medium',
     ReasoningEffort.high => 'high',
+    ReasoningEffort.max => 'max',
   };
 
   String? get apiValue => switch (this) {
@@ -103,6 +157,7 @@ extension ReasoningEffortDetails on ReasoningEffort {
 }
 
 class TranslationSettings {
+  final bool expertTranslation;
   final String providerId;
   final String model;
   final TranslationTarget target;
@@ -111,6 +166,7 @@ class TranslationSettings {
   final ReasoningEffort reasoningEffort;
 
   const TranslationSettings({
+    this.expertTranslation = false,
     this.providerId = 'provider-1',
     this.model = 'gpt-4o-mini',
     this.target = TranslationTarget.system,
@@ -120,6 +176,7 @@ class TranslationSettings {
   });
 
   TranslationSettings copyWith({
+    bool? expertTranslation,
     String? providerId,
     String? model,
     TranslationTarget? target,
@@ -127,6 +184,7 @@ class TranslationSettings {
     bool? translateToc,
     ReasoningEffort? reasoningEffort,
   }) => TranslationSettings(
+    expertTranslation: expertTranslation ?? this.expertTranslation,
     providerId: providerId ?? this.providerId,
     model: model ?? this.model,
     target: target ?? this.target,
@@ -136,6 +194,7 @@ class TranslationSettings {
   );
 
   Map<String, dynamic> toJson() => {
+    'expert_translation': expertTranslation,
     'provider_id': providerId,
     'model': model,
     'target': target.name,
@@ -146,6 +205,7 @@ class TranslationSettings {
 
   factory TranslationSettings.fromJson(Map<String, dynamic> json) =>
       TranslationSettings(
+        expertTranslation: json['expert_translation'] == true,
         providerId: json['provider_id'] as String? ?? 'provider-1',
         model: json['model'] as String? ?? 'gpt-4o-mini',
         target: TranslationTarget.values.firstWhere(
@@ -173,7 +233,7 @@ class SemanticLayoutSettings {
     this.enabled = false,
     this.providerId = '',
     this.model = '',
-    this.reasoningEffort = ReasoningEffort.defaultLevel,
+    this.reasoningEffort = ReasoningEffort.none,
   });
   Map<String, dynamic> toJson() => {
     'enabled': enabled,
@@ -187,7 +247,7 @@ class SemanticLayoutSettings {
     model: json['model'] as String? ?? '',
     reasoningEffort: ReasoningEffort.values.firstWhere(
       (value) => value.label == json['reasoning_effort'],
-      orElse: () => ReasoningEffort.defaultLevel,
+      orElse: () => ReasoningEffort.none,
     ),
   );
 }
@@ -275,12 +335,19 @@ class AiSettings {
       normalizedProviders.add(
         provider.copyWith(
           id: id,
-          name: provider.name.trim().isEmpty
+          name:
+              provider.kind != AiProviderKind.custom ||
+                  provider.name.trim().isEmpty
               ? provider.kind.label
               : provider.name.trim(),
           baseUrl: provider.baseUrl.trim(),
-          models: models.isEmpty ? const ['gpt-4o-mini'] : models,
+          models: models,
         ),
+      );
+    }
+    if (normalizedProviders.isEmpty) {
+      normalizedProviders.add(
+        const AiProviderConfig(id: 'provider-1', name: 'Custom'),
       );
     }
     final selected =
@@ -294,7 +361,7 @@ class AiSettings {
     );
     final model = provider.models.contains(translation.model)
         ? translation.model
-        : provider.models.first;
+        : provider.models.firstOrNull ?? '';
     return AiSettings(
       providers: normalizedProviders,
       translation: translation.copyWith(providerId: selected, model: model),

@@ -272,7 +272,7 @@ void main() {
     final s = parseSection(
       '<p>How reading develops</p><p>${'word ' * 40}</p><p>Formula <span class="math">x</span></p>',
     );
-    expect(headingCandidate(s.blocks[0]), isTrue);
+    expect(headingCandidate(s.blocks[0]), isFalse);
     expect(headingCandidate(s.blocks[1]), isFalse);
     expect(headingCandidate(s.blocks[2]), isFalse);
   });

@@ -43,7 +43,8 @@ void main() {
       const viewport = LayoutViewport(width: 411, height: 700);
       const style = ReaderStyle(focusMode: true);
       await controller.open(file, viewport, style);
-      expect(controller.currentPage!.focusUnits.length, 2);
+      expect(controller.currentPages, hasLength(1));
+      expect(controller.currentPage!.focusUnits.length, 4);
       controller.activateFocusUnit(1);
       final shortAnchor = controller.readingAnchor!;
       await controller.updateStyle(style.copyWith(baseFontSize: 22));
@@ -56,7 +57,6 @@ void main() {
         controller.currentPages.first.focusUnits[1].sources.first,
       );
       expect(controller.readingAnchor!.node, shortAnchor.node);
-      await controller.nextPage();
       expect(controller.currentPage!.scrollExtent, greaterThan(0));
       controller.scrollFocus(controller.currentPage!.scrollExtent / 2);
       final anchor = controller.readingAnchor!;
@@ -66,7 +66,7 @@ void main() {
         controller.readingAnchor!.textOffset,
         closeTo(anchor.textOffset, 80),
       );
-      expect(controller.currentPage!.focusUnits, hasLength(1));
+      expect(controller.currentPage!.focusUnits, hasLength(4));
       await controller.updateStyle(style.copyWith(baseFontSize: 23));
       expect(controller.readingAnchor!.node, anchor.node);
       expect(

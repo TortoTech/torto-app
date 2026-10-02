@@ -65,10 +65,14 @@ void main() {
       const LayoutViewport(width: 400, height: 700),
       const ReaderStyle(),
     );
+    controller.prepareReaderImages([controller.currentPage!], 3);
+    await waitForImage(controller, 'image0.png');
     expect(controller.resolveImage('image0.png'), isNotNull);
     await controller.goToSection(1);
     expect(controller.resolveImage('image0.png'), isNotNull);
     await controller.goToSection(3);
+    controller.prepareReaderImages([controller.currentPage!], 3);
+    await waitForImage(controller, 'image3.png');
     expect(controller.resolveImage('image3.png'), isNotNull);
     expect(controller.resolveImage('image0.png'), isNull);
   });
@@ -108,6 +112,8 @@ void main() {
         );
       }
       for (final placement in imagePlacements) {
+        controller.prepareReaderImages([page], 3);
+        await waitForImage(controller, placement.href);
         expect(
           controller.resolveImage(placement.href),
           isNotNull,
@@ -142,5 +148,11 @@ void main() {
       rendered.dispose();
       picture.dispose();
     });
+  }
+}
+
+Future<void> waitForImage(ReaderController controller, String href) async {
+  for (var i = 0; i < 200 && controller.resolveImage(href) == null; i++) {
+    await Future<void>.delayed(const Duration(milliseconds: 10));
   }
 }

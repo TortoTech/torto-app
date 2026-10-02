@@ -9,7 +9,14 @@ class MathText {
   MathText(this.text, this.boundaries, this.protected);
 }
 
-MathText mathText(TextBlock block) {
+bool _bibliographyLink(TextRun run) =>
+    run.link != null &&
+    RegExp(
+      r'(?:#|/)(?:bib|cite|ref)|bibliograph|references',
+      caseSensitive: false,
+    ).hasMatch(run.link!);
+
+MathText mathText(TextBlock block, {bool allowBibliographicLinks = false}) {
   final text = StringBuffer();
   final boundaries = <int, int>{0: 0};
   final protected = <(int, int)>[];
@@ -17,7 +24,8 @@ MathText mathText(TextBlock block) {
   for (final inline in block.inlines) {
     if (inline is TextRun) {
       final start = offset;
-      if (inline.link != null ||
+      if ((inline.link != null &&
+              !(allowBibliographicLinks && _bibliographyLink(inline))) ||
           inline.style.inlineRole != InlineRole.normal ||
           inline.style.linkRole != LinkRole.normal ||
           inline.style.inlineCitation > 0) {
@@ -53,7 +61,8 @@ MathText mathText(TextBlock block) {
         text.write('</$tag>');
       }
       boundaries[text.length] = offset;
-      if (inline.link != null ||
+      if ((inline.link != null &&
+              !(allowBibliographicLinks && _bibliographyLink(inline))) ||
           inline.style.inlineRole != InlineRole.normal ||
           inline.style.linkRole != LinkRole.normal ||
           inline.style.inlineCitation > 0) {
@@ -91,7 +100,22 @@ List<Map<String, dynamic>> citationCandidates(Section section) {
       final chars = paragraph.plainText.runes.toList();
       final stack = <int>[];
       var start = 0;
-      final encoded = mathText(paragraph);
+      final encoded = mathText(paragraph, allowBibliographicLinks: true);
+      final linkedRanges = <(int, int)>[];
+      var linkedOffset = 0;
+      for (final inline in paragraph.inlines) {
+        final length = inline is TextRun
+            ? inline.text.runes.length
+            : inline is MathInline
+            ? inline.sourceText.runes.length
+            : inline is BreakInline
+            ? 1
+            : 0;
+        if (inline is TextRun && _bibliographyLink(inline)) {
+          linkedRanges.add((linkedOffset, linkedOffset + length));
+        }
+        linkedOffset += length;
+      }
       for (var i = 0; i < chars.length; i++) {
         final c = chars[i];
         const pairs = {40: 41, 91: 93, 0xff08: 0xff09, 0xff3b: 0xff3d};
@@ -120,6 +144,9 @@ List<Map<String, dynamic>> citationCandidates(Section section) {
             'start': start,
             'end': i + 1,
             'text': value,
+            'linked': linkedRanges.any(
+              (range) => range.$1 < i + 1 && start < range.$2,
+            ),
             'before': String.fromCharCodes(
               chars.sublist((start - 120).clamp(0, chars.length), start),
             ),
@@ -133,6 +160,94 @@ List<Map<String, dynamic>> citationCandidates(Section section) {
   }
   return out;
 }
+
+bool localCitation(Map<String, dynamic> candidate) {
+  var value = candidate['text'] as String;
+  const normalize = {
+    '（': '(',
+    '）': ')',
+    '［': '[',
+    '］': ']',
+    '，': ',',
+    '；': ';',
+    '＆': '&',
+    '–': '-',
+    '—': '-',
+    '‑': '-',
+    '：': ':',
+  };
+  normalize.forEach((from, to) => value = value.replaceAll(from, to));
+  value = value.substring(1, value.length - 1).trim();
+  value = value
+      .replaceFirst(RegExp(r'^(?:[Ss]ee |cf\. |e\.g\.,? |参见|例如|见)'), '')
+      .trim();
+  final work = RegExp(
+    r'^(.+?)\s*,?\s+((?:1[0-9]{3}|20[0-9]{2})[a-z]?(?:\s*,\s*(?:1[0-9]{3}|20[0-9]{2})[a-z]?)*)(?:\s*,\s*(?:pp?\.|pages?|页)\s*[0-9]+(?:\s*-\s*[0-9]+)?)?$',
+  );
+  final author = RegExp(
+    r"^(?:[\u4e00-\u9fff]{2,6}|(?:\p{Lu}[\p{L}\p{M}.'’\-]*)(?:\s+(?:(?:van|von|de|del|der|den|da|dos|la|le)\s+)?\p{Lu}[\p{L}\p{M}.'’\-]*){0,4})$",
+    unicode: true,
+  );
+  final excluded = RegExp(
+    r'^(?:figure|fig|table|eq|equation|chapter|appendix|version|born|updated|copyright|january|february|march|april|may|june|july|august|september|october|november|december)\b',
+    caseSensitive: false,
+  );
+  if (value.split(';').every((part) {
+    final match = work.firstMatch(part.trim().replaceAll(',', ', '));
+    if (match == null) return false;
+    final authors = match[1]!
+        .trim()
+        .replaceFirst(RegExp(r',\s*$'), '')
+        .replaceFirst(RegExp(r'(?:\s+et al\.?|等)$'), '')
+        .replaceAll(RegExp(r',\s*(?:&|and)\s*'), '&')
+        .replaceAll(RegExp(r'\s+and\s+|、|与'), '&');
+    return authors
+        .split(RegExp(r'[&,]'))
+        .every(
+          (name) =>
+              author.hasMatch(name.trim()) &&
+              !excluded.hasMatch(name.trim()) &&
+              RegExp(r'[\p{Lu}\u4e00-\u9fff]', unicode: true).hasMatch(name),
+        );
+  })) {
+    return true;
+  }
+  // Numeric brackets require citation cues, avoiding array/index notation.
+  if (!RegExp(
+        r'^[1-9][0-9]{0,3}(?:\s*-\s*[1-9][0-9]{0,3})?(?:\s*,\s*[1-9][0-9]{0,3}(?:\s*-\s*[1-9][0-9]{0,3})?)*$',
+      ).hasMatch(value) ||
+      !RegExp(r'^[\[［]').hasMatch(candidate['text'] as String)) {
+    return false;
+  }
+  for (final part in value.split(',')) {
+    final numbers = part.split('-').map((n) => int.parse(n.trim())).toList();
+    if (numbers.length == 2 && numbers[0] > numbers[1]) return false;
+  }
+  final before = (candidate['before'] as String)
+      .trimRight()
+      .replaceFirst(RegExp(r'[:：]\s*$'), '')
+      .toLowerCase();
+  final context = before.substring(
+    (before.length - 48).clamp(0, before.length),
+  );
+  return !RegExp(
+        r'array|matrix|vector|index|interval|数组|矩阵|向量|索引|区间',
+      ).hasMatch(context) &&
+      (candidate['linked'] == true ||
+          RegExp(
+            r'(?:see|cf\.|refs?\.|references?|studies|文献|参见|参考|见)$',
+          ).hasMatch(before));
+}
+
+List<Map<String, dynamic>> localCitationGroups(Section section) => [
+  for (final candidate in citationCandidates(section))
+    if (localCitation(candidate))
+      {
+        'kind': 'citation',
+        for (final key in ['block', 'paragraph', 'start', 'end', 'text'])
+          key: candidate[key],
+      },
+];
 
 List<Map<String, dynamic>> resolveInlineProposals(
   Section section,

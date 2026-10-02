@@ -5,6 +5,7 @@ import 'package:torto/core/layout/layout_engine.dart';
 import 'package:torto/core/layout/layout_types.dart';
 import 'package:torto/core/layout/focus_layout.dart';
 import 'package:torto/app/reader/focus_reading_state.dart';
+import 'package:torto/app/reader/focus_navigation.dart';
 
 final spine = SpineItemId.generated(0);
 SourceRange range(String node, int length) => SourceRange(
@@ -88,21 +89,22 @@ void main() {
     expect(pages.single.focusUnits, isEmpty);
     expect(pages.single.scrollExtent, 0);
   });
-  test('short blocks pack without splitting or moving when activated', () {
+  test('a subsection stays one logical page without moving on activation', () {
     final blocks = List.generate(
       18,
       (i) => paragraph('n$i', 'A short paragraph.'),
     );
     final pages = layout(blocks);
-    expect(pages.length, greaterThan(1));
+    expect(pages.length, 1);
     expect(pages.first.focusUnits.length, greaterThan(1));
     expect(pages.expand((p) => p.focusUnits).length, blocks.length);
     for (final page in pages) {
-      expect(page.scrollExtent, 0);
-      expect(page.focusUnits.last.bounds.bottom, lessThanOrEqualTo(380.01));
+      expect(page.scrollExtent, greaterThan(0));
     }
     final state = FocusReadingState()..attach(pages.first, 20);
-    final positions = pages.first.items
+    final positions = state
+        .display(pages.first)
+        .items
         .whereType<TextPlacement>()
         .map((t) => t.y)
         .toList();
@@ -120,33 +122,34 @@ void main() {
     expect(state.activate(100), isFalse);
   });
 
-  test('long paragraph owns one scrollable page between short pages', () {
+  test('a long paragraph scrolls with the surrounding subsection', () {
     final pages = layout([
       paragraph('n0', 'Before'),
       paragraph('n1', 'Long text. ' * 250),
       paragraph('n2', 'After'),
     ]);
-    expect(pages.length, 3);
-    final long = pages[1];
-    expect(long.focusUnits.length, 1);
+    expect(pages.length, 1);
+    final long = pages.single;
+    expect(long.focusUnits.length, 3);
     expect(long.scrollExtent, greaterThan(400));
-    final text = long.items.whereType<TextPlacement>().single;
+    final text = long.items.whereType<TextPlacement>().elementAt(1);
     expect(text.startLine, 0);
     expect(text.endLine, text.lineMetrics.length);
     final state = FocusReadingState()..attach(long, 20);
     state.scroll(long.scrollExtent / 2);
+    state.activateVisible();
     final anchor = state.anchor!;
     expect(anchor.textOffset, greaterThan(0));
     expect(
-      state.display(long).items.whereType<TextPlacement>().single.y,
+      state.display(long).items.whereType<TextPlacement>().first.y,
       text.y - state.offset,
     );
-    state.attach(pages.last, 20);
+    state.attach(layout([paragraph('other', 'Other subsection')]).single, 20);
     state.attach(long, 20);
     expect(state.offset, long.scrollExtent / 2);
     expect(state.scroll(double.infinity), isTrue);
     expect(state.offset, long.scrollExtent);
-    expect(state.activate(1), isFalse);
+    expect(state.activate(3), isFalse);
     state.target = anchor;
     state.attach(long, 20);
     expect(state.anchor!.textOffset, closeTo(anchor.textOffset, 60));
@@ -169,11 +172,11 @@ void main() {
         paragraph('d', 'Another root', kind: TextBlockKind.listItem),
       ];
       final groups = FocusUnitBuilder.build(blocks);
-      expect(groups.values.map((b) => b.length), [3, 2, 1]);
+      expect(groups.values.map((b) => b.length), [6]);
       final units = layout(blocks).expand((p) => p.focusUnits).toList();
-      expect(units.length, 3);
+      expect(units.length, 1);
       expect(units.first.anchor!.node, 'a');
-      expect(units[1].contains(range('c', 1).start), isTrue);
+      expect(units[0].contains(range('c', 1).start), isTrue);
     },
   );
 
@@ -197,13 +200,15 @@ void main() {
       after: [paragraph('note', 'Table note')],
     );
     final pages = layout([quote, table, paragraph('after', 'After')]);
-    expect(pages.length, 3);
-    expect(pages[0].focusUnits.length, 1);
+    expect(pages.length, 1);
+    expect(pages[0].focusUnits.length, 3);
     expect(pages[0].items.whereType<QuotePlacement>().length, 1);
-    expect(pages[0].items.whereType<TextPlacement>().last.nodeId, 'author');
-    expect(pages[1].items.whereType<TableCellPlacement>().length, 30);
-    expect(pages[1].items.whereType<TextPlacement>().last.nodeId, 'note');
-    expect(pages[1].scrollExtent, greaterThan(0));
+    expect(
+      pages[0].items.whereType<TextPlacement>().map((p) => p.nodeId),
+      containsAll(['author', 'note', 'after']),
+    );
+    expect(pages[0].items.whereType<TableCellPlacement>().length, 30);
+    expect(pages[0].scrollExtent, greaterThan(0));
   });
 
   test('image caption, hard breaks and trailing heading keep content', () {
@@ -213,13 +218,20 @@ void main() {
       const PageBreakBlock(),
       paragraph('heading', 'Trailing heading', kind: TextBlockKind.heading),
     ]);
-    expect(pages.length, 2);
+    expect(pages.length, 1);
     expect(pages.first.focusUnits.length, 1);
     expect(
       pages.first.focusUnits.single.contains(range('img', 0).start),
       isTrue,
     );
-    expect(pages.last.focusUnits.single.anchor!.node, 'heading');
+    expect(
+      pages.single.items.whereType<TextPlacement>().last.nodeId,
+      'heading',
+    );
+    expect(
+      pages.single.focusUnits.single.contains(range('heading', 1).start),
+      isFalse,
+    );
   });
 
   test(
@@ -232,7 +244,13 @@ void main() {
       final first = layout(blocks);
       final state = FocusReadingState()..backwards = true;
       state.attach(first.last, 20);
-      expect(state.offset, first.last.scrollExtent);
+      expect(
+        state.offset,
+        FocusNavigation.overflow(
+          first.last,
+          first.last.focusUnits.length - 1,
+        )!.bottom,
+      );
       state.scroll(first.last.scrollExtent / 2);
       final anchor = state.anchor!;
       final second = layout(

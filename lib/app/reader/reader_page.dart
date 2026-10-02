@@ -1,12 +1,15 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
-import 'package:flutter/physics.dart';
+import 'focus_navigation.dart';
 import 'dart:ui' show FrameTiming;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../core/ir/text_index.dart';
 import '../sync/sync_models.dart';
 import 'text_selection_layer.dart';
 import 'book_search_page.dart';
+import 'chat_page.dart';
+import 'pdf_discovery_page.dart';
 import '../statistics/reading_tracker.dart';
 import '../statistics/statistics_store.dart';
 import '../statistics/statistics_model.dart';
@@ -16,19 +19,21 @@ import 'system_reader_fonts.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:flutter_math_fork/flutter_math.dart' as fm;
 
 import '../../core/ir/style.dart' show LinkRole;
+import '../../core/ir/ir.dart' show SourceRange;
 import '../../core/layout/layout_types.dart';
 import '../../core/render/page_painter.dart';
 import '../../l10n/app_localizations.dart';
 import '../settings/ai_providers_page.dart';
 import '../settings/app_preferences.dart';
 import 'footnote_sheet.dart';
+import 'media_preview.dart';
 import 'reader_controller.dart';
 import 'reader_preferences_store.dart';
 import 'toc_drawer.dart';
 import 'toc_items.dart';
+import '../ai/reader_book_tools.dart';
 
 /// Full-screen reading view: tap zones / swipe to turn pages, center tap
 /// toggles minimal navigation controls (back on top, contents on the bottom).
@@ -66,7 +71,6 @@ class _ReaderPageState extends State<ReaderPage>
   double _readerWidth = 0;
   AnimationController? _focusMotion;
   bool _focusDragging = false;
-  double _focusDragDistance = 0;
 
   void _stopFocusMotion() {
     _focusMotion?.stop();
@@ -76,10 +80,16 @@ class _ReaderPageState extends State<ReaderPage>
     }
   }
 
+  double _focusDragStart = 0;
+  double _focusDragDistance = 0;
+  int _focusDragUnit = 0;
+
   void _startFocusDrag(DragStartDetails details, ReaderController controller) {
     if (_selecting || controller.busy || _turnPhase != _TurnPhase.idle) return;
     _stopFocusMotion();
     _focusDragging = true;
+    _focusDragStart = controller.focusReading.offset;
+    _focusDragUnit = controller.focusReading.active;
     _focusDragDistance = 0;
     controller.setPageTurnActive(true);
     setState(() => _overlayVisible = false);
@@ -90,52 +100,145 @@ class _ReaderPageState extends State<ReaderPage>
     ReaderController controller,
   ) {
     if (!_focusDragging) return;
-    _focusDragDistance += details.delta.dy;
-    if ((controller.currentPage?.scrollExtent ?? 0) > 0) {
-      controller.scrollFocus(controller.focusReading.offset - details.delta.dy);
-    }
+    _focusDragDistance -= details.delta.dy;
+    final page = controller.currentPage;
+    if (page == null || page.focusUnits.isEmpty) return;
+    final direction = _focusDragDistance >= 0 ? 1 : -1;
+    final destination = FocusNavigation.step(
+      page,
+      _focusDragUnit,
+      _focusDragStart,
+      direction,
+    );
+    final minimum = _focusDragStart < destination.offset
+        ? _focusDragStart
+        : destination.offset;
+    final maximum = _focusDragStart > destination.offset
+        ? _focusDragStart
+        : destination.offset;
+    controller.scrollFocus(
+      (_focusDragStart + _focusDragDistance).clamp(minimum, maximum),
+      trackVisible: false,
+    );
   }
 
   void _endFocusDrag(DragEndDetails details, ReaderController controller) {
     if (!_focusDragging) return;
     _focusDragging = false;
     final page = controller.currentPage;
-    if (page == null || page.scrollExtent <= 0) {
-      if (_focusDragDistance.abs() >= 36) {
-        controller.activateFocusUnit(
-          controller.focusReading.active + (_focusDragDistance < 0 ? 1 : -1),
-        );
-      }
+    if (page == null || page.focusUnits.isEmpty) {
       controller.setPageTurnActive(false);
       return;
     }
     final velocity = -(details.primaryVelocity ?? 0);
-    if (velocity.abs() < 50) {
-      controller.setPageTurnActive(false);
-      return;
+    final commit = _focusDragDistance.abs() >= 36 || velocity.abs() >= 500;
+    final direction = velocity.abs() >= 500
+        ? (velocity > 0 ? 1 : -1)
+        : (_focusDragDistance >= 0 ? 1 : -1);
+    final destination = commit
+        ? FocusNavigation.step(page, _focusDragUnit, _focusDragStart, direction)
+        : (active: _focusDragUnit, offset: _focusDragStart);
+    if (destination.active == _focusDragUnit &&
+        (destination.offset - _focusDragStart).abs() < 1 &&
+        commit) {
+      final atEdge = direction > 0
+          ? _focusDragUnit == page.focusUnits.length - 1
+          : _focusDragUnit == 0;
+      if (atEdge && controller.canPeek(direction)) {
+        unawaited(_turnFocusAtEdge(controller, direction));
+        return;
+      }
+      HapticFeedback.selectionClick();
     }
+    controller.activateFocusUnit(destination.active);
+    _animateFocusTo(controller, destination.offset);
+  }
+
+  Future<void> _turnFocusAtEdge(
+    ReaderController controller,
+    int direction,
+  ) async {
+    try {
+      if (direction > 0) {
+        await controller.nextPage();
+      } else {
+        await controller.prevPage();
+      }
+      if (!mounted) return;
+      final page = controller.currentPage;
+      if (page != null && page.focusUnits.isNotEmpty) {
+        final active = direction > 0 ? 0 : page.focusUnits.length - 1;
+        controller.activateFocusUnit(active);
+        controller.scrollFocus(
+          direction < 0
+              ? FocusNavigation.overflow(page, active)?.bottom ??
+                    FocusNavigation.target(page, active)
+              : FocusNavigation.target(page, active),
+          trackVisible: false,
+        );
+      }
+      _schedulePeekPreparation();
+    } finally {
+      controller.setPageTurnActive(false);
+    }
+  }
+
+  void _animateFocusTo(ReaderController controller, double target) {
+    final page = controller.currentPage;
+    if (page == null) return;
+    final start = controller.focusReading.offset;
     _focusMotion?.dispose();
-    final next = AnimationController.unbounded(vsync: this);
-    _focusMotion = next;
-    next.addListener(() {
+    final motion = AnimationController(
+      vsync: this,
+      duration: FocusNavigation.duration(target - start),
+    );
+    _focusMotion = motion;
+    controller.setPageTurnActive(true);
+    motion.addListener(() {
       if (controller.currentPage != page || _selecting || controller.busy) {
         _stopFocusMotion();
         return;
       }
-      controller.scrollFocus(next.value);
-      if (next.value <= 0 || next.value >= page.scrollExtent) {
-        _stopFocusMotion();
+      controller.scrollFocus(
+        start + (target - start) * Curves.easeInOut.transform(motion.value),
+        trackVisible: false,
+      );
+    });
+    motion.forward().whenCompleteOrCancel(() {
+      if (mounted &&
+          identical(_focusMotion, motion) &&
+          !_focusDragging &&
+          _turnPhase == _TurnPhase.idle) {
+        controller.setPageTurnActive(_selecting);
       }
     });
-    next
-        .animateWith(
-          FrictionSimulation(0.135, controller.focusReading.offset, velocity),
-        )
-        .whenCompleteOrCancel(() {
-          if (mounted && !_focusDragging && _turnPhase == _TurnPhase.idle) {
-            controller.setPageTurnActive(_selecting);
-          }
-        });
+  }
+
+  Offset? _imageTapPosition;
+  Future<void> _openImagePreview(ReaderController controller) async {
+    final position = _imageTapPosition;
+    final page = controller.displayPage;
+    if (position == null || page == null) return;
+    final images = page.items.whereType<ImagePlacement>().where(
+      (image) => image.rect.contains(position),
+    );
+    if (images.isEmpty) return;
+    _stopFocusMotion();
+    final href = images.first.originalImage ?? images.first.href;
+    final texture = controller.imagePreview(href);
+    controller.setPageTurnActive(true);
+    try {
+      await showReaderImagePreview(
+        context,
+        texture,
+        formula: images.first.latex != null,
+      );
+    } finally {
+      try {
+        (await texture)?.dispose();
+      } catch (_) {}
+      if (mounted) controller.setPageTurnActive(_selecting);
+    }
   }
 
   Future<void> _toggleFocusMode() async {
@@ -187,6 +290,7 @@ class _ReaderPageState extends State<ReaderPage>
     int? active,
   }) {
     final selected = active ?? controller.focusReading.active;
+    final unit = page.focusUnits.elementAtOrNull(selected);
     return ClipRect(
       clipper: page.scrollExtent > 0
           ? _FocusContentClipper(_style.marginTop, _style.marginBottom)
@@ -196,29 +300,55 @@ class _ReaderPageState extends State<ReaderPage>
         children: [
           PageWidget(
             page: page,
+            visibleFootnoteBounds: unit == null
+                ? const []
+                : unit.paintBounds.isEmpty
+                ? [unit.bounds]
+                : unit.paintBounds,
             imageResolver: controller.resolveImage,
             background: _background,
             foreground: _foreground,
           ),
           for (var i = 0; i < page.focusUnits.length; i++)
-            Positioned.fromRect(
-              rect: Rect.fromLTRB(
-                0,
-                page.focusUnits[i].bounds.top,
-                page.viewport.width,
-                page.focusUnits[i].bounds.bottom,
-              ),
-              child: IgnorePointer(
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 120),
-                  color: _background.withValues(alpha: i == selected ? 0 : .48),
+            for (final paintRect
+                in page.focusUnits[i].paintBounds.isEmpty
+                    ? [page.focusUnits[i].bounds]
+                    : page.focusUnits[i].paintBounds)
+              Positioned.fromRect(
+                rect: paintRect,
+                child: IgnorePointer(
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 120),
+                    decoration: BoxDecoration(
+                      color: _background.withValues(
+                        alpha: i == selected ? 0 : .48,
+                      ),
+                      border:
+                          i == selected &&
+                              page.items.any(
+                                (item) =>
+                                    (item is ImagePlacement &&
+                                        item.rect.overlaps(paintRect)) ||
+                                    (item is TableCellPlacement &&
+                                        item.rect.overlaps(paintRect)),
+                              )
+                          ? Border.all(
+                              color: _foreground.withValues(alpha: .5),
+                              width: 1.2,
+                            )
+                          : null,
+                    ),
+                  ),
                 ),
               ),
-            ),
-          if (page.focusUnits.length > 1)
+          if (page.focusUnits.length > 1 && selected < page.focusUnits.length)
             Positioned(
               left: 8,
-              top: page.focusUnits[selected].bounds.top + 4,
+              top:
+                  (page.focusUnits[selected].paintBounds.firstOrNull ??
+                          page.focusUnits[selected].bounds)
+                      .top +
+                  4,
               child: IgnorePointer(
                 child: Container(
                   width: 2,
@@ -1046,17 +1176,31 @@ class _ReaderPageState extends State<ReaderPage>
       return;
     }
     final link = controller.displayPage?.linkAt(details.localPosition);
-    if (link != null) {
+    final focusPage = controller.displayPage;
+    final linkedUnit =
+        focusPage?.focusUnits.indexWhere(
+          (unit) => unit.hitTest(details.localPosition),
+        ) ??
+        -1;
+    final inactiveReference =
+        link?.footnoteIcon == true &&
+        focusPage?.focusId != null &&
+        linkedUnit != controller.focusReading.active;
+    if (link != null && !inactiveReference) {
       unawaited(_activateLink(controller, link));
       return;
     }
-    final focusPage = controller.displayPage;
-    if (focusPage != null && focusPage.focusUnits.isNotEmpty) {
+    if (focusPage != null && focusPage.focusId != null) {
       final unit = focusPage.focusUnits.indexWhere(
-        (u) => u.bounds.contains(details.localPosition),
+        (u) => u.hitTest(details.localPosition),
       );
       if (unit >= 0 && unit != controller.focusReading.active) {
+        _stopFocusMotion();
         controller.activateFocusUnit(unit);
+        _animateFocusTo(
+          controller,
+          FocusNavigation.target(controller.currentPage!, unit),
+        );
       } else {
         setState(() => _overlayVisible = !_overlayVisible);
       }
@@ -1081,71 +1225,9 @@ class _ReaderPageState extends State<ReaderPage>
     ReaderController controller,
     TextLinkRange link,
   ) async {
+    _stopFocusMotion();
     if (link.latex != null) {
-      final actionStyle = TextButton.styleFrom(
-        minimumSize: const Size(64, 36),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-        textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-      );
-      await showDialog<void>(
-        context: context,
-        builder: (context) => AlertDialog(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(14),
-          ),
-          contentPadding: const EdgeInsets.fromLTRB(24, 28, 24, 20),
-          actionsPadding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-          buttonPadding: const EdgeInsets.symmetric(horizontal: 2),
-          actionsAlignment: MainAxisAlignment.end,
-          content: SizedBox(
-            width: 500,
-            child: ConstrainedBox(
-              constraints: BoxConstraints(
-                maxHeight: MediaQuery.sizeOf(context).height * .6,
-              ),
-              child: Align(
-                heightFactor: 1,
-                child: InteractiveViewer(
-                  minScale: .5,
-                  maxScale: 8,
-                  child: FittedBox(
-                    fit: BoxFit.scaleDown,
-                    child: fm.Math.tex(
-                      link.latex!,
-                      textStyle: TextStyle(
-                        fontSize: 22,
-                        color: Theme.of(context).colorScheme.onSurface,
-                      ),
-                      onErrorFallback: (_) => Text(link.latex!),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-          actions: [
-            TextButton(
-              style: actionStyle,
-              onPressed: () {
-                Clipboard.setData(ClipboardData(text: link.latex!));
-                Navigator.pop(context);
-              },
-              child: Text(context.l10n.text('复制', 'Copy')),
-            ),
-            TextButton(
-              style: actionStyle.copyWith(
-                foregroundColor: WidgetStatePropertyAll(
-                  Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-              ),
-              onPressed: () => Navigator.pop(context),
-              child: Text(context.l10n.text('关闭', 'Close')),
-            ),
-          ],
-        ),
-      );
+      await showReaderFormulaPreview(context, link.latex!);
       return;
     }
     final url = Uri.tryParse(link.href);
@@ -1185,6 +1267,8 @@ class _ReaderPageState extends State<ReaderPage>
           typography: controller.style.typography,
           entries: entries,
           initialCitation: link.citationOrdinal,
+          initialFootnoteNumber: link.footnoteNumber,
+          markerColor: footnoteIconColor(_background),
         );
       } finally {
         _statisticsFootnote = false;
@@ -1470,7 +1554,7 @@ class _ReaderPageState extends State<ReaderPage>
     final rawNeighbour = controller.peekPage(
       direction == _TurnDirection.next ? 1 : -1,
     );
-    final preview = rawNeighbour != null && rawNeighbour.focusUnits.isNotEmpty
+    final preview = rawNeighbour != null && rawNeighbour.focusId != null
         ? controller.focusReading.preview(
             rawNeighbour,
             backwards: direction == _TurnDirection.previous,
@@ -1478,11 +1562,15 @@ class _ReaderPageState extends State<ReaderPage>
         : null;
     final neighbour = preview?.$1 ?? rawNeighbour;
     final current = controller.displayPage;
+    controller.prepareReaderImages([
+      ?current,
+      ?neighbour,
+    ], MediaQuery.devicePixelRatioOf(context));
     final imageResolver = controller.resolveImage;
 
     Widget page(PageLayout? layout) => layout == null
         ? ColoredBox(color: _background)
-        : layout.focusUnits.isNotEmpty
+        : layout.focusId != null
         ? _focusPageSurface(
             controller,
             layout,
@@ -1505,6 +1593,33 @@ class _ReaderPageState extends State<ReaderPage>
         : _turnFromBookEnd && direction == _TurnDirection.previous
         ? page(current)
         : page(neighbour);
+
+    if (current?.focusId != null &&
+        neighbour?.focusId != null &&
+        !_turnFromBookEnd &&
+        !_turnToBookEnd) {
+      return Stack(
+        clipBehavior: Clip.hardEdge,
+        children: [
+          Positioned(
+            key: const Key('reader-focus-current-slide'),
+            left: offset,
+            top: 0,
+            bottom: 0,
+            width: width,
+            child: currentWidget,
+          ),
+          Positioned(
+            key: const Key('reader-focus-neighbour-slide'),
+            left: offset + (direction == _TurnDirection.next ? width : -width),
+            top: 0,
+            bottom: 0,
+            width: width,
+            child: neighbourWidget,
+          ),
+        ],
+      );
+    }
 
     Widget ridingPage(Widget content, double left) => Positioned(
       key: const Key('reader-turn-moving-page'),
@@ -1667,6 +1782,72 @@ class _ReaderPageState extends State<ReaderPage>
     );
   }
 
+  Future<void> _chat() async {
+    final controller = _controller;
+    if (controller == null || controller.busy) return;
+    _stopFocusMotion();
+    final unit = controller.currentPage?.focusUnits.elementAtOrNull(
+      controller.focusReading.active,
+    );
+    final nodes = await controller.textNodes(controller.sectionIndex);
+    if (!mounted) return;
+    final selected = unit == null
+        ? nodes.take(8)
+        : nodes.where((node) => unit.contains(node.source.start));
+    final excerpt = selected.map((node) => node.text).join('\n');
+    controller.setReaderVisible(false);
+    try {
+      await Navigator.push(
+        context,
+        MaterialPageRoute<void>(
+          builder: (_) => ChatPage(
+            bookId: controller.statisticsBookId,
+            title: controller.title,
+            excerpt: excerpt.substring(0, excerpt.length.clamp(0, 10000)),
+            blockId:
+                unit?.anchor?.toString() ??
+                controller.readingAnchor?.toString() ??
+                '${controller.sectionIndex}',
+            file: widget.file.path,
+            tools: ReaderBookTools(
+              controller,
+              selection: _selectionKey.currentState?.selection,
+            ),
+            onBookReference: (uri) async {
+              Navigator.pop(context);
+              if (uri.host == 'source') {
+                try {
+                  final encoded = uri.queryParameters['range']!;
+                  final range = SourceRange.fromJson(
+                    Map<String, dynamic>.from(
+                      jsonDecode(
+                        utf8.decode(
+                          base64Url.decode(base64Url.normalize(encoded)),
+                        ),
+                      ),
+                    ),
+                  );
+                  await controller.goToTextRange(range);
+                } catch (_) {}
+              } else if (uri.host == 'page') {
+                final index = int.tryParse(uri.queryParameters['unit'] ?? '');
+                if (index != null &&
+                    index >= 0 &&
+                    index < controller.sectionCount) {
+                  await controller.goToSection(index);
+                }
+              } else if (uri.host == 'toc') {
+                await controller.goToHref(uri.queryParameters['href'] ?? '');
+              }
+            },
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) controller.setReaderVisible(true);
+    }
+  }
+
   Widget _buildReaderHeader() => Positioned(
     top: 0,
     left: 0,
@@ -1689,37 +1870,30 @@ class _ReaderPageState extends State<ReaderPage>
                 onPressed: () => Navigator.of(context).maybePop(),
               ),
               const Spacer(),
-              if (_controller?.style.focusMode == true &&
-                  _controller?.focusModeAllowed == true) ...[
+              IconButton(
+                icon: const Icon(Icons.chat_outlined),
+                tooltip: context.l10n.text('阅读助手', 'Reading assistant'),
+                onPressed: _controller == null || _controller!.busy
+                    ? null
+                    : _chat,
+              ),
+              if (_controller?.pdfSource != null)
                 IconButton(
-                  key: const Key('reader-focus-previous-page'),
-                  tooltip: context.l10n.text('上一页', 'Previous page'),
-                  icon: const Icon(Icons.chevron_left),
-                  onPressed: _controller!.busy
-                      ? null
-                      : () {
-                          _stopFocusMotion();
-                          if (_showBookEnd) {
-                            setState(() => _showBookEnd = false);
-                          } else {
-                            _controller!.prevPage().then(
-                              (_) => _schedulePeekPreparation(),
-                            );
-                          }
-                        },
+                  icon: const Icon(Icons.auto_awesome_outlined),
+                  tooltip: context.l10n.text(
+                    '识别 PDF 目录',
+                    'Discover PDF contents',
+                  ),
+                  onPressed: () => Navigator.push(
+                    context,
+                    MaterialPageRoute<void>(
+                      builder: (_) => PdfDiscoveryPage(
+                        controller: _controller!,
+                        booksDirectory: widget.file.parent,
+                      ),
+                    ),
+                  ),
                 ),
-                IconButton(
-                  key: const Key('reader-focus-next-page'),
-                  tooltip: context.l10n.text('下一页', 'Next page'),
-                  icon: const Icon(Icons.chevron_right),
-                  onPressed: _controller!.busy || _showBookEnd
-                      ? null
-                      : () {
-                          _stopFocusMotion();
-                          _nextPageOrEnd(_controller!);
-                        },
-                ),
-              ],
               IconButton(
                 onPressed: _searchBook,
                 icon: Icon(Icons.search, color: _chromeForeground),
@@ -1965,8 +2139,8 @@ class _ReaderPageState extends State<ReaderPage>
                     subtitle: Text(
                       controller.focusModeAllowed
                           ? context.l10n.text(
-                              '上下切换段落或滚动，左右翻页',
-                              'Swipe vertically to focus or scroll; horizontally to turn pages',
+                              '上下滚动当前小节，左右切换小节',
+                              'Scroll within a subsection; swipe horizontally to switch subsections',
                             )
                           : context.l10n.text(
                               '固定版式暂不支持',
@@ -2179,12 +2353,20 @@ class _ReaderPageState extends State<ReaderPage>
                   ],
                 ),
           items: items,
-          activeId: activeTocId(items, controller.sectionIndex),
+          activeId: activeTocId(
+            items,
+            controller.sectionIndex,
+            reachedTargets: controller.reachedTocTargets,
+          ),
           onNavigate: (item) {
             final target = item.spineIndex;
             if (target == null) return;
             Navigator.of(context).pop(); // close the drawer first
-            controller.goToSection(target);
+            if (item.href.isNotEmpty) {
+              controller.goToHref(item.href);
+            } else {
+              controller.goToSection(target);
+            }
           },
         );
       },
@@ -2282,7 +2464,24 @@ class _ReaderPageState extends State<ReaderPage>
       });
     }
     final displayPage = controller.displayPage;
-    final focus = page?.focusUnits.isNotEmpty == true && !_showBookEnd;
+    final adjacentImages = <PageLayout>[];
+    for (final direction in [-1, 1]) {
+      final adjacent = controller.peekPage(direction);
+      if (adjacent != null) {
+        adjacentImages.add(
+          adjacent.focusId == null
+              ? adjacent
+              : controller.focusReading
+                    .preview(adjacent, backwards: direction < 0)
+                    .$1,
+        );
+      }
+    }
+    controller.prepareReaderImages([
+      ?displayPage,
+      ...adjacentImages,
+    ], MediaQuery.devicePixelRatioOf(context));
+    final focus = page?.focusId != null && !_showBookEnd;
     final width = constraints.maxWidth;
     return Stack(
       children: [
@@ -2305,8 +2504,31 @@ class _ReaderPageState extends State<ReaderPage>
                   ? (d) => _endFocusDrag(d, controller)
                   : null,
               onVerticalDragCancel: focus && !_selecting
-                  ? _stopFocusMotion
+                  ? () {
+                      if (_focusDragging) {
+                        _focusDragging = false;
+                        _animateFocusTo(controller, _focusDragStart);
+                      } else {
+                        _stopFocusMotion();
+                      }
+                    }
                   : null,
+              onDoubleTapDown:
+                  _selecting ||
+                      !(displayPage?.items.any(
+                            (item) => item is ImagePlacement,
+                          ) ??
+                          false)
+                  ? null
+                  : (details) => _imageTapPosition = details.localPosition,
+              onDoubleTap:
+                  _selecting ||
+                      !(displayPage?.items.any(
+                            (item) => item is ImagePlacement,
+                          ) ??
+                          false)
+                  ? null
+                  : () => _openImagePreview(controller),
               behavior: HitTestBehavior.opaque,
               onTapUp: _selecting
                   ? null

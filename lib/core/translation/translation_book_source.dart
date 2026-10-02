@@ -148,6 +148,46 @@ class TranslationBookSource implements BookSource {
       _renderCache[index] = cached;
       return cached.$4;
     }
+    // Inline recognition can add formulas/references while cached translations
+    // are still present. Reject only incompatible segments and make them
+    // retryable instead of crashing composition or retaining untranslated text.
+    var invalidated = false;
+    for (final entry in translations.entries.toList()) {
+      final stored = entry.value;
+      bool valid(int? segment, String text) {
+        try {
+          final original = _segmentInlines(section, entry.key, segment);
+          if (original == null) return false;
+          TranslationMarkupCodec.decode(
+            text,
+            original,
+            language: targetLanguageCode,
+          );
+          return true;
+        } on FormatException {
+          return false;
+        } on RangeError {
+          return false;
+        }
+      }
+
+      if (stored.whole != null && !valid(null, stored.whole!)) {
+        stored.whole = null;
+        invalidated = true;
+      }
+      for (final segment in stored.segments.entries.toList()) {
+        if (!valid(segment.key, segment.value)) {
+          stored.segments.remove(segment.key);
+          invalidated = true;
+        }
+      }
+      if (stored.whole == null && stored.segments.isEmpty) {
+        translations.remove(entry.key);
+      }
+    }
+    if (invalidated) {
+      _revision++;
+    }
     final renderMode = mode;
     final language = targetLanguageCode;
     final revision = _revision;
@@ -652,6 +692,7 @@ class TranslationBookSource implements BookSource {
     listOrdered: block.listOrdered,
     listOrdinal: block.listOrdinal,
     listDepth: block.listDepth,
+    listGroupId: block.listGroupId,
     listMarkerVisible: listMarkerVisible ?? block.listMarkerVisible,
     inlines: inlines ?? block.inlines,
     style: style ?? block.style,

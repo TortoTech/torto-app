@@ -23,7 +23,7 @@ void main() {
     expect(prompt, contains('# 正文结构'));
     expect(prompt, contains('# 输出格式'));
     expect(prompt, contains('<cite>'));
-    expect(prompt, contains('<torto-italic>'));
+    expect(prompt, contains('<t-italic>'));
     expect(prompt, contains('不需要用括号附原文'));
   });
 

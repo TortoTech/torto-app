@@ -9,6 +9,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 
 import 'app/home/home_page.dart';
+import 'app/reader/reader_book_benchmark.dart';
 import 'app/settings/app_preferences.dart';
 import 'l10n/app_localizations.dart';
 
@@ -42,6 +43,11 @@ void main() {
     return false;
   };
   runApp(const TortoApp());
+  if (benchmarkBookTitle.isNotEmpty) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(runRequestedBookBenchmark());
+    });
+  }
 }
 
 class TortoApp extends StatefulWidget {

@@ -45,6 +45,13 @@ class TextStyle {
   final InlineRole inlineRole;
   final HyphenationMode hyphenation;
   final int inlineCitation;
+
+  /// Display-only numbering assigned before pagination; authored text is kept.
+  final int footnoteNumber;
+  final String? referenceScope;
+  final double? referenceAdvance;
+  final double referencePaintOffset;
+  final double referenceGlyphAdvance;
   final bool website;
 
   const TextStyle({
@@ -63,6 +70,11 @@ class TextStyle {
     this.inlineRole = InlineRole.normal,
     this.hyphenation = HyphenationMode.auto,
     this.inlineCitation = 0,
+    this.footnoteNumber = 0,
+    this.referenceScope,
+    this.referenceAdvance,
+    this.referencePaintOffset = 0,
+    this.referenceGlyphAdvance = 0,
     this.website = false,
   });
 
@@ -72,6 +84,17 @@ class TextStyle {
   /// [overlay]'s defaults (false / 1.0 / null) mean "no change".
   TextStyle merge(TextStyle overlay) {
     return TextStyle(
+      referenceScope: overlay.referenceScope ?? referenceScope,
+      referenceAdvance: overlay.referenceAdvance ?? referenceAdvance,
+      referencePaintOffset: overlay.referencePaintOffset != 0
+          ? overlay.referencePaintOffset
+          : referencePaintOffset,
+      referenceGlyphAdvance: overlay.referenceGlyphAdvance != 0
+          ? overlay.referenceGlyphAdvance
+          : referenceGlyphAdvance,
+      footnoteNumber: overlay.footnoteNumber != 0
+          ? overlay.footnoteNumber
+          : footnoteNumber,
       inlineCitation: overlay.inlineCitation != 0
           ? overlay.inlineCitation
           : inlineCitation,
@@ -119,8 +142,18 @@ class TextStyle {
     InlineRole? inlineRole,
     HyphenationMode? hyphenation,
     int? inlineCitation,
+    int? footnoteNumber,
+    String? referenceScope,
+    double? referenceAdvance,
+    double? referencePaintOffset,
+    double? referenceGlyphAdvance,
     bool? website,
   }) => TextStyle(
+    referenceScope: referenceScope ?? this.referenceScope,
+    referenceAdvance: referenceAdvance ?? this.referenceAdvance,
+    referencePaintOffset: referencePaintOffset ?? this.referencePaintOffset,
+    referenceGlyphAdvance: referenceGlyphAdvance ?? this.referenceGlyphAdvance,
+    footnoteNumber: footnoteNumber ?? this.footnoteNumber,
     inlineCitation: inlineCitation ?? this.inlineCitation,
     website: website ?? this.website,
     bold: bold ?? this.bold,
@@ -145,6 +178,11 @@ class TextStyle {
   bool operator ==(Object other) =>
       other is TextStyle &&
       other.inlineCitation == inlineCitation &&
+      other.footnoteNumber == footnoteNumber &&
+      other.referenceScope == referenceScope &&
+      other.referenceAdvance == referenceAdvance &&
+      other.referencePaintOffset == referencePaintOffset &&
+      other.referenceGlyphAdvance == referenceGlyphAdvance &&
       other.website == website &&
       other.bold == bold &&
       other.italic == italic &&
@@ -163,6 +201,8 @@ class TextStyle {
 
   @override
   int get hashCode => Object.hash(
+    referenceScope,
+    footnoteNumber,
     bold,
     italic,
     emphasis,

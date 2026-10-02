@@ -35,7 +35,29 @@ Future<void> searchWorker((String, String, SendPort) args) async {
     for (var spine = 0; spine < source.book.spine.length; spine++) {
       final section = await source.parseSection(spine);
       final batch = <TextMatch>[];
-      for (final node in sectionTextNodes(section)) {
+      final pdfText = source is PdfBookSource
+          ? source.pageText(spine)?.text ?? ''
+          : '';
+      final nodes = source is PdfBookSource
+          ? <BookTextNode>[
+              BookTextNode(
+                SourceRange(
+                  start: SourceAnchor(
+                    spine: section.id,
+                    node: 'pdf-page-$spine',
+                    textOffset: 0,
+                  ),
+                  end: SourceAnchor(
+                    spine: section.id,
+                    node: 'pdf-page-$spine',
+                    textOffset: pdfText.runes.length,
+                  ),
+                ),
+                pdfText,
+              ),
+            ]
+          : sectionTextNodes(section);
+      for (final node in nodes) {
         for (final (start, end) in sourceMatches(
           node.text,
           args.$2.trim(),

@@ -13,6 +13,13 @@ Future<Section> _composeInWorker(
   List<SemanticGroup> groups,
 ) => Isolate.run(() => composeSemanticLayout(original, displayed, groups));
 
+Future<Section> _localCitationsInWorker(Section section) => Isolate.run(() {
+  final groups = localCitationGroups(section);
+  return groups.isEmpty
+      ? section
+      : composeSemanticLayout(section, section, groups);
+});
+
 String? sourceKey(Block b) {
   final s = switch (b) {
     TextBlock(:final source) ||
@@ -37,7 +44,12 @@ bool numbered(Block b) =>
 bool headingCandidate(Block b) =>
     paragraph(b) &&
     (b as TextBlock).plainText.trim().runes.length <= 120 &&
-    (numbered(b) || RegExp(r'\p{L}', unicode: true).hasMatch(b.plainText)) &&
+    (numbered(b) ||
+        RegExp(
+              r'^(?:[0-9０-９]{1,4}(?:[.．][0-9０-９]{1,4})*(?:\s|[.)．）、:：]|[\u4e00-\u9fff])|[（(][0-9０-９]{1,4}(?:[.．][0-9０-９]{1,4})*[）)]|(?:chapter|part|section|book|volume|chap\.|sec\.|vol\.)\s+(?:[0-9０-９]{1,4}(?:[.．][0-9０-９]{1,4})*|[ivxlcdm]+)(?:$|\s|[.:：、)）-])|第[零〇一二三四五六七八九十百千两0-9０-９]+[章节篇部卷回])',
+              caseSensitive: false,
+            ).hasMatch(b.plainText.trim()) &&
+            RegExp(r'\p{L}', unicode: true).hasMatch(b.plainText)) &&
     b.inlines.every(
       (inline) => switch (inline) {
         TextRun(:final style) =>
@@ -187,6 +199,8 @@ List<SemanticGroup> validateGroups(
   Object? raw, {
   int start = 0,
   int? end,
+  int? contextStart,
+  int? contextEnd,
   Set<int>? protected,
   Set<String>? kinds,
 }) {
@@ -248,9 +262,10 @@ List<SemanticGroup> validateGroups(
       }
       final ids = groupIds(g);
       if (!consecutive(ids) ||
-          ids.first < start ||
+          ids.first < (contextStart ?? start) ||
           ids.first >= (end ?? input.length) ||
-          ids.last >= (end ?? input.length) ||
+          ids.last < start ||
+          ids.last >= (contextEnd ?? end ?? input.length) ||
           ids.last >= input.length ||
           ids.any(used.contains)) {
         continue;
@@ -609,6 +624,7 @@ Section composeSemanticLayout(
 }
 
 class SemanticLayoutBookSource implements BookSource {
+  final bool localCitations;
   final BookSource inner;
   final Map<int, (Section, List<SemanticGroup>)> annotations;
   final bool inlineOnly;
@@ -617,6 +633,7 @@ class SemanticLayoutBookSource implements BookSource {
     this.inner, {
     Map<int, (Section, List<SemanticGroup>)>? annotations,
     this.inlineOnly = false,
+    this.localCitations = false,
   }) : annotations = annotations ?? {};
   @override
   Book get book => inner.book;
@@ -626,15 +643,18 @@ class SemanticLayoutBookSource implements BookSource {
   Future<Section> parseSection(int index) async {
     final displayed = await inner.parseSection(index);
     final data = annotations[index];
-    if (data == null || data.$2.isEmpty) {
-      _rendered.remove(index);
-      return displayed;
-    }
     final cached = _rendered[index];
     if (cached != null &&
         identical(cached.$1, displayed) &&
-        identical(cached.$2, data)) {
+        identical(cached.$2, data ?? 'local-citations-v1')) {
       return cached.$3;
+    }
+    if (data == null || data.$2.isEmpty) {
+      final result = localCitations
+          ? await _localCitationsInWorker(displayed)
+          : displayed;
+      _rendered[index] = (displayed, data ?? 'local-citations-v1', result);
+      return result;
     }
     final original = data.$1;
     final groups = inlineOnly
@@ -648,7 +668,10 @@ class SemanticLayoutBookSource implements BookSource {
               )
               .toList()
         : data.$2;
-    final result = await _composeInWorker(original, displayed, groups);
+    final composed = await _composeInWorker(original, displayed, groups);
+    final result = localCitations
+        ? await _localCitationsInWorker(composed)
+        : composed;
     _rendered.removeWhere((key, _) => (key - index).abs() > 2);
     if (identical(annotations[index], data)) {
       _rendered[index] = (displayed, data, result);

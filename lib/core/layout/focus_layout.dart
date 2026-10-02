@@ -4,20 +4,26 @@ import 'layout_types.dart';
 
 /// Boundaries are computed before layout, so authored groups never split.
 class FocusUnitBuilder {
-  static Map<int, List<Block>> build(List<Block> blocks) {
+  static Map<int, List<Block>> build(
+    List<Block> blocks, {
+    Set<int> boundaries = const {},
+  }) {
     final groups = <int, List<Block>>{};
     var start = -1;
     int? listDepth;
     var headingsOnly = false;
     for (var i = 0; i < blocks.length; i++) {
       final block = blocks[i];
-      if (block is PageBreakBlock) {
+      if (boundaries.contains(i)) {
         start = -1;
         listDepth = null;
         headingsOnly = false;
+      }
+      if (block is PageBreakBlock ||
+          block is LineBreakBlock ||
+          block is SeparatorBlock) {
         continue;
       }
-      if (block is LineBreakBlock || block is SeparatorBlock) continue;
       final heading = block is TextBlock && block.kind == TextBlockKind.heading;
       final previous = start < 0 ? null : groups[start]!.last;
       final companion =
@@ -28,13 +34,27 @@ class FocusUnitBuilder {
           block is TextBlock &&
           block.kind == TextBlockKind.caption &&
           previous is ImageBlock;
+      final previousBody = start < 0
+          ? null
+          : groups[start]!
+                .whereType<TextBlock>()
+                .where((b) => !b.nodeId.endsWith('@translation'))
+                .lastOrNull;
       final descendant =
           block is TextBlock &&
           block.kind == TextBlockKind.listItem &&
           listDepth != null &&
-          block.listDepth > listDepth;
+          block.listDepth >= listDepth &&
+          (block.listGroupId == previousBody?.listGroupId);
+      final introduction =
+          block is TextBlock &&
+          block.kind == TextBlockKind.listItem &&
+          listDepth == null &&
+          previousBody?.kind == TextBlockKind.paragraph &&
+          !previousBody!.inlines.any((inline) => inline is InlineImageRun);
       final attach =
-          start >= 0 && (headingsOnly || companion || caption || descendant);
+          start >= 0 &&
+          (headingsOnly || companion || caption || descendant || introduction);
       if (!attach) {
         start = i;
         groups[start] = [];
@@ -50,6 +70,27 @@ class FocusUnitBuilder {
       }
     }
     return groups;
+  }
+
+  static List<List<Block>> overflowParts(List<Block> blocks) {
+    final roots = blocks
+        .whereType<TextBlock>()
+        .where((b) => b.kind == TextBlockKind.listItem)
+        .toList();
+    if (roots.isEmpty) return [blocks];
+    final depth = roots.map((b) => b.listDepth).reduce((a, b) => a < b ? a : b);
+    final parts = <List<Block>>[];
+    for (final block in blocks) {
+      if (parts.isEmpty ||
+          block is TextBlock &&
+              block.kind == TextBlockKind.listItem &&
+              block.listDepth == depth &&
+              !block.nodeId.endsWith('@translation')) {
+        parts.add([]);
+      }
+      parts.last.add(block);
+    }
+    return parts;
   }
 
   static List<SourceRange> sources(Block block) => switch (block) {

@@ -195,6 +195,7 @@ class TextBlock extends Block {
   final bool listOrdered;
   final int listOrdinal;
   final int listDepth;
+  final String? listGroupId;
 
   /// Whether this item owns a visible marker. Some EPUBs encode nested list
   /// continuations as marker-less paragraphs while retaining list indentation.
@@ -217,6 +218,7 @@ class TextBlock extends Block {
     this.listOrdered = false,
     this.listOrdinal = 0,
     this.listDepth = 0,
+    this.listGroupId,
     this.listMarkerVisible = true,
     required this.inlines,
     this.style = BlockStyle.normal,

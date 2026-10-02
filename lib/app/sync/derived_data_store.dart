@@ -29,6 +29,53 @@ class DerivedDataStore {
   Directory _bookDirectory(String bookId) =>
       Directory('${root.path}${Platform.pathSeparator}$bookId');
 
+  Future<void> savePdfDiscovery(
+    String bookId, {
+    required String title,
+    required List<String> authors,
+    required List<Map<String, dynamic>> entries,
+    required List<Map<String, dynamic>> specialPages,
+  }) async {
+    if (!RegExp(r'^[A-Za-z0-9_-]+$').hasMatch(bookId)) {
+      throw const FormatException('Invalid book identity');
+    }
+    final directory = _bookDirectory(bookId);
+    await directory.create(recursive: true);
+    final file = File(
+      '${directory.path}${Platform.pathSeparator}metadata.json',
+    );
+    Map<String, dynamic> stored = {};
+    try {
+      stored = Map<String, dynamic>.from(
+        jsonDecode(await file.readAsString()) as Map,
+      );
+    } catch (_) {}
+    final value = {
+      ...stored,
+      'version': 1,
+      'book_id': bookId,
+      if (title.isNotEmpty || authors.isNotEmpty)
+        'metadata': {
+          'version': 1,
+          'book_id': bookId,
+          'metadata': {'title': title, 'authors': authors},
+        },
+      if (entries.isNotEmpty || specialPages.isNotEmpty)
+        'toc': {
+          if (stored['toc'] is Map) ...(stored['toc'] as Map),
+          'version': 1,
+          'book_id': bookId,
+          'verified_pages': true,
+          'page_mapping_revision': 2,
+          'entries': entries.isNotEmpty
+              ? entries
+              : (stored['toc'] is Map ? stored['toc']['entries'] ?? [] : []),
+          'special_pages': specialPages,
+        },
+    };
+    await _writeAtomicIfChanged(file, utf8.encode(jsonEncode(value)));
+  }
+
   Future<int> syncRemoteBook(
     WebDavClient webdav,
     String bookId, {

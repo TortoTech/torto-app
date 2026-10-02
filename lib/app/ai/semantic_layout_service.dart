@@ -21,16 +21,17 @@ List<Map<String, dynamic>> _wireCitations(Section section) {
   final ordinals = <(int, int), int>{};
   return [
     for (final candidate in citationCandidates(section))
-      (() {
-        final block = candidate['block'] as int,
-            paragraph = candidate['paragraph'] as int;
-        final ordinal = ordinals.update(
-          (block, paragraph),
-          (value) => value + 1,
-          ifAbsent: () => 0,
-        );
-        return {...candidate, 'wire_id': 'c${block}_${paragraph}_$ordinal'};
-      })(),
+      if (!localCitation(candidate))
+        (() {
+          final block = candidate['block'] as int,
+              paragraph = candidate['paragraph'] as int;
+          final ordinal = ordinals.update(
+            (block, paragraph),
+            (value) => value + 1,
+            ifAbsent: () => 0,
+          );
+          return {...candidate, 'wire_id': 'c${block}_${paragraph}_$ordinal'};
+        })(),
   ];
 }
 
@@ -91,7 +92,7 @@ class SemanticLayoutService {
     this.model, {
     OpenAiCompatibleClient? client,
     this.cacheDirectory,
-    this.reasoningEffort = ReasoningEffort.defaultLevel,
+    this.reasoningEffort = ReasoningEffort.none,
   }) : client = client ?? OpenAiCompatibleClient();
   void cancel() {
     _cancelled = true;
@@ -116,7 +117,7 @@ class SemanticLayoutService {
           '${(await getApplicationCacheDirectory()).path}/semantic-layout-v4',
         );
     final prefix = await _fingerprintInWorker([
-      'mobile-4',
+      'mobile-5-desktop-wire-1',
       bookId,
       section.href,
       input,
@@ -293,6 +294,8 @@ class SemanticLayoutService {
             raw,
             start: batch.start,
             end: batch.end,
+            contextStart: batch.contextStart,
+            contextEnd: batch.contextEnd,
             kinds: kinds,
           );
           if (checked.length == raw.length) accepted = checked;
@@ -305,6 +308,7 @@ class SemanticLayoutService {
       if (accepted == null) {
         for (var attempt = 0; attempt < 2; attempt++) {
           final response = await client.recognizeLayout(
+            compact: true,
             provider: provider,
             model: model,
             prompt: requestPrompt,
@@ -315,7 +319,7 @@ class SemanticLayoutService {
               ...payload,
               if (attempt > 0)
                 'validation_feedback':
-                    'Use only eligible IDs entirely inside the target range, explicit quote sources and non-overlapping groups. Do not change source text.',
+                    'Use only supplied context IDs; groups must touch the target range, explicit quote sources and non-overlapping groups. Do not change source text.',
             },
           );
           _check();
@@ -354,6 +358,8 @@ class SemanticLayoutService {
             unique,
             start: batch.start,
             end: batch.end,
+            contextStart: batch.contextStart,
+            contextEnd: batch.contextEnd,
             kinds: kinds,
           );
           final invalid = malformed || valid.length != unique.length;
@@ -428,6 +434,25 @@ class SemanticLayoutService {
       /* Best-effort eviction. */
     }
     _check();
+    final selected = batches ?? semanticBatches(section);
+    for (final group in localCitationGroups(section)) {
+      if (selected.any(
+            (batch) =>
+                batch.start <= group['block'] && group['block'] < batch.end,
+          ) &&
+          !groups.any(
+            (existing) =>
+                existing['kind'] == 'citation' &&
+                const [
+                  'block',
+                  'paragraph',
+                  'start',
+                  'end',
+                ].every((key) => existing[key] == group[key]),
+          )) {
+        groups.add(group);
+      }
+    }
     return validateGroups(section, groups);
   }
 

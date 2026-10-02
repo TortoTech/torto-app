@@ -237,8 +237,8 @@ void main() {
     expect(encoded, contains('<em> emphasis</em>'));
     expect(encoded, contains('<i> term</i>'));
     expect(encoded, contains('<cite> work</cite>'));
-    expect(encoded, contains('<torto-italic> visual</torto-italic>'));
-    expect(encoded, contains('<torto-math-0/>'));
+    expect(encoded, contains('<t-italic> visual</t-italic>'));
+    expect(encoded, contains('<t-math-0/>'));
 
     final decoded = TranslationMarkupCodec.decode(
       '<strong>重要</strong><em>强调</em><i>术语</i><cite>作品</cite>'

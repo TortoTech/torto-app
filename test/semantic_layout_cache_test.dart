@@ -36,7 +36,7 @@ void main() {
     () {
       expect(
         SemanticLayoutSettings.fromJson({}).reasoningEffort,
-        ReasoningEffort.defaultLevel,
+        ReasoningEffort.none,
       );
       const settings = SemanticLayoutSettings(
         enabled: true,

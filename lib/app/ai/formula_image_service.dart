@@ -125,6 +125,7 @@ Future<List<Map<String, dynamic>>> recognizeFormulaImages({
       for (var attempt = 0; attempt < 2 && pending.isNotEmpty; attempt++) {
         check();
         final response = await client.recognizeLayout(
+          compact: true,
           provider: provider,
           model: model,
           reasoningEffort: effort,

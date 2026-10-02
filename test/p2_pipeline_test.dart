@@ -1,3 +1,4 @@
+import 'package:torto/app/ai/semantic_wire.dart';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -44,6 +45,7 @@ void main() {
         const AiProviderConfig(
           id: 'p',
           name: 'P',
+          kind: AiProviderKind.openAi,
           baseUrl: 'https://example.test/v1',
           apiKey: 'test',
         ),
@@ -53,10 +55,12 @@ void main() {
           client: MockClient((request) async {
             calls++;
             final body = jsonDecode(request.body),
-                input = jsonDecode(body['messages'][1]['content']);
+                input = SemanticWire.decode(
+                  jsonDecode(body['messages'][1]['content']),
+                );
             expect(
               body['response_format']['json_schema']['schema']['required'],
-              containsAll(['groups', 'citations', 'formulas']),
+              containsAll(['g', 'c', 'f']),
             );
             expect(input['blocks'][0].containsKey('text'), isFalse);
             expect(
@@ -70,7 +74,7 @@ void main() {
                     'message': {
                       'content': jsonEncode({
                         'groups': [],
-                        'citations': ['c0_0_0'],
+                        'citations': [],
                         'formulas': [
                           {
                             'block': 0,
@@ -110,14 +114,17 @@ void main() {
       );
       final node = (raw.blocks.single as TextBlock).nodeId;
       final inputs = await translation.untranslatedBlocksForNodes(0, {node});
-      expect(inputs.single.text, contains('<torto-math-0/>'));
-      expect(inputs.single.text, contains('<torto-protected-0/>'));
-      expect(inputs.single.text, contains('<torto-protected-1/>'));
+      expect(inputs.single.text, contains('<t-math-0/>'));
+      expect(
+        inputs.single.text,
+        contains('<citation id="1">(Smith, 2020)</citation>'),
+      );
+      expect(inputs.single.text, contains('<t-web-0/>'));
       await translation.storeBatch(0, [
         BlockTranslation(
           blockIndex: 0,
           text:
-              '译文 <torto-math-0/> <torto-protected-0/>。链接 <torto-protected-1/>。',
+              '译文 <t-math-0/> <citation id="1">(Smith, 2020)</citation>。链接 <t-web-0/>。',
         ),
       ]);
       final result = (await display.parseSection(0)).blocks.single as TextBlock;

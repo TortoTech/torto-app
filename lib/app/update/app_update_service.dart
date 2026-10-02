@@ -2,6 +2,8 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+enum UpdateSource { automatic, github, gitee }
+
 class AppUpdateInfo {
   final String currentVersion;
   final String? latestVersion;
@@ -34,7 +36,113 @@ class AppUpdateService {
       _ownsClient = client == null,
       endpoint = endpoint ?? latestReleaseEndpoint;
 
-  Future<AppUpdateInfo> check({required String currentVersion}) async {
+  Future<AppUpdateInfo> check({
+    required String currentVersion,
+    UpdateSource source = UpdateSource.github,
+  }) async {
+    if (source == UpdateSource.github) return _github(currentVersion);
+    if (source == UpdateSource.gitee) return _gitee(currentVersion);
+    final results = await Future.wait([
+      _github(
+        currentVersion,
+      ).then<AppUpdateInfo?>((value) => value).catchError((Object _) => null),
+      _gitee(
+        currentVersion,
+      ).then<AppUpdateInfo?>((value) => value).catchError((Object _) => null),
+    ]);
+    final available =
+        results.whereType<AppUpdateInfo>().where((v) => v.hasRelease).toList()
+          ..sort(
+            (a, b) =>
+                compareReleaseVersions(b.latestVersion!, a.latestVersion!),
+          );
+    if (available.isNotEmpty) return available.first;
+    if (results.any((v) => v != null)) {
+      return AppUpdateInfo(
+        currentVersion: currentVersion,
+        latestVersion: null,
+        releasePage: null,
+      );
+    }
+    throw const AppUpdateException('Update sources are unavailable.');
+  }
+
+  Future<AppUpdateInfo> _gitee(String currentVersion) async {
+    final response = await _client
+        .get(
+          Uri.parse(
+            'https://gitee.com/api/v5/repos/TortoTech/torto-app/releases/latest',
+          ),
+        )
+        .timeout(const Duration(seconds: 15));
+    if (response.statusCode == 404) {
+      return AppUpdateInfo(
+        currentVersion: currentVersion,
+        latestVersion: null,
+        releasePage: null,
+      );
+    }
+    if (response.statusCode != 200) {
+      throw const AppUpdateException('Gitee update source is unavailable.');
+    }
+    final release = jsonDecode(response.body) as Map;
+    final tag = release['tag_name'];
+    if (tag is! String ||
+        !RegExp(r'^v\d+\.\d+\.\d+$').hasMatch(tag) ||
+        release['prerelease'] == true ||
+        release['draft'] == true) {
+      throw const AppUpdateException('Invalid Gitee release.');
+    }
+    final manifestResponse = await _client
+        .get(
+          Uri.parse(
+            'https://gitee.com/TortoTech/torto-app/releases/download/$tag/torto-update.json',
+          ),
+        )
+        .timeout(const Duration(seconds: 15));
+    if (manifestResponse.statusCode != 200) {
+      throw const AppUpdateException('Gitee release mirroring is incomplete.');
+    }
+    final manifest = jsonDecode(manifestResponse.body) as Map;
+    final asset = manifest['asset'];
+    final name = 'Torto-${tag.substring(1)}-android-arm64-v8a.apk';
+    if (manifest['tag'] != tag ||
+        manifest['version'] != tag.substring(1) ||
+        asset is! Map ||
+        asset['name'] != name ||
+        asset['size'] is! int ||
+        asset['size'] <= 0 ||
+        asset['sha256'] is! String ||
+        !RegExp(r'^[a-f0-9]{64}$').hasMatch(asset['sha256'])) {
+      throw const AppUpdateException('Gitee release verification failed.');
+    }
+    final files = release['assets'];
+    if (files is! List ||
+        !files.whereType<Map>().any((file) {
+          final url = Uri.tryParse(
+            file['browser_download_url'] as String? ?? '',
+          );
+          return file['name'] == name &&
+              url != null &&
+              url.scheme == 'https' &&
+              url.host == 'gitee.com' &&
+              url.userInfo.isEmpty &&
+              url.path == '/TortoTech/torto-app/releases/download/$tag/$name';
+        })) {
+      throw const AppUpdateException(
+        'Gitee release is missing the Android APK.',
+      );
+    }
+    return AppUpdateInfo(
+      currentVersion: currentVersion,
+      latestVersion: tag.substring(1),
+      releasePage: Uri.parse(
+        'https://gitee.com/TortoTech/torto-app/releases/tag/$tag',
+      ),
+    );
+  }
+
+  Future<AppUpdateInfo> _github(String currentVersion) async {
     final response = await _client
         .get(
           endpoint,

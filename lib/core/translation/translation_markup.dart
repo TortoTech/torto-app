@@ -5,18 +5,28 @@ import '../semantic_layout/web_links.dart';
 
 class TranslationMarkupCodec {
   static final _tokenPattern = RegExp(
-    r'</?(?:strong|em|i|cite|torto-italic|u|s|sup|sub|noteref|noteback|inlinefootnote|torto-size|torto-size-[0-9]+)>|<torto-math-(\d+)/>|<torto-size scale="([^"<>]*)">|<torto-protected-(\d+)/>',
+    r'</?(?:strong|em|i|cite|citation|torto-italic|u|s|sup|sub|noteref|noteback|inlinefootnote|torto-size|torto-size-[0-9]+)>|<torto-math-(\d+)/>|<torto-size scale="([^"<>]*)">|<torto-protected-(\d+)/>|<citation id="([1-9][0-9]*)">',
   );
 
   static String encode(List<Inline> inlines) {
     inlines = translationInlines(inlines);
     final output = StringBuffer();
     var mathIndex = 0;
-    var protectedIndex = 0;
+    var websiteIndex = 0, noteIndex = 0, inlineNoteIndex = 0, citation = 0;
     for (final inline in inlines) {
+      final nextCitation = inline is TextRun ? inline.style.inlineCitation : 0;
+      if (nextCitation != citation) {
+        if (citation != 0) output.write('</citation>');
+        if (nextCitation != 0) output.write('<citation id="$nextCitation">');
+        citation = nextCitation;
+      }
       if (inline is TextRun &&
-          (inline.style.inlineCitation > 0 || inline.style.website)) {
-        output.write('<torto-protected-${protectedIndex++}/>');
+          inline.style.linkRole == LinkRole.footnoteReference) {
+        output.write('<t-note-${noteIndex++}/>');
+        continue;
+      }
+      if (inline is TextRun && inline.style.website) {
+        output.write('<t-web-${websiteIndex++}/>');
         continue;
       }
       switch (inline) {
@@ -33,7 +43,8 @@ class TranslationMarkupCodec {
             tags.add('torto-size');
           }
           if (inline.style.inlineRole == InlineRole.footnote) {
-            open('inlinefootnote');
+            output.write('<inlinefootnote id="${inlineNoteIndex++}">');
+            tags.add('inlinefootnote');
           }
           switch (inline.style.linkRole) {
             case LinkRole.normal:
@@ -75,7 +86,11 @@ class TranslationMarkupCodec {
           break;
       }
     }
-    return output.toString();
+    if (citation != 0) output.write('</citation>');
+    return output.toString().replaceAllMapped(
+      RegExp(r'(</?)torto-(math-[0-9]+|size|italic)'),
+      (m) => '${m[1]}t-${m[2]}',
+    );
   }
 
   static List<Inline> decode(
@@ -85,16 +100,75 @@ class TranslationMarkupCodec {
     bool requireSizeMarkup = false,
   }) {
     original = translationInlines(original);
-    final protected = original
+    final identity =
+        (requireSizeMarkup && !translated.contains('<torto-')) ||
+        translated.contains(
+          RegExp(
+            r'<(?:t-size |t-italic|t-math-|t-note-|t-web-|citation id=|inlinefootnote id=)',
+          ),
+        );
+    translated = translated.replaceAllMapped(
+      RegExp(r'(</?)t-(math-[0-9]+|size(?:-[0-9]+)?|italic|protected-[0-9]+)'),
+      (m) => '${m[1]}torto-${m[2]}',
+    );
+    final websites = original
         .whereType<TextRun>()
-        .where((run) => run.style.inlineCitation > 0 || run.style.website)
+        .where((r) => r.style.website)
         .toList();
+    final notes = original
+        .whereType<TextRun>()
+        .where((r) => r.style.linkRole == LinkRole.footnoteReference)
+        .toList();
+    final protected = identity
+        ? <TextRun>[...websites, ...notes]
+        : original
+              .whereType<TextRun>()
+              .where((run) => run.style.inlineCitation > 0 || run.style.website)
+              .toList();
+    if (identity) {
+      translated = translated.replaceAllMapped(
+        RegExp(r'<t-(web|note)-(\d+)/>'),
+        (m) =>
+            '<torto-protected-${int.parse(m[2]!) + (m[1] == 'note' ? websites.length : 0)}/>',
+      );
+      final expectedCitations =
+          original
+              .whereType<TextRun>()
+              .map((r) => r.style.inlineCitation)
+              .where((id) => id > 0)
+              .toSet()
+              .toList()
+            ..sort();
+      final actualCitations = RegExp(
+        r'<citation id="([1-9][0-9]*)">',
+      ).allMatches(translated).map((m) => int.parse(m[1]!)).toList()..sort();
+      if (expectedCitations.join(',') != actualCitations.join(',')) {
+        throw const FormatException('Translation changed citation identities.');
+      }
+      final expectedNotes = original
+          .whereType<TextRun>()
+          .where((r) => r.style.inlineRole == InlineRole.footnote)
+          .length;
+      final actualNotes = RegExp(
+        r'<inlinefootnote id="([0-9]+)">',
+      ).allMatches(translated).map((m) => int.parse(m[1]!)).toList()..sort();
+      if (actualNotes.join(',') !=
+          List.generate(expectedNotes, (i) => i).join(',')) {
+        throw const FormatException(
+          'Translation changed inline note identities.',
+        );
+      }
+      translated = translated.replaceAll(
+        RegExp(r'<inlinefootnote id="[0-9]+">'),
+        '<inlinefootnote>',
+      );
+    }
     final protectedIds =
         RegExp(
             r'<torto-protected-(\d+)/>',
           ).allMatches(translated).map((m) => int.parse(m.group(1)!)).toList()
           ..sort();
-    if (requireSizeMarkup || protectedIds.isNotEmpty) {
+    if (requireSizeMarkup || identity || protectedIds.isNotEmpty) {
       if (protectedIds.length != protected.length ||
           List.generate(
             protectedIds.length,
@@ -179,8 +253,21 @@ class TranslationMarkupCodec {
       final mathIndex = match.group(1);
       if (match.group(3) != null) {
         output.add(protected[int.parse(match.group(3)!)]);
+      } else if (match.group(4) != null) {
+        stack.add(
+          _StyleFrame(
+            'citation',
+            stack.last.style.copyWith(
+              inlineCitation: int.parse(match.group(4)!),
+            ),
+          ),
+        );
       } else if (mathIndex != null) {
-        output.add(math[int.parse(mathIndex)]);
+        final index = int.tryParse(mathIndex);
+        if (index == null || index < 0 || index >= math.length) {
+          throw const FormatException('Unknown formula placeholder.');
+        }
+        output.add(math[index]);
       } else if (match.group(2) != null) {
         final scale = double.tryParse(match.group(2)!);
         if (scale == null || !scale.isFinite || scale <= 0) {

@@ -10,6 +10,7 @@ import 'reader_controller.dart' show ReaderFootnote;
 
 import '../../core/ir/book.dart';
 import '../../core/layout/layout_types.dart';
+import '../../core/render/page_painter.dart' show footnoteIconColor;
 import '../../core/linebreak/english_hyphenator.dart';
 import '../../core/linebreak/paragraph_optimizer.dart';
 import '../../core/linebreak/measurement.dart';
@@ -26,6 +27,8 @@ Future<void> showReaderFootnoteSheet(
   ReaderTypography typography = const ReaderTypography(),
   List<ReaderFootnote> entries = const [],
   int initialCitation = 0,
+  int initialFootnoteNumber = 0,
+  Color? markerColor,
 }) async {
   await EnglishHyphenator.instance.ensureLoadedForLanguage(publicationLanguage);
   if (!context.mounted) return;
@@ -71,6 +74,8 @@ Future<void> showReaderFootnoteSheet(
         typography: typography,
         entries: entries,
         initialCitation: initialCitation,
+        initialFootnoteNumber: initialFootnoteNumber,
+        markerColor: markerColor ?? footnoteIconColor(background),
       ),
     ),
   );
@@ -84,6 +89,8 @@ class ReaderFootnoteSheet extends StatelessWidget {
   final ReaderTypography typography;
   final List<ReaderFootnote> entries;
   final int initialCitation;
+  final int initialFootnoteNumber;
+  final Color? markerColor;
 
   const ReaderFootnoteSheet({
     super.key,
@@ -94,6 +101,8 @@ class ReaderFootnoteSheet extends StatelessWidget {
     this.typography = const ReaderTypography(),
     this.entries = const [],
     this.initialCitation = 0,
+    this.initialFootnoteNumber = 0,
+    this.markerColor,
   });
 
   @override
@@ -107,7 +116,15 @@ class ReaderFootnoteSheet extends StatelessWidget {
         child: SingleChildScrollView(
           padding: const EdgeInsets.fromLTRB(24, 4, 24, 28),
           child: entries.isNotEmpty
-              ? _ReferenceRows(entries, initialCitation, foreground)
+              ? _ReferenceRows(
+                  entries,
+                  initialCitation,
+                  initialFootnoteNumber,
+                  foreground,
+                  markerColor ??
+                      footnoteIconColor(Theme.of(context).colorScheme.surface),
+                  publicationLanguage,
+                )
               : OptimizedJustifiedText(
                   text,
                   publicationLanguage: publicationLanguage,
@@ -142,8 +159,18 @@ class ReaderFootnoteSheet extends StatelessWidget {
 class _ReferenceRows extends StatefulWidget {
   final List<ReaderFootnote> entries;
   final int selected;
+  final int selectedFootnote;
   final Color color;
-  const _ReferenceRows(this.entries, this.selected, this.color);
+  final Color markerColor;
+  final String publicationLanguage;
+  const _ReferenceRows(
+    this.entries,
+    this.selected,
+    this.selectedFootnote,
+    this.color,
+    this.markerColor,
+    this.publicationLanguage,
+  );
   @override
   State<_ReferenceRows> createState() => _ReferenceRowsState();
 }
@@ -160,44 +187,97 @@ class _ReferenceRowsState extends State<_ReferenceRows> {
   }
 
   @override
-  Widget build(BuildContext context) => Column(
-    crossAxisAlignment: CrossAxisAlignment.stretch,
-    children: [
-      for (final note in widget.entries)
-        Padding(
-          key: widget.selected > 0 && note.citationOrdinal == widget.selected
-              ? selected
-              : null,
-          padding: const EdgeInsets.only(bottom: 16),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SizedBox(
-                width: 40,
-                child: Text(
-                  note.marker,
-                  style: TextStyle(color: widget.color, fontSize: 15),
+  Widget build(BuildContext context) {
+    final scaler = MediaQuery.textScalerOf(context);
+    // Measure exactly the style that Text paints, including theme spacing and
+    // weight. Otherwise a bracket can wrap out of the one-line marker slot.
+    final markerStyle = DefaultTextStyle.of(context).style.merge(
+      TextStyle(
+        color: widget.markerColor,
+        fontSize: 17,
+        height: 1,
+        fontFamily: 'Literata',
+      ),
+    );
+    var slot = 0.0;
+    for (final note in widget.entries) {
+      final painter = TextPainter(
+        text: TextSpan(text: note.displayMarker, style: markerStyle),
+        textDirection: TextDirection.ltr,
+        textScaler: scaler,
+      )..layout();
+      slot = math.max(slot, painter.width.ceilToDouble() + 2);
+      painter.dispose();
+    }
+    final gap = scaler.scale(17) * 0.3;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (final note in widget.entries)
+          Padding(
+            key:
+                (widget.selected > 0 &&
+                        note.citationOrdinal == widget.selected) ||
+                    (widget.selectedFootnote > 0 &&
+                        note.footnoteNumber == widget.selectedFootnote)
+                ? selected
+                : null,
+            padding: const EdgeInsets.only(bottom: 16),
+            child: _NoteContent(
+              note,
+              widget.color,
+              publicationLanguage: widget.publicationLanguage,
+              leadingWidth: slot + gap,
+              leading: WidgetSpan(
+                alignment: PlaceholderAlignment.middle,
+                child: SizedBox(
+                  width: slot + gap,
+                  height: MediaQuery.textScalerOf(context).scale(17),
+                  child: Padding(
+                    padding: EdgeInsets.only(right: gap),
+                    child: Center(
+                      child: Text(
+                        note.displayMarker,
+                        style: markerStyle,
+                        textDirection: TextDirection.ltr,
+                        softWrap: false,
+                        maxLines: 1,
+                        overflow: TextOverflow.visible,
+                      ),
+                    ),
+                  ),
                 ),
               ),
-              Expanded(child: _NoteContent(note, widget.color)),
-            ],
+            ),
           ),
-        ),
-    ],
-  );
+      ],
+    );
+  }
 }
 
 class _NoteContent extends StatelessWidget {
   final ReaderFootnote note;
   final Color color;
-  const _NoteContent(this.note, this.color);
+  final InlineSpan leading;
+  final String publicationLanguage;
+  final double leadingWidth;
+  const _NoteContent(
+    this.note,
+    this.color, {
+    required this.leading,
+    required this.publicationLanguage,
+    required this.leadingWidth,
+  });
   @override
   Widget build(BuildContext context) {
     final inlines = translationInlines(note.inlines ?? []);
     if (!inlines.any((inline) => inline is ir.MathInline)) {
       return OptimizedJustifiedText(
-        note.text,
+        note.popupText,
         style: TextStyle(color: color, fontSize: 17, height: 1.55),
+        leading: leading,
+        leadingWidth: leadingWidth,
+        publicationLanguage: publicationLanguage,
       );
     }
     return LayoutBuilder(
@@ -205,6 +285,7 @@ class _NoteContent extends StatelessWidget {
         TextSpan(
           style: TextStyle(color: color, fontSize: 17, height: 1.55),
           children: [
+            leading,
             for (final inline in inlines)
               if (inline is ir.TextRun)
                 TextSpan(text: inline.text)
@@ -251,6 +332,8 @@ class OptimizedJustifiedText extends StatelessWidget {
   final TextStyle style;
   final String publicationLanguage;
   final ParagraphHyphenator? hyphenator;
+  final InlineSpan? leading;
+  final double leadingWidth;
 
   const OptimizedJustifiedText(
     this.text, {
@@ -258,6 +341,8 @@ class OptimizedJustifiedText extends StatelessWidget {
     required this.style,
     this.publicationLanguage = '',
     this.hyphenator,
+    this.leading,
+    this.leadingWidth = 0,
   });
 
   @override
@@ -278,6 +363,8 @@ class OptimizedJustifiedText extends StatelessWidget {
                 style: style,
                 publicationLanguage: publicationLanguage,
                 hyphenator: hyphenator ?? EnglishHyphenator.instance,
+                leading: index == 0 ? leading : null,
+                leadingWidth: index == 0 ? leadingWidth : 0,
               ),
           ],
         ],
@@ -291,12 +378,16 @@ class _OptimizedParagraphText extends StatelessWidget {
   final TextStyle style;
   final String publicationLanguage;
   final ParagraphHyphenator hyphenator;
+  final InlineSpan? leading;
+  final double leadingWidth;
 
   const _OptimizedParagraphText(
     this.text, {
     required this.style,
     required this.publicationLanguage,
     required this.hyphenator,
+    this.leading,
+    this.leadingWidth = 0,
   });
 
   @override
@@ -311,8 +402,22 @@ class _OptimizedParagraphText extends StatelessWidget {
         MediaQuery.textScalerOf(context),
         publicationLanguage,
         hyphenator,
+        leading: leading,
+        leadingWidth: leadingWidth,
       );
       if (span == null) {
+        if (leading != null) {
+          return Text.rich(
+            TextSpan(
+              style: style,
+              children: [
+                leading!,
+                TextSpan(text: text),
+              ],
+            ),
+            textAlign: TextAlign.justify,
+          );
+        }
         return Text(text, style: style, textAlign: TextAlign.justify);
       }
       return Text.rich(
@@ -331,8 +436,10 @@ TextSpan? _optimizedTextSpan(
   double width,
   TextScaler textScaler,
   String publicationLanguage,
-  ParagraphHyphenator hyphenator,
-) {
+  ParagraphHyphenator hyphenator, {
+  InlineSpan? leading,
+  double leadingWidth = 0,
+}) {
   final hyphenationBreaks = hyphenator.breakOpportunities(
     text: text,
     spans: [HyphenationSpan(start: 0, end: text.length)],
@@ -424,12 +531,12 @@ TextSpan? _optimizedTextSpan(
       1.0,
       width - math.min(1.0, textScaler.scale(style.fontSize ?? 17) * 0.05),
     ),
-    firstLineIndent: 0,
+    firstLineIndent: leadingWidth,
     defaultEm: textScaler.scale(style.fontSize ?? 17),
   );
   if (plan == null) return null;
 
-  final children = <InlineSpan>[];
+  final children = <InlineSpan>[?leading];
   for (var lineIndex = 0; lineIndex < plan.lines.length; lineIndex++) {
     final line = plan.lines[lineIndex];
     final plain = StringBuffer();

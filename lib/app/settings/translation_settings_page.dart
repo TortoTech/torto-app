@@ -71,15 +71,23 @@ class _TranslationSettingsPageState extends State<TranslationSettingsPage> {
         for (final model in provider.models)
           '${provider.id}\u0000$model': '${provider.name} · $model',
     };
-    var selected = '${translation.providerId}\u0000${translation.model}';
-    if (!options.containsKey(selected)) selected = options.keys.first;
+    String? selected = '${translation.providerId}\u0000${translation.model}';
+    if (!options.containsKey(selected)) selected = options.keys.firstOrNull;
     return ListView(
       padding: const EdgeInsets.symmetric(vertical: 12),
       children: [
-        ListTile(
-          title: Text(l10n.text('翻译模型', 'Translation model')),
-          trailing: DropdownButton<String>(
-            value: selected,
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 20, 16, 4),
+          child: Text(
+            l10n.text('翻译模型', 'Translation model'),
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.all(16),
+          child: DropdownButtonFormField<String>(
+            isExpanded: true,
+            initialValue: selected,
             items: [
               for (final entry in options.entries)
                 DropdownMenuItem(value: entry.key, child: Text(entry.value)),
@@ -157,15 +165,17 @@ class _TranslationSettingsPageState extends State<TranslationSettingsPage> {
           onChanged: (value) =>
               _update(translation.copyWith(translateToc: value)),
         ),
-        Padding(
-          padding: const EdgeInsets.all(16),
-          child: Text(
+        SwitchListTile(
+          title: Text(l10n.text('专家翻译', 'Expert translation')),
+          subtitle: Text(
             l10n.text(
-              '开启翻译时，当前页面的正文会发送给所选 AI 提供商。PDF 固定版式暂不支持。',
-              'When translation is enabled, visible book text is sent to the selected AI provider. Fixed-layout PDF is not supported yet.',
+              '按书籍和语言记忆术语，保持后续译文一致',
+              'Remember terminology per book and language for consistent translations',
             ),
-            style: Theme.of(context).textTheme.bodySmall,
           ),
+          value: translation.expertTranslation,
+          onChanged: (value) =>
+              _update(translation.copyWith(expertTranslation: value)),
         ),
       ],
     );

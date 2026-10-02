@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.6.2+6200
+version: 0.7.1+7222
 
 environment:
   sdk: ^3.11.3
@@ -72,6 +72,10 @@ dependencies:
   # dictionaries are bundled; paragraph layout and source mapping stay Dart.
   hyphen: ^0.3.1
   flutter_math_fork: ^0.7.4
+  flutter_markdown_plus: ^1.0.12
+  markdown: ^7.3.0
+  flutter_svg: ^2.2.4
+  webview_flutter: ^4.13.1
 
 dev_dependencies:
   flutter_test:
@@ -107,6 +111,7 @@ flutter:
 
   assets:
     - assets/ai/semantic_layout.md
+    - assets/assistant/
     - assets/ai/formula_images.md
     - assets/ai/formula_transcribe.md
     - assets/ai/formula_verify.md

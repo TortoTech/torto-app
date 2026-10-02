@@ -168,7 +168,7 @@ void main() {
       const normal = TextRun('normal');
       expect(
         TranslationMarkupCodec.encode([sized, normal]),
-        '<torto-size scale="1.2">sized</torto-size>normal',
+        '<t-size scale="1.2">sized</t-size>normal',
       );
       final legacy = TranslationMarkupCodec.decode('Old translation', [
         sized,

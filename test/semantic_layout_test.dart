@@ -1,3 +1,4 @@
+import 'package:torto/app/ai/semantic_wire.dart';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -109,6 +110,7 @@ void main() {
       const AiProviderConfig(
         id: 'p',
         name: 'P',
+        kind: AiProviderKind.openAi,
         baseUrl: 'https://example.test/v1',
         apiKey: 'test',
       ),
@@ -154,6 +156,7 @@ void main() {
         const AiProviderConfig(
           id: 'p',
           name: 'P',
+          kind: AiProviderKind.openAi,
           baseUrl: 'https://example.test/v1',
           apiKey: 'test',
         ),
@@ -368,6 +371,7 @@ void main() {
       const provider = AiProviderConfig(
         id: 'p',
         name: 'P',
+        kind: AiProviderKind.openAi,
         baseUrl: 'https://example.test/v1',
         models: ['m'],
         apiKey: 'test',
@@ -417,7 +421,7 @@ void main() {
     },
   );
   test(
-    'unnumbered headings share one request without an independent review',
+    'numbered headings share one request without an independent review',
     () async {
       final dir = await Directory.systemTemp.createTemp('torto-layout-test');
       addTearDown(() => dir.delete(recursive: true));
@@ -425,13 +429,14 @@ void main() {
       const provider = AiProviderConfig(
         id: 'p',
         name: 'P',
+        kind: AiProviderKind.openAi,
         baseUrl: 'https://example.test/v1',
         apiKey: 'test',
       );
       final client = OpenAiCompatibleClient(
         client: MockClient((request) async {
           final body = jsonDecode(request.body);
-          final input = jsonDecode(body['messages'][1]['content']);
+          final input = SemanticWire.decode(jsonDecode(body['messages'][1]['content']));
           requests++;
           expect(input['review_only'], isNull);
           expect(input['quotes_enabled'], isTrue);
@@ -465,7 +470,7 @@ void main() {
         await service.recognize(
           chapter([
             paragraphAt(0, 'Before'),
-            paragraphAt(1, 'How reading develops'),
+            paragraphAt(1, '1. How reading develops'),
             paragraphAt(2, 'continues'),
           ]),
           'book',

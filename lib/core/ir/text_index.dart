@@ -27,12 +27,14 @@ Iterable<BookTextNode> sectionTextNodes(
             block.source!,
             block.plainText,
             displayId: block.nodeId,
-            selectable: !block.inlines.any(
-              (run) =>
-                  run is MathInline &&
-                  run.original == null &&
-                  run.originalImage == null,
-            ),
+            selectable:
+                !block.nodeId.endsWith('@rewrite') &&
+                !block.inlines.any(
+                  (run) =>
+                      run is MathInline &&
+                      run.original == null &&
+                      run.originalImage == null,
+                ),
           );
         }
       case QuoteBlock():

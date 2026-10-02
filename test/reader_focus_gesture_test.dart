@@ -1,5 +1,6 @@
 import 'package:torto/app/reader/text_selection_layer.dart';
 import 'package:torto/app/reader/focus_reading_state.dart';
+import 'package:torto/app/reader/focus_navigation.dart';
 import 'package:torto/core/ir/text_index.dart';
 import 'package:torto/core/render/page_painter.dart';
 import 'dart:io';
@@ -69,6 +70,12 @@ Future<FocusController> mount(WidgetTester tester, {bool long = false}) async {
       id: spine,
       spineIndex: 0,
       href: 'a',
+      anchors: [
+        ir.SectionAnchor(
+          fragment: 'last',
+          source: ir.SourceAnchor(spine: spine, node: 'last', textOffset: 0),
+        ),
+      ],
       blocks: [
         if (long)
           block('long', 'Long paragraph text. ' * 400)
@@ -83,6 +90,7 @@ Future<FocusController> mount(WidgetTester tester, {bool long = false}) async {
     ),
     const LayoutViewport(width: 411, height: 914),
     const ReaderStyle(focusMode: true, baseFontSize: 20),
+    readingToc: const [ir.TocEntry(label: 'Last', href: 'a#last')],
   );
   final controller = FocusController(pages);
   addTearDown(() {
@@ -101,15 +109,65 @@ Future<FocusController> mount(WidgetTester tester, {bool long = false}) async {
 }
 
 void main() {
+  testWidgets(
+    'horizontal focus transition moves both subsection surfaces together',
+    (tester) async {
+      final controller = await mount(tester);
+      final gesture = await tester.startGesture(const Offset(330, 420));
+      await gesture.moveBy(const Offset(-30, 0));
+      await tester.pump();
+      await gesture.moveBy(const Offset(-110, 0));
+      await tester.pump();
+      final current = tester.widget<Positioned>(
+        find.byKey(const Key('reader-focus-current-slide')),
+      );
+      final neighbour = tester.widget<Positioned>(
+        find.byKey(const Key('reader-focus-neighbour-slide')),
+      );
+      expect(current.left, lessThan(0));
+      expect(neighbour.left! - current.left!, 411);
+      expect(controller.pageIndex, 0);
+      await gesture.up();
+      await tester.pumpAndSettle();
+      expect(controller.pageIndex, 1);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+  testWidgets(
+    'diagonal focus gestures lock to one axis and short drags return to the same block',
+    (tester) async {
+      final controller = await mount(tester);
+      await tester.dragFrom(const Offset(250, 420), const Offset(-250, -20));
+      await tester.pumpAndSettle();
+      expect(controller.pageIndex, 1);
+      await tester.dragFrom(const Offset(70, 420), const Offset(250, 20));
+      await tester.pumpAndSettle();
+      expect(controller.pageIndex, 0);
+      final before = controller.focusReading.active;
+      await tester.dragFrom(const Offset(210, 420), const Offset(20, -160));
+      await tester.pumpAndSettle();
+      expect(controller.pageIndex, 0);
+      expect(controller.focusReading.active, before + 1);
+      final settled = controller.focusReading.offset;
+      final gesture = await tester.startGesture(const Offset(210, 420));
+      await gesture.moveBy(const Offset(0, -25));
+      await tester.pump(const Duration(milliseconds: 500));
+      await gesture.up();
+      await tester.pumpAndSettle();
+      expect(controller.focusReading.active, before + 1);
+      expect(controller.focusReading.offset, settled);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
   testWidgets('sentence splitting is a persistent global focus-only switch', (
     tester,
   ) async {
     final controller = await mount(tester);
     Future<void> openSheet() async {
-      await tester.tapAt(
-        controller.currentPage!.focusUnits.first.bounds.center,
-      );
+      await tester.tapAt(const Offset(205, 30));
       await tester.pumpAndSettle();
+      expect(find.byKey(const Key('reader-focus-previous-page')), findsNothing);
+      expect(find.byKey(const Key('reader-focus-next-page')), findsNothing);
       await tester.tap(find.byKey(const Key('reader-style-button')));
       await tester.pumpAndSettle();
     }
@@ -223,9 +281,7 @@ void main() {
     'focus switch is available in typography and persists independently',
     (tester) async {
       final controller = await mount(tester);
-      await tester.tapAt(
-        controller.currentPage!.focusUnits.first.bounds.center,
-      );
+      await tester.tapAt(const Offset(205, 30));
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const Key('reader-style-button')));
       await tester.pumpAndSettle();
@@ -243,7 +299,7 @@ void main() {
     },
   );
   testWidgets(
-    'vertical swipes activate one unit without moving the page; tap activates',
+    'vertical swipes advance one focus block; taps activate and settle visible blocks',
     (tester) async {
       final controller = await mount(tester);
       final first = controller.currentPage!;
@@ -252,11 +308,16 @@ void main() {
       await tester.pumpAndSettle();
       expect(controller.pageIndex, 0);
       expect(controller.focusReading.active, 1);
+      expect(controller.focusReading.offset, greaterThan(0));
       expect(controller.currentPage, same(first));
       expect(controller.currentPage!.focusUnits.map((u) => u.bounds), bounds);
-      await tester.tapAt(first.focusUnits[2].bounds.center);
+      final visible = controller.displayPage!.focusUnits;
+      final target = visible.indexWhere(
+        (unit) => unit.bounds.top > 50 && unit.bounds.bottom < 850,
+      );
+      await tester.tapAt(visible[target].paintBounds.first.center);
       await tester.pumpAndSettle();
-      expect(controller.focusReading.active, 2);
+      expect(controller.focusReading.active, target);
       expect(controller.pageIndex, 0);
       controller.activateFocusUnit(first.focusUnits.length - 1);
       await tester.pump();
@@ -266,8 +327,8 @@ void main() {
         1800,
       );
       await tester.pumpAndSettle();
-      expect(controller.pageIndex, 0);
-      expect(controller.focusReading.active, first.focusUnits.length - 1);
+      expect(controller.pageIndex, 1);
+      expect(controller.focusReading.active, 0);
       expect(find.byType(Scrollbar), findsNothing);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox());
@@ -293,7 +354,7 @@ void main() {
   });
 
   testWidgets(
-    'long block scrolls with inertia and never turns at its boundary',
+    'long block advances one window then a fresh edge swipe changes subsection',
     (tester) async {
       final controller = await mount(tester, long: true);
       expect(controller.currentPage!.scrollExtent, greaterThan(0));
@@ -316,27 +377,44 @@ void main() {
         1600,
       );
       await tester.pumpAndSettle();
-      expect(controller.pageIndex, 0);
-      expect(
-        controller.focusReading.offset,
-        controller.currentPage!.scrollExtent,
-      );
+      expect(controller.pageIndex, 1);
+      expect(controller.focusReading.active, 0);
       expect(find.byType(Scrollbar), findsNothing);
       await tester.flingFrom(
-        const Offset(330, 400),
-        const Offset(-270, 0),
+        const Offset(210, 400),
+        const Offset(0, 180),
         1200,
       );
       await tester.pumpAndSettle();
-      expect(controller.pageIndex, 1);
-      await tester.flingFrom(const Offset(70, 400), const Offset(270, 0), 1200);
-      await tester.pumpAndSettle();
+      expect(controller.pageIndex, 0);
       expect(
         controller.focusReading.offset,
-        controller.currentPage!.scrollExtent,
+        FocusNavigation.overflow(controller.currentPage!, 0)!.bottom,
       );
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox());
     },
   );
+
+  testWidgets('short edge drags and book boundaries do not change subsection', (
+    tester,
+  ) async {
+    final controller = await mount(tester);
+    await tester.dragFrom(const Offset(210, 400), const Offset(0, 150));
+    await tester.pumpAndSettle();
+    expect(controller.pageIndex, 0);
+    controller.activateFocusUnit(controller.currentPage!.focusUnits.length - 1);
+    await tester.pump();
+    await tester.dragFrom(const Offset(210, 400), const Offset(0, -25));
+    await tester.pumpAndSettle();
+    expect(controller.pageIndex, 0);
+    await tester.flingFrom(const Offset(210, 400), const Offset(0, -160), 1200);
+    await tester.pumpAndSettle();
+    expect(controller.pageIndex, 1);
+    await tester.flingFrom(const Offset(210, 400), const Offset(0, -160), 1200);
+    await tester.pumpAndSettle();
+    expect(controller.pageIndex, 1);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox());
+  });
 }

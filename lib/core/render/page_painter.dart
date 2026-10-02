@@ -22,12 +22,14 @@ class PagePainter extends CustomPainter {
   /// Base foreground used to derive the muted separator color. When null it
   /// is inferred from [background] luminance.
   final Color? foreground;
+  final List<ui.Rect>? visibleFootnoteBounds;
 
   PagePainter({
     required this.page,
     required this.imageResolver,
     required this.background,
     this.foreground,
+    this.visibleFootnoteBounds,
   });
 
   static void _paintParagraph(
@@ -136,7 +138,7 @@ class PagePainter extends CustomPainter {
                 image.height.toDouble(),
               ),
               item.rect,
-              Paint(),
+              Paint()..filterQuality = FilterQuality.medium,
             );
           }
         case SeparatorPlacement():
@@ -155,14 +157,20 @@ class PagePainter extends CustomPainter {
     // all horizontal and vertical edges and submit it as one path instead.
     _paintTableGrid(canvas, tableCells, resolvedForeground.withAlpha(96));
     _paintInlineImages(canvas, page.items, imageResolver);
-    _paintFootnoteIcons(canvas, page.items, footnoteIconColor(background));
+    _paintFootnoteIcons(
+      canvas,
+      page.items,
+      footnoteIconColor(background),
+      visibleBounds: visibleFootnoteBounds,
+    );
   }
 
   @override
   bool shouldRepaint(PagePainter oldDelegate) =>
       !identical(oldDelegate.page, page) ||
       oldDelegate.background != background ||
-      oldDelegate.foreground != foreground;
+      oldDelegate.foreground != foreground ||
+      oldDelegate.visibleFootnoteBounds != visibleFootnoteBounds;
 }
 
 /// Matches torto desktop's semantic footnote-link blue in light and dark
@@ -221,14 +229,19 @@ void _paintInlineImages(
         image,
         ui.Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
         destination,
-        Paint(),
+        Paint()..filterQuality = FilterQuality.medium,
       );
       canvas.restore();
     }
   }
 }
 
-void _paintFootnoteIcons(Canvas canvas, List<PageItem> items, Color color) {
+void _paintFootnoteIcons(
+  Canvas canvas,
+  List<PageItem> items,
+  Color color, {
+  List<ui.Rect>? visibleBounds,
+}) {
   for (final item in items) {
     final ui.Paragraph paragraph;
     final List<TextLinkRange> links;
@@ -252,18 +265,34 @@ void _paintFootnoteIcons(Canvas canvas, List<PageItem> items, Color color) {
         continue;
     }
 
+    final bodyParagraph = paragraph;
+    List<ui.LineMetrics>? bodyLineMetrics;
     for (final link in links.where((link) => link.footnoteIcon)) {
       final boxes = paragraph.getBoxesForRange(link.start, link.end);
       for (final box in boxes) {
         if (box.right - box.left < 0.5 || box.bottom - box.top < 0.5) {
           continue;
         }
-        final bounds = ui.Rect.fromLTRB(
+        var bounds = ui.Rect.fromLTRB(
           paragraphOffset.dx + box.left,
           paragraphOffset.dy + box.top,
           paragraphOffset.dx + box.right,
           paragraphOffset.dy + box.bottom,
         ).intersect(clip);
+        if (link.referenceGlyphAdvance > 0) {
+          bounds = ui.Rect.fromLTWH(
+            paragraphOffset.dx + box.left + link.referencePaintOffset,
+            bounds.top,
+            link.referenceGlyphAdvance,
+            bounds.height,
+          ).intersect(clip);
+        }
+        if (visibleBounds != null &&
+            !visibleBounds.any(
+              (rect) => rect.inflate(1).contains(bounds.center),
+            )) {
+          break;
+        }
         if (!bounds.isEmpty) {
           if (link.websiteIcon) {
             final center = bounds.center,
@@ -282,7 +311,7 @@ void _paintFootnoteIcons(Canvas canvas, List<PageItem> items, Color color) {
               center + ui.Offset(r, 0),
               paint,
             );
-          } else if (link.citationOrdinal > 0) {
+          } else if (link.citationOrdinal > 0 || link.footnoteNumber > 0) {
             final builder =
                 ui.ParagraphBuilder(
                     ui.ParagraphStyle(
@@ -291,11 +320,67 @@ void _paintFootnoteIcons(Canvas canvas, List<PageItem> items, Color color) {
                     ),
                   )
                   ..pushStyle(
-                    ui.TextStyle(color: color, fontFamily: 'Literata'),
+                    ui.TextStyle(
+                      color: color,
+                      fontSize: link.referenceFontSize > 0
+                          ? link.referenceFontSize
+                          : null,
+                      fontFamily: link.referenceFontFamily,
+                      fontWeight:
+                          ui.FontWeight.values[(link.referenceFontWeight ~/
+                                      100 -
+                                  1)
+                              .clamp(0, 8)],
+                      fontVariations:
+                          link.referenceFontFamily == 'Literata' &&
+                              link.referenceFontSize > 0
+                          ? [
+                              ui.FontVariation(
+                                'wght',
+                                link.referenceFontWeight.toDouble(),
+                              ),
+                              ui.FontVariation(
+                                'opsz',
+                                link.referenceFontSize * 0.75,
+                              ),
+                            ]
+                          : null,
+                    ),
                   )
-                  ..addText('[${link.citationOrdinal}]');
+                  ..addText(
+                    link.citationOrdinal > 0
+                        ? '[${link.citationOrdinal}]'
+                        : '${link.footnoteNumber}',
+                  );
             final paragraph = builder.build()
               ..layout(const ui.ParagraphConstraints(width: 1000));
+            if (link.referenceFontSize > 0) {
+              final lineNumber = bodyParagraph.getLineNumberAt(link.start);
+              final bodyMetrics = bodyLineMetrics ??= bodyParagraph
+                  .computeLineMetrics();
+              final markerMetrics = paragraph.computeLineMetrics();
+              if (lineNumber != null &&
+                  lineNumber < bodyMetrics.length &&
+                  markerMetrics.isNotEmpty) {
+                final baseline =
+                    paragraphOffset.dy +
+                    bodyMetrics[lineNumber].baseline -
+                    link.referenceBaselineRise;
+                canvas.drawParagraph(
+                  paragraph,
+                  ui.Offset(
+                    link.referenceGlyphAdvance > 0
+                        ? paragraphOffset.dx +
+                              box.left +
+                              link.referencePaintOffset
+                        : bounds.center.dx - paragraph.longestLine / 2,
+                    baseline - markerMetrics.first.baseline,
+                  ),
+                );
+              }
+              paragraph.dispose();
+              break;
+            }
             final scale = math.min(
               1.0,
               math.min(
@@ -471,6 +556,7 @@ class PageWidget extends StatelessWidget {
   final ui.Image? Function(String href) imageResolver;
   final Color background;
   final Color? foreground;
+  final List<ui.Rect>? visibleFootnoteBounds;
 
   const PageWidget({
     super.key,
@@ -478,6 +564,7 @@ class PageWidget extends StatelessWidget {
     required this.background,
     ui.Image? Function(String href)? imageResolver,
     this.foreground,
+    this.visibleFootnoteBounds,
   }) : imageResolver = imageResolver ?? _noImage;
 
   static ui.Image? _noImage(String href) => null;
@@ -493,6 +580,7 @@ class PageWidget extends StatelessWidget {
           imageResolver: imageResolver,
           background: background,
           foreground: foreground,
+          visibleFootnoteBounds: visibleFootnoteBounds,
         ),
       ),
     );

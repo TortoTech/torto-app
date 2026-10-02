@@ -175,7 +175,10 @@ class SentenceStructure {
         continue;
       }
       if (stack.isEmpty &&
-          ('。！？'.contains(c) || splitSemicolons && ';；'.contains(c))) {
+          ('。！？'.contains(c) ||
+              splitSemicolons &&
+                  ';；:：'.contains(c) &&
+                  (!':：'.contains(c) || !technicalColon(text, i)))) {
         var end = i + 1;
         while (end < text.length &&
             (space(end) || '；;。.!！?？'.contains(text[end]))) {
@@ -306,5 +309,23 @@ class SentenceStructure {
       }
     }
     return attached.toList()..sort();
+  }
+
+  static bool technicalColon(String text, int index) {
+    final before = index > 0 ? text[index - 1] : '';
+    final after = index + 1 < text.length ? text[index + 1] : '';
+    final prefix = text
+        .substring(0, index)
+        .split(RegExp(r'\s'))
+        .last
+        .toLowerCase();
+    return RegExp(r'[0-9]').hasMatch(before) &&
+            RegExp(r'[0-9]').hasMatch(after) ||
+        before == ':' ||
+        after == ':' ||
+        after == '/' ||
+        after == '\\' ||
+        prefix.contains('://') ||
+        const {'mailto', 'tel', 'urn', 'data'}.contains(prefix);
   }
 }

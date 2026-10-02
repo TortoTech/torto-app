@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../l10n/app_localizations.dart';
 import '../update/app_update_service.dart';
@@ -21,6 +22,24 @@ class _AboutPageState extends State<AboutPage> {
   AppUpdateInfo? _updateInfo;
   Object? _updateError;
   bool _checking = false;
+  UpdateSource _source = UpdateSource.automatic;
+
+  @override
+  void initState() {
+    super.initState();
+    SharedPreferences.getInstance().then((prefs) {
+      final stored = prefs.getString('update_source_v1');
+      if (mounted) {
+        setState(
+          () => _source =
+              UpdateSource.values
+                  .where((value) => value.name == stored)
+                  .firstOrNull ??
+              UpdateSource.automatic,
+        );
+      }
+    });
+  }
 
   @override
   void dispose() {
@@ -38,6 +57,7 @@ class _AboutPageState extends State<AboutPage> {
       final packageInfo = await _packageInfo;
       final updateInfo = await _updateService.check(
         currentVersion: packageInfo.version,
+        source: _source,
       );
       if (!mounted) return;
       setState(() => _updateInfo = updateInfo);
@@ -80,10 +100,7 @@ class _AboutPageState extends State<AboutPage> {
 
   String _updateStatus(AppLocalizations l10n) {
     if (_checking) {
-      return l10n.text(
-        '正在连接 GitHub Releases…',
-        'Connecting to GitHub Releases…',
-      );
+      return l10n.text('正在检查更新源…', 'Checking update sources…');
     }
     if (_updateError != null) {
       return l10n.text('检查失败，点击重试', 'Check failed. Tap to retry.');
@@ -164,6 +181,37 @@ class _AboutPageState extends State<AboutPage> {
             clipBehavior: Clip.antiAlias,
             child: Column(
               children: [
+                ListTile(
+                  title: Text(l10n.text('更新源', 'Update source')),
+                  trailing: DropdownButton<UpdateSource>(
+                    value: _source,
+                    items: [
+                      for (final source in UpdateSource.values)
+                        DropdownMenuItem(
+                          value: source,
+                          child: Text(
+                            source == UpdateSource.automatic
+                                ? l10n.text('自动', 'Automatic')
+                                : source == UpdateSource.github
+                                ? 'GitHub'
+                                : 'Gitee',
+                          ),
+                        ),
+                    ],
+                    onChanged: _checking
+                        ? null
+                        : (value) async {
+                            if (value == null) return;
+                            setState(() {
+                              _source = value;
+                              _updateInfo = null;
+                              _updateError = null;
+                            });
+                            await (await SharedPreferences.getInstance())
+                                .setString('update_source_v1', value.name);
+                          },
+                  ),
+                ),
                 ListTile(
                   leading: const Icon(Icons.system_update_outlined),
                   title: Text(l10n.text('检查更新', 'Check for updates')),

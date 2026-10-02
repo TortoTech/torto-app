@@ -445,6 +445,14 @@ class TextLinkRange {
   final LinkRole role;
   final bool footnoteIcon;
   final int citationOrdinal;
+  final int footnoteNumber;
+  final String? referenceScope;
+  final double referenceFontSize;
+  final double referenceBaselineRise;
+  final String referenceFontFamily;
+  final int referenceFontWeight;
+  final double referencePaintOffset;
+  final double referenceGlyphAdvance;
   final bool websiteIcon;
   final String? latex;
   final String? originalImage;
@@ -460,6 +468,14 @@ class TextLinkRange {
     required this.role,
     this.footnoteIcon = false,
     this.citationOrdinal = 0,
+    this.footnoteNumber = 0,
+    this.referenceScope,
+    this.referenceFontSize = 0,
+    this.referenceBaselineRise = 0,
+    this.referenceFontFamily = 'Literata',
+    this.referenceFontWeight = 400,
+    this.referencePaintOffset = 0,
+    this.referenceGlyphAdvance = 0,
     this.websiteIcon = false,
     this.latex,
     this.originalImage,
@@ -558,13 +574,21 @@ class ParagraphDisposalPool {
 
 class FocusUnitLayout {
   final ui.Rect bounds;
+
+  /// Content-only regions. Geometry may include a heading for scroll entry.
+  final List<ui.Rect> paintBounds;
   final List<SourceRange> sources;
   final SourceAnchor? anchor;
   const FocusUnitLayout({
     required this.bounds,
     required this.sources,
+    this.paintBounds = const [],
     this.anchor,
   });
+
+  bool hitTest(ui.Offset position) => paintBounds.isEmpty
+      ? bounds.contains(position)
+      : paintBounds.any((rect) => rect.contains(position));
 
   bool contains(SourceAnchor value) => sources.any((range) {
     if (range.start.spine != value.spine) return false;
@@ -582,6 +606,10 @@ class FocusUnitLayout {
 
 /// Renderer-independent display data for one page.
 class PageLayout {
+  final String? focusId;
+  final double sourceTextLength;
+  final double? endProgression;
+
   /// Complete semantic units in page coordinates; empty in ordinary mode.
   final List<FocusUnitLayout> focusUnits;
   final double scrollExtent;
@@ -601,6 +629,9 @@ class PageLayout {
   final ParagraphDisposalPool? disposalPool;
 
   const PageLayout({
+    this.focusId,
+    this.sourceTextLength = 0,
+    this.endProgression,
     this.focusUnits = const [],
     this.scrollExtent = 0,
     required this.viewport,
@@ -655,12 +686,30 @@ class PageLayout {
       if (!slice.contains(position)) continue;
       for (final link in links) {
         for (final box in paragraph.getBoxesForRange(link.start, link.end)) {
-          final rect = ui.Rect.fromLTRB(
+          if (link.footnoteIcon && box.right - box.left < 0.5) continue;
+          var rect = ui.Rect.fromLTRB(
             paragraphOffset.dx + box.left,
             paragraphOffset.dy + box.top,
             paragraphOffset.dx + box.right,
             paragraphOffset.dy + box.bottom,
           ).intersect(slice);
+          if (link.footnoteIcon &&
+              link.referenceFontSize > 0 &&
+              link.referenceGlyphAdvance > 0) {
+            final line = paragraph.getLineNumberAt(link.start);
+            if (line != null) {
+              final baseline =
+                  paragraphOffset.dy +
+                  paragraph.computeLineMetrics()[line].baseline -
+                  link.referenceBaselineRise;
+              rect = ui.Rect.fromLTWH(
+                paragraphOffset.dx + box.left + link.referencePaintOffset,
+                baseline - link.referenceFontSize,
+                link.referenceGlyphAdvance,
+                link.referenceFontSize * 1.25,
+              ).intersect(slice);
+            }
+          }
           if (!rect.isEmpty && rect.inflate(2).contains(position)) return link;
         }
       }

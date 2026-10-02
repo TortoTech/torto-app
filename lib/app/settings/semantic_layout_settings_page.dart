@@ -17,7 +17,7 @@ class _SemanticLayoutSettingsPageState
   AiSettings? settings;
   bool enabled = false, saving = false;
   String providerId = '', model = '';
-  ReasoningEffort reasoningEffort = ReasoningEffort.defaultLevel;
+  ReasoningEffort reasoningEffort = ReasoningEffort.none;
   @override
   void initState() {
     super.initState();
@@ -169,15 +169,6 @@ class _SemanticLayoutSettingsPageState
                       ),
                     ),
                   ),
-                Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Text(
-                    l.text(
-                      '开启后会将当前阅读小节的原文片段和候选公式图片发送给所选 AI 服务，优先处理可见内容。后台识别并缓存结果，不修改书籍文件；支持与翻译同时使用。不支持图片的模型保留原图。固定版式 PDF 不参与 AI 排版。',
-                      'When enabled, source excerpts and candidate formula images from the current reading subsections are sent to the selected AI service, prioritizing visible content. Results are cached without changing the book. Works alongside translation. Models without image support retain original images; fixed-layout PDFs are excluded.',
-                    ),
-                  ),
-                ),
               ],
             ),
     );

@@ -11,6 +11,7 @@ TextBlock withInlines(TextBlock b, List<Inline> inlines) => TextBlock(
   listOrdered: b.listOrdered,
   listOrdinal: b.listOrdinal,
   listDepth: b.listDepth,
+  listGroupId: b.listGroupId,
   listMarkerVisible: b.listMarkerVisible,
 );
 
@@ -22,6 +23,46 @@ TextRun withRun(TextRun run, String text, {TextStyle? style, String? link}) =>
       language: run.language,
       displayWritingSystem: run.displayWritingSystem,
     );
+
+/// Caption numbering is emphasized without changing authored source offsets.
+List<Inline> emphasizeCaptionLabel(List<Inline> inlines) {
+  final prefix = inlines
+      .takeWhile((inline) => inline is TextRun)
+      .cast<TextRun>()
+      .map((run) => run.text)
+      .join();
+  final label = RegExp(
+    r'^\s*(?:(?:fig(?:ure)?\.?|table)\s+[0-9]+(?:[.\-–][0-9]+)*|[图表](?:格)?\s*[0-9一二三四五六七八九十]+(?:[.\-–][0-9]+)*)(?:[.:：、])?',
+    caseSensitive: false,
+  ).firstMatch(prefix);
+  if (label == null) return inlines;
+  final out = <Inline>[];
+  var offset = 0;
+  for (final inline in inlines) {
+    if (inline is! TextRun || offset >= label.end) {
+      out.add(inline);
+      continue;
+    }
+    final end = (label.end - offset).clamp(0, inline.text.length);
+    out.add(
+      withRun(
+        inline,
+        inline.text.substring(0, end),
+        style: inline.style.copyWith(bold: true),
+      ),
+    );
+    if (end < inline.text.length) {
+      out.add(withRun(inline, inline.text.substring(end)));
+    }
+    offset += inline.text.length;
+  }
+  return out;
+}
+
+bool standaloneTableLabel(String text) => RegExp(
+  r'^(?:table|表格|表)\s*[0-9一二三四五六七八九十]+(?:[.\-–][0-9]+)*[.:：]?$',
+  caseSensitive: false,
+).hasMatch(text.trim());
 
 /// Reading-order traversal shared by recognition, transformation and popups.
 List<TextBlock> blockTexts(Block b) => switch (b) {

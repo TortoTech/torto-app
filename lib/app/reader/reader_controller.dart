@@ -21,14 +21,20 @@ import '../../core/ir/text_index.dart';
 import '../sync/sync_models.dart';
 import 'annotations_repository.dart';
 import 'focus_reading_state.dart';
+import '../../core/formats/image_dimensions.dart';
+import '../../core/reading/rewrite_book_source.dart';
 import '../../core/layout/layout_engine.dart';
+import '../../core/layout/footnote_spacing.dart';
 import '../../core/layout/layout_types.dart';
+import '../../core/layout/focus_layout.dart';
 import '../../core/linebreak/english_hyphenator.dart';
 import '../../core/translation/translation_book_source.dart';
 import '../../core/translation/translation_models.dart';
 import '../ai/ai_models.dart';
 import '../ai/ai_settings_store.dart';
 import '../ai/openai_compatible_client.dart';
+import '../ai/translation_glossary.dart';
+import '../ai/pdf_discovery_service.dart';
 import '../progress_store.dart';
 import '../sync/derived_data_store.dart';
 
@@ -44,12 +50,25 @@ class ReaderFootnote {
   final String text;
   final List<Inline>? inlines;
   final int citationOrdinal;
+  final int footnoteNumber;
+  String get displayMarker => footnoteNumber > 0 ? '$footnoteNumber' : marker;
+  String get popupText {
+    if (citationOrdinal == 0) return text;
+    final value = text.trim();
+    for (final pair in const [('(', ')'), ('（', '）'), ('[', ']'), ('［', '］')]) {
+      if (value.startsWith(pair.$1) && value.endsWith(pair.$2)) {
+        return value.substring(1, value.length - 1).trim();
+      }
+    }
+    return value;
+  }
 
   const ReaderFootnote({
     required this.marker,
     required this.text,
     this.inlines,
     this.citationOrdinal = 0,
+    this.footnoteNumber = 0,
   });
 }
 
@@ -249,6 +268,74 @@ class ReaderController extends ChangeNotifier {
 
   BookSource? _source;
   BookSource? _resourceSource;
+  RewriteBookSource? _rewriteSource;
+  bool _assistantLayoutActive = false;
+  BookSource? get assistantSource => _resourceSource;
+  bool get hasTemporaryRewrites =>
+      _rewriteSource?.replacements.isNotEmpty ?? false;
+  Future<void> clearTemporaryRewrites() async {
+    _rewriteSource?.clear();
+    await _refreshAssistantLayout();
+  }
+
+  Future<void> rewriteAssistantBlocks(Map<String, String> replacements) async {
+    if (translationEnabled) {
+      throw StateError(
+        'Switch to original text before applying a temporary rewrite',
+      );
+    }
+    if (_resourceSource == null ||
+        _rewriteSource == null ||
+        replacements.isEmpty) {
+      throw StateError('No book context');
+    }
+    final pending = <int, Map<String, String>>{};
+    for (final entry in replacements.entries) {
+      final parts = entry.key.split('/');
+      if (parts.length != 2) {
+        throw const FormatException('Invalid block identity');
+      }
+      final index = int.parse(parts[0]);
+      if (index < 0 || index >= sectionCount) {
+        throw const FormatException('Invalid content unit');
+      }
+      final section = await _rewriteSource!.inner.parseSection(index);
+      final block = section.blocks
+          .whereType<TextBlock>()
+          .where((b) => b.nodeId == parts[1])
+          .firstOrNull;
+      if (block == null ||
+          block.kind != TextBlockKind.paragraph ||
+          block.inlines.any(
+            (i) =>
+                i is! TextRun ||
+                i.link != null ||
+                i.style.inlineCitation > 0 ||
+                i.style.inlineRole != InlineRole.normal ||
+                i.style.linkRole != LinkRole.normal,
+          )) {
+        throw StateError('Only plain prose blocks can be rewritten');
+      }
+      if (entry.value.trim().isEmpty || entry.value.length > 20000) {
+        throw const FormatException('Invalid rewrite');
+      }
+      (pending[index] ??= {})[parts[1]] = entry.value;
+    }
+    for (final item in pending.entries) {
+      _rewriteSource!.set(item.key, item.value);
+    }
+    await _refreshAssistantLayout();
+  }
+
+  Future<void> _refreshAssistantLayout() async {
+    _assistantLayoutActive = true;
+    try {
+      await _refreshCurrentSectionPreservingPosition();
+    } finally {
+      _assistantLayoutActive = false;
+    }
+  }
+
   TranslationBookSource? _translationSource;
   SemanticLayoutBookSource? _semanticSource;
   AiSettings? _semanticSettings;
@@ -284,6 +371,16 @@ class ReaderController extends ChangeNotifier {
     final settings = await aiSettingsStore.load();
     if (_disposed || epoch != _semanticEpoch) return;
     _semanticSettings = settings;
+    final active = _activeAiSettings;
+    if (active != null) {
+      // Expert mode affects future requests only; retain successful cached
+      // translations and any request already using its captured settings.
+      _activeAiSettings = active.copyWith(
+        translation: active.translation.copyWith(
+          expertTranslation: settings.translation.expertTranslation,
+        ),
+      );
+    }
     final selection = settings.semanticLayout,
         provider = settings.provider(settings.semanticLayout.providerId);
     final identity = jsonEncode([
@@ -337,7 +434,7 @@ class ReaderController extends ChangeNotifier {
   Set<int> _visibleSemanticBlocks(SemanticPlan plan) {
     final nodes = <String>{};
     final images = <String>{};
-    for (final item in currentPage?.items ?? []) {
+    for (final item in displayPage?.items ?? []) {
       switch (item) {
         case TextPlacement(:final nodeId, :final source):
           nodes.add(source?.start.node ?? nodeId);
@@ -349,7 +446,7 @@ class ReaderController extends ChangeNotifier {
           break;
       }
     }
-    if (currentPage?.firstAnchor case final anchor?) nodes.add(anchor.node);
+    if (readingAnchor case final anchor?) nodes.add(anchor.node);
     return plan.visibleBlocks(nodes, images);
   }
 
@@ -386,7 +483,7 @@ class ReaderController extends ChangeNotifier {
     if (provider == null ||
         !provider.models.contains(selection.model) ||
         provider.baseUrl.isEmpty ||
-        provider.apiKey.isEmpty) {
+        provider.kind.requiresApiKey && provider.apiKey.isEmpty) {
       semanticLayoutError = 'AI layout model unavailable';
       return;
     }
@@ -625,6 +722,12 @@ class ReaderController extends ChangeNotifier {
 
   /// Decoded images by package href; null values mark known-missing.
   final Map<String, ui.Image?> _images = {};
+  final Map<String, ui.Size?> _imageSizes = {};
+  final Map<String, int> _imageDimensions = {};
+  final Map<String, int> _imageRequests = {};
+  Set<String> _visibleImages = {};
+  double _imagePixelRatio = 1;
+  bool _imagePumpActive = false;
 
   int sectionIndex = 0;
   int pageIndex = 0;
@@ -637,6 +740,8 @@ class ReaderController extends ChangeNotifier {
 
   String title = '';
   List<TocEntry> _derivedToc = const [];
+  BookMetadata? _derivedMetadata;
+  int _derivedEpoch = 0;
   AiSettings? _activeAiSettings;
   bool translationEnabled = false;
   bool _translationInFlight = false;
@@ -781,6 +886,19 @@ class ReaderController extends ChangeNotifier {
   List<PageLayout> get currentPages => _sections[sectionIndex] ?? const [];
 
   final focusReading = FocusReadingState();
+  final Map<int, Map<String, SourceAnchor>> _tocAnchors = {};
+  final Map<int, List<String>> _sourceNodeOrder = {};
+
+  Set<String> get reachedTocTargets {
+    final current = readingAnchor;
+    final nodes = _sourceNodeOrder[sectionIndex] ?? const <String>[];
+    final at = current == null ? -1 : nodes.indexOf(current.node);
+    return {
+      for (final entry in (_tocAnchors[sectionIndex] ?? {}).entries)
+        if (at >= 0 && nodes.indexOf(entry.value.node) <= at) entry.key,
+    };
+  }
+
   bool get focusModeAllowed =>
       _format != BookFormat.pdf &&
       _source?.book.metadata.layout != RenditionLayout.prePaginated;
@@ -802,9 +920,20 @@ class ReaderController extends ChangeNotifier {
     }
   }
 
-  void scrollFocus(double offset) {
+  void scrollFocus(double offset, {bool trackVisible = true}) {
     if (busy || currentPage == null) return;
-    if (focusReading.scroll(offset)) {
+    if (focusReading.scroll(
+      offset,
+      usesVisibleAnchor:
+          trackVisible ||
+          (currentPage!.focusUnits
+                      .elementAtOrNull(focusReading.active)
+                      ?.bounds
+                      .height ??
+                  0) >
+              currentPage!.viewport.height,
+    )) {
+      if (trackVisible) focusReading.activateVisible();
       notifyListeners();
       _scheduleSave();
     }
@@ -824,7 +953,11 @@ class ReaderController extends ChangeNotifier {
 
   ReaderStyle get style => _style;
   String get statisticsBookId => _source?.book.id ?? '';
-  BookMetadata? get statisticsMetadata => _source?.book.metadata;
+  PdfBookSource? get pdfSource => _resourceSource is PdfBookSource
+      ? _resourceSource as PdfBookSource
+      : null;
+  BookMetadata? get statisticsMetadata =>
+      _derivedMetadata ?? _source?.book.metadata;
 
   bool _peekPreparing = false;
 
@@ -864,15 +997,52 @@ class ReaderController extends ChangeNotifier {
   double get totalProgression {
     final count = sectionCount;
     if (count == 0) return 0;
-    return ((sectionIndex + (currentPage?.progression ?? 0)) / count).clamp(
-      0.0,
-      1.0,
-    );
+    return ((sectionIndex + readingProgression) / count).clamp(0.0, 1.0);
+  }
+
+  double get readingProgression {
+    final page = currentPage;
+    return page?.focusId == null
+        ? page?.progression ?? 0
+        : focusReading.progression;
   }
 
   /// Synchronous image resolver handed to the render stage.
   ui.Image? resolveImage(String href) =>
       _formulaRasterizer.image(href) ?? _images[href];
+
+  /// A preview owns its texture; it never replaces the reading cache or layout.
+  Future<ui.Image?> imagePreview(String href) async {
+    final source = _resourceSource, size = _imageSizes[href];
+    if (source == null || size == null || size.width <= 0 || size.height <= 0) {
+      return null;
+    }
+    final longest = math.max(size.width, size.height);
+    final dimension = math
+        .min(
+          8192,
+          math.sqrt(16 * 1024 * 1024 / (size.width * size.height)) * longest,
+        )
+        .floor()
+        .clamp(1, 8192);
+    final ui.Image? image;
+    if (source is RasterResourceSource) {
+      image = await (source as RasterResourceSource).rasterResource(
+        href,
+        maxDimension: dimension,
+      );
+    } else {
+      final bytes = await source.resource(href);
+      image = bytes == null
+          ? null
+          : await _decodeReaderImage(bytes, maxDimension: dimension);
+    }
+    if (_disposed || !identical(source, _resourceSource)) {
+      image?.dispose();
+      return null;
+    }
+    return image;
+  }
 
   /// Opens [file], restores the saved position (if any), and paginates the
   /// starting section. Throws when the file is not a readable e-book.
@@ -922,13 +1092,16 @@ class ReaderController extends ChangeNotifier {
       source,
       annotations: annotations,
       inlineOnly: true,
+      localCitations: true,
     );
     final translationSource = TranslationBookSource(preparedSource);
     _translationSource = translationSource;
-    _source = _semanticSource = SemanticLayoutBookSource(
+    _semanticSource = SemanticLayoutBookSource(
       translationSource,
       annotations: annotations,
+      localCitations: true,
     );
+    _source = _rewriteSource = RewriteBookSource(_semanticSource!);
     _style = style.copyWith(
       writingSystem: _book.metadata.writingSystem,
       publicationLanguage: _preferredHyphenationLanguage(
@@ -936,6 +1109,7 @@ class ReaderController extends ChangeNotifier {
       ),
     );
     _derivedToc = const [];
+    _derivedMetadata = null;
     title = _book.metadata.title.isEmpty
         ? _fileTitle(file.path)
         : _book.metadata.title;
@@ -1001,16 +1175,51 @@ class ReaderController extends ChangeNotifier {
     BookSource source,
     Directory booksDirectory,
   ) async {
-    final toc = await DerivedDataStore.fromBooksDirectory(
-      booksDirectory,
-    ).generatedToc(source.book.id, source.book);
-    if (!identical(_resourceSource, source) || toc.isEmpty) return;
-    _derivedToc = toc;
+    final epoch = ++_derivedEpoch;
+    final store = DerivedDataStore.fromBooksDirectory(booksDirectory);
+    final toc = await store.generatedToc(source.book.id, source.book);
+    final metadata = await store.metadata(source.book.id);
+    if (_disposed ||
+        epoch != _derivedEpoch ||
+        !identical(_resourceSource, source)) {
+      return;
+    }
+    if (toc.isNotEmpty) _derivedToc = toc;
+    if (metadata != null) {
+      final original = source.book.metadata;
+      _derivedMetadata = BookMetadata(
+        title: metadata.title.isEmpty ? original.title : metadata.title,
+        authors: metadata.authors.isEmpty ? original.authors : metadata.authors,
+        languages: original.languages,
+        layout: original.layout,
+      );
+      if (metadata.title.isNotEmpty) title = metadata.title;
+    }
+    if (toc.isEmpty && metadata == null) return;
     if (translationEnabled) {
       _translatedTocLabels.clear();
       _queueTocTranslation();
     }
     notifyListeners();
+  }
+
+  Future<void> applyPdfDiscovery(
+    PdfDiscoveryResult result,
+    Directory booksDirectory,
+  ) async {
+    final source = _resourceSource;
+    if (_disposed || source is! PdfBookSource) return;
+    final store = DerivedDataStore.fromBooksDirectory(booksDirectory);
+    _derivedEpoch++;
+    await store.savePdfDiscovery(
+      source.book.id,
+      title: result.title,
+      authors: result.authors,
+      entries: result.entries,
+      specialPages: result.specialPages,
+    );
+    if (_disposed || !identical(_resourceSource, source)) return;
+    await _loadDerivedToc(source, booksDirectory);
   }
 
   bool needsViewport(LayoutViewport next) =>
@@ -1150,7 +1359,7 @@ class ReaderController extends ChangeNotifier {
     _translationRecheckPending = false;
     final source = _translationSource;
     final settings = _activeAiSettings;
-    final page = currentPage;
+    final page = displayPage;
     if (source == null || settings == null || page == null) return;
     final visibleNodes = <String>{};
     for (final item in page.items) {
@@ -1204,6 +1413,15 @@ class ReaderController extends ChangeNotifier {
           ),
           blocks: blocks,
           reasoningEffort: translation.reasoningEffort,
+          glossary: translation.expertTranslation
+              ? TranslationGlossary(
+                  _book.id,
+                  resolvedTranslationTarget(
+                    translation.target,
+                    ui.PlatformDispatcher.instance.locale.languageCode,
+                  ),
+                )
+              : null,
           validate: (translations) =>
               source.validateBatch(requestedSection!, translations),
         );
@@ -1300,6 +1518,15 @@ class ReaderController extends ChangeNotifier {
             ui.PlatformDispatcher.instance.locale.languageCode,
           ),
           reasoningEffort: translation.reasoningEffort,
+          glossary: translation.expertTranslation
+              ? TranslationGlossary(
+                  _book.id,
+                  resolvedTranslationTarget(
+                    translation.target,
+                    ui.PlatformDispatcher.instance.locale.languageCode,
+                  ),
+                )
+              : null,
           blocks: [
             for (final label in labels)
               TranslationBlockInput(
@@ -1411,7 +1638,7 @@ class ReaderController extends ChangeNotifier {
     if (provider.baseUrl.trim().isEmpty) {
       return 'Configure the AI provider URL first.';
     }
-    if (provider.apiKey.trim().isEmpty) {
+    if (provider.kind.requiresApiKey && provider.apiKey.trim().isEmpty) {
       return 'Configure the AI provider API Key first.';
     }
     if (model.trim().isEmpty) return 'Select a translation model first.';
@@ -1679,6 +1906,7 @@ class ReaderController extends ChangeNotifier {
     if (text == null || text.trim().isEmpty) return null;
     return ReaderFootnote(
       marker: link.marker,
+      footnoteNumber: link.footnoteNumber,
       text: _withoutFootnoteMarker(text.trim(), link.marker),
       inlines: section.blocks
           .expand(blockTexts)
@@ -1703,7 +1931,28 @@ class ReaderController extends ChangeNotifier {
         break;
       }
     }
-    final links = (owner ?? [selected])
+    final scope = selected.referenceScope;
+    final scoped = scope == null
+        ? owner ?? [selected]
+        : [
+            for (final page in currentPages)
+              for (final item in page.items)
+                for (final link in switch (item) {
+                  TextPlacement(:final links) ||
+                  TableCellPlacement(:final links) => links,
+                  _ => <TextLinkRange>[],
+                })
+                  if (link.referenceScope == scope) link,
+          ];
+    final seen = <TextLinkRange>{};
+    final seenNumbers = <int>{};
+    final links = scoped
+        .where(
+          (link) =>
+              seen.add(link) &&
+              (link.footnoteNumber == 0 ||
+                  seenNumbers.add(link.footnoteNumber)),
+        )
         .where(
           (link) =>
               !link.websiteIcon &&
@@ -1715,6 +1964,10 @@ class ReaderController extends ChangeNotifier {
           ? 1
           : a.citationOrdinal == 0 && b.citationOrdinal > 0
           ? -1
+          : a.citationOrdinal > 0
+          ? a.citationOrdinal.compareTo(b.citationOrdinal)
+          : a.footnoteNumber > 0 && b.footnoteNumber > 0
+          ? a.footnoteNumber.compareTo(b.footnoteNumber)
           : a.start.compareTo(b.start),
     );
     final out = <ReaderFootnote>[];
@@ -1726,6 +1979,7 @@ class ReaderController extends ChangeNotifier {
                   : link.marker,
               text: link.inlineNote!,
               citationOrdinal: link.citationOrdinal,
+              footnoteNumber: link.footnoteNumber,
             )
           : await resolveFootnote(link);
       if (note != null) out.add(note);
@@ -1822,9 +2076,37 @@ class ReaderController extends ChangeNotifier {
       {'section': index},
     );
     if (cancelled()) return const [];
+    _sourceNodeOrder[index] = [
+      for (final block in section.blocks)
+        for (final range in FocusUnitBuilder.sources(block)) range.start.node,
+    ];
+    final targets = <String, SourceAnchor>{};
+    void collectTargets(List<TocEntry> entries) {
+      for (final entry in entries) {
+        final (path, fragment) = splitPackageFragment(entry.href);
+        if (path == section.href) {
+          final anchor = fragment == null
+              ? section.anchors.firstOrNull?.source
+              : _anchorByFragment(section, fragment)?.source;
+          if (anchor != null) targets[entry.href] = anchor;
+          if (fragment == null && _sourceNodeOrder[index]!.isNotEmpty) {
+            targets[entry.href] = SourceAnchor(
+              spine: section.id,
+              node: _sourceNodeOrder[index]!.first,
+              textOffset: 0,
+            );
+          }
+        }
+        collectTargets(entry.children);
+      }
+    }
+
+    collectTargets(_derivedToc.isNotEmpty ? _derivedToc : book.toc);
+    _tocAnchors[index] = targets;
     await Future.wait([
       _decodeSectionImages(section),
       _formulaRasterizer.prepare(section, style.foreground),
+      FootnoteSpacing.prepare(section, style),
       EnglishHyphenator.instance.ensureLoadedForSection(
         section,
         publicationLanguage: style.publicationLanguage,
@@ -1839,10 +2121,14 @@ class ReaderController extends ChangeNotifier {
       imageSizeResolver: _imageSize,
       coverHref: book.coverHref,
       renditionLayout: book.metadata.layout,
+      readingToc: _derivedToc.isNotEmpty ? _derivedToc : book.toc,
       timeSlice: opened
           ? const Duration(milliseconds: 4)
           : const Duration(milliseconds: 10),
-      shouldPause: () => opened && (_pageTurnActive || !_readerVisible),
+      shouldPause: () =>
+          opened &&
+          !_assistantLayoutActive &&
+          (_pageTurnActive || !_readerVisible),
       shouldCancel: cancelled,
     );
     ReaderDiagnostics.instance.event('layout.complete', {
@@ -1874,11 +2160,11 @@ class ReaderController extends ChangeNotifier {
       for (final inline in inlines) {
         if (inline is MathInline &&
             inline.originalImage != null &&
-            !_images.containsKey(inline.originalImage)) {
+            !_imageSizes.containsKey(inline.originalImage)) {
           hrefs.add(inline.originalImage!);
         }
         if (inline case InlineImageRun(:final image)) {
-          if (!_images.containsKey(image.href)) hrefs.add(image.href);
+          if (!_imageSizes.containsKey(image.href)) hrefs.add(image.href);
         }
       }
     }
@@ -1886,7 +2172,7 @@ class ReaderController extends ChangeNotifier {
     void collectBlock(Block block) {
       switch (block) {
         case ImageBlock():
-          if (!_images.containsKey(block.href)) hrefs.add(block.href);
+          if (!_imageSizes.containsKey(block.href)) hrefs.add(block.href);
         case TextBlock(:final inlines):
           collectInlines(inlines);
         case QuoteBlock(:final body, :final attribution):
@@ -1902,7 +2188,7 @@ class ReaderController extends ChangeNotifier {
           }
         case FigureBlock(:final images, :final captions):
           for (final image in images) {
-            if (!_images.containsKey(image.href)) hrefs.add(image.href);
+            if (!_imageSizes.containsKey(image.href)) hrefs.add(image.href);
           }
           for (final caption in captions) {
             collectInlines(caption.inlines);
@@ -1910,7 +2196,7 @@ class ReaderController extends ChangeNotifier {
         case NoteBlock(:final blocks):
           blocks.forEach(collectBlock);
         case SeparatorBlock(:final image):
-          if (image != null && !_images.containsKey(image.href)) {
+          if (image != null && !_imageSizes.containsKey(image.href)) {
             hrefs.add(image.href);
           }
         case PageBreakBlock() || LineBreakBlock():
@@ -1920,50 +2206,177 @@ class ReaderController extends ChangeNotifier {
 
     section.blocks.forEach(collectBlock);
     if (hrefs.isEmpty) return;
-    final decodeDimension = math.min(
-      2048,
-      math.max(1, math.sqrt(24 * 1024 * 1024 / (4 * hrefs.length)).floor()),
-    );
     for (final href in hrefs) {
       if (_disposed) return;
-      await (() async {
-        try {
-          final source = _resourceSource!;
-          if (source is RasterResourceSource) {
-            final rasterSource = source as RasterResourceSource;
-            _images[href] = await rasterSource.rasterResource(
-              href,
-              maxDimension: decodeDimension,
+      try {
+        final source = _resourceSource!;
+        if (source is PdfBookSource) {
+          _imageSizes[href] = source.resourceSize(href);
+        } else {
+          final bytes = await source.resource(href);
+          if (bytes == null) {
+            _imageSizes[href] = null;
+            continue;
+          }
+          final dimensions = readImageDimensions(bytes);
+          if (dimensions != null) {
+            _imageSizes[href] = ui.Size(
+              dimensions.$1.toDouble(),
+              dimensions.$2.toDouble(),
             );
           } else {
-            final bytes = await source.resource(href);
-            _images[href] = bytes == null
-                ? null
-                : await _decodeReaderImage(
-                    bytes,
-                    maxDimension: decodeDimension,
-                  );
+            final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
+            try {
+              final descriptor = await ui.ImageDescriptor.encoded(buffer);
+              try {
+                _imageSizes[href] = ui.Size(
+                  descriptor.width.toDouble(),
+                  descriptor.height.toDouble(),
+                );
+              } finally {
+                descriptor.dispose();
+              }
+            } finally {
+              buffer.dispose();
+            }
           }
-        } catch (error, stackTrace) {
-          debugPrint(
-            'Could not decode reader image $href: $error\n$stackTrace',
-          );
-          if (_resourceSource is PdfBookSource) rethrow;
-          _images[href] = null; // missing or undecodable: render without it
         }
-      })();
-      if (_disposed) {
-        _images.remove(href)?.dispose();
-        return;
+      } catch (error) {
+        _imageSizes[href] = null;
+        debugPrint('Image metadata failed: $error');
       }
       await Future<void>.delayed(Duration.zero);
     }
   }
 
-  ui.Size? _imageSize(String href) {
-    final image = _images[href];
-    if (image == null) return null;
-    return ui.Size(image.width.toDouble(), image.height.toDouble());
+  ui.Size? _imageSize(String href) => _imageSizes[href];
+
+  /// Layout keeps source dimensions; pixel textures are loaded only on demand.
+  void prepareReaderImages(Iterable<PageLayout> pages, double pixelRatio) {
+    if (_disposed || _resourceSource == null) return;
+    _imagePixelRatio = pixelRatio;
+    final wanted = <String, int>{};
+    void request(String href, double width, double height) {
+      final size = _imageSizes[href];
+      if (size == null || size.width <= 0 || size.height <= 0) return;
+      final scale = math.max(
+        width * pixelRatio / size.width,
+        height * pixelRatio / size.height,
+      );
+      final source = _resourceSource is PdfBookSource
+          ? double.infinity
+          : math.max(size.width, size.height);
+      final longest = math.max(size.width, size.height);
+      final pixelCap =
+          math.sqrt(4 * 1024 * 1024 / (size.width * size.height)) * longest;
+      final dimension = math
+          .min(source, math.min(8192, math.min(pixelCap, longest * scale)))
+          .ceil()
+          .clamp(1, 8192);
+      wanted[href] = math.max(wanted[href] ?? 0, dimension);
+    }
+
+    for (final page in pages) {
+      for (final item in page.items) {
+        if (item is ImagePlacement &&
+            item.rect.overlaps(
+              ui.Rect.fromLTWH(0, 0, page.viewport.width, page.viewport.height),
+            )) {
+          request(item.href, item.rect.width, item.rect.height);
+        } else if (item is TextPlacement || item is TableCellPlacement) {
+          final images = item is TextPlacement
+              ? item.inlineImages
+              : (item as TableCellPlacement).inlineImages;
+          for (final image in images) {
+            request(image.href, image.width, image.height);
+          }
+        }
+      }
+    }
+    _visibleImages = wanted.keys.toSet();
+    _imageRequests.removeWhere((href, _) => !wanted.containsKey(href));
+    for (final entry in wanted.entries) {
+      if ((_imageDimensions[entry.key] ?? 0) < entry.value &&
+              !_images.containsKey(entry.key) ||
+          (_images[entry.key] != null &&
+              (_imageDimensions[entry.key] ?? 0) < entry.value)) {
+        _imageRequests[entry.key] = entry.value;
+      }
+    }
+    if (!_imagePumpActive && _imageRequests.isNotEmpty) {
+      unawaited(_pumpReaderImages());
+    }
+  }
+
+  Future<void> _pumpReaderImages() async {
+    _imagePumpActive = true;
+    // Never notify while the caller is building or painting a page.
+    await Future<void>.delayed(Duration.zero);
+    try {
+      while (!_disposed && _imageRequests.isNotEmpty) {
+        final entry = _imageRequests.entries.first;
+        _imageRequests.remove(entry.key);
+        if ((_imageDimensions[entry.key] ?? 0) >= entry.value) continue;
+        final source = _resourceSource;
+        if (source == null) break;
+        ui.Image? image;
+        try {
+          if (source is RasterResourceSource) {
+            image = await (source as RasterResourceSource).rasterResource(
+              entry.key,
+              maxDimension: entry.value,
+            );
+          } else {
+            final bytes = await source.resource(entry.key);
+            if (bytes != null) {
+              image = await _decodeReaderImage(
+                bytes,
+                maxDimension: entry.value,
+              );
+            }
+          }
+          if (_disposed ||
+              !identical(source, _resourceSource) ||
+              !_visibleImages.contains(entry.key)) {
+            image?.dispose();
+            continue;
+          }
+          final old = _images.remove(entry.key);
+          _images[entry.key] = image;
+          _imageDimensions[entry.key] = entry.value;
+          old?.dispose();
+          _trimReaderImages();
+          ReaderDiagnostics.instance.event('image.ready', {
+            'href': entry.key,
+            'width': image?.width ?? 0,
+            'height': image?.height ?? 0,
+            'dpr': _imagePixelRatio,
+          });
+          notifyListeners();
+        } catch (error) {
+          if (!_disposed) {
+            _images[entry.key] = null;
+            debugPrint('Image decode failed: $error');
+          }
+        }
+        await Future<void>.delayed(Duration.zero);
+      }
+    } finally {
+      _imagePumpActive = false;
+    }
+  }
+
+  void _trimReaderImages() {
+    int bytes() => _images.values.fold(
+      0,
+      (n, image) => n + (image == null ? 0 : image.width * image.height * 4),
+    );
+    for (final href in _images.keys.toList()) {
+      if (bytes() <= 48 * 1024 * 1024) break;
+      if (_visibleImages.contains(href)) continue;
+      _images.remove(href)?.dispose();
+      _imageDimensions.remove(href);
+    }
   }
 
   static Future<ui.Image> _decodeReaderImage(
@@ -2029,10 +2442,12 @@ class ReaderController extends ChangeNotifier {
         .toList();
     for (final href in staleImages) {
       _images.remove(href)?.dispose();
+      _imageDimensions.remove(href);
     }
   }
 
-  static void _disposePages(List<PageLayout> pages) {
+  void _disposePages(List<PageLayout> pages) {
+    focusReading.detach(pages);
     for (final page in pages) {
       page.dispose();
     }
@@ -2053,12 +2468,15 @@ class ReaderController extends ChangeNotifier {
   }
 
   Future<void> _saveProgress() async {
+    if (busy) {
+      _progressDirty = true;
+      return;
+    }
     final source = _source;
     if (source == null) return;
     final book = source.book;
     if (book.sectionCount == 0) return;
-    final page = currentPage;
-    final progression = page?.progression ?? 0.0;
+    final progression = readingProgression;
     final displayedAnchor = readingAnchor;
     // Translation has no character-level original alignment. Persist the
     // canonical paragraph start, never a translated-text offset as original.
@@ -2132,6 +2550,9 @@ class ReaderController extends ChangeNotifier {
       image?.dispose();
     }
     _images.clear();
+    _imageSizes.clear();
+    _imageDimensions.clear();
+    _imageRequests.clear();
     final resourceSource = _resourceSource;
     if (resourceSource is DisposableBookSource) {
       (resourceSource as DisposableBookSource).dispose();

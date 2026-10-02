@@ -157,8 +157,8 @@ void main() {
         const MathInline(r'\frac{x}{2}', original: [TextRun('x/2')]),
       ];
       final encoded = TranslationMarkupCodec.encode(original);
-      expect(encoded, contains('<torto-protected-0/>'));
-      expect(encoded, contains('<torto-protected-1/>'));
+      expect(encoded, contains('<citation id="1">(Smith, 2020)</citation>'));
+      expect(encoded, contains('<t-web-0/>'));
       final decoded = TranslationMarkupCodec.decode(
         encoded,
         original,
@@ -180,7 +180,7 @@ void main() {
       );
       expect(
         () => TranslationMarkupCodec.decode(
-          encoded.replaceAll('<torto-protected-0/>', ''),
+          encoded.replaceAll('<citation id="1">(Smith, 2020)</citation>', ''),
           original,
           language: 'zh-CN',
           requireSizeMarkup: true,

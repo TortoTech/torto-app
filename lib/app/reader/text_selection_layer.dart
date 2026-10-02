@@ -183,6 +183,7 @@ class ReaderSelectionLayer extends StatefulWidget {
 }
 
 class ReaderSelectionLayerState extends State<ReaderSelectionLayer> {
+  ReaderSelection? get selection => _selection;
   String? markAt(Offset point) {
     for (final mark in widget.marks) {
       if (mark.annotationId != null &&
@@ -223,6 +224,16 @@ class ReaderSelectionLayerState extends State<ReaderSelectionLayer> {
       if (node.text.isEmpty || !node.selectable) continue;
       for (final surface in surfaces.where((s) => s.node == node.displayId)) {
         if (!surface.clip.contains(position)) continue;
+        if (surfaces.any(
+              (other) =>
+                  other.node != surface.node &&
+                  other.clip.overlaps(surface.clip),
+            ) &&
+            !surface
+                .boxes(0, node.text.runes.length)
+                .any((box) => box.inflate(1).contains(position))) {
+          continue;
+        }
         final p = surface.paragraph
             .getPositionForOffset(position - surface.origin)
             .offset;

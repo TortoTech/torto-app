@@ -1,3 +1,4 @@
+import 'package:torto/app/ai/semantic_wire.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -124,7 +125,7 @@ void main() {
               client: MockClient((request) {
                 final body = jsonDecode(request.body);
                 expect(body['reasoning_effort'], 'low');
-                requests.add(jsonDecode(body['messages'][1]['content']) as Map);
+                requests.add(SemanticWire.decode(jsonDecode(body['messages'][1]['content'])) as Map);
                 final reply = Completer<http.Response>();
                 replies.add(reply);
                 return reply.future;
@@ -185,7 +186,7 @@ void main() {
         translations++;
         await releaseTranslation.future;
         final body = jsonDecode(request.body);
-        final input = jsonDecode(body['messages'][1]['content']) as Map;
+        final input = SemanticWire.decode(jsonDecode(body['messages'][1]['content'])) as Map;
         return response(
           input.map((key, value) => MapEntry(key, 'Translated text.')),
         );

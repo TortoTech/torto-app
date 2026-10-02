@@ -25,6 +25,7 @@ void main() {
 
     await tester.tap(find.text('设置'));
     await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(find.text('关于 Torto'), 200);
     expect(find.text('关于 Torto'), findsOneWidget);
 
     final about = find.byIcon(Icons.info_outline);

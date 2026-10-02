@@ -9,6 +9,7 @@ import '../sync/cloud_settings_page.dart';
 import '../sync/cloud_sync_controller.dart';
 import 'about_page.dart';
 import 'ai_providers_page.dart';
+import 'assistant_settings_page.dart';
 import 'app_preferences.dart';
 import 'reading_settings_page.dart';
 import 'system_settings_page.dart';
@@ -57,7 +58,9 @@ class SettingsPage extends StatelessWidget {
           ListTile(
             leading: const Icon(Icons.dns_outlined),
             title: Text(l10n.text('AI 提供商', 'AI providers')),
-            subtitle: const Text('OpenAI-compatible API'),
+            subtitle: Text(
+              l10n.text('提供商、密钥与模型', 'Providers, API keys and models'),
+            ),
             trailing: const Icon(Icons.chevron_right),
             onTap: () => Navigator.of(context).push(
               MaterialPageRoute<void>(builder: (_) => const AiProvidersPage()),
@@ -73,6 +76,19 @@ class SettingsPage extends StatelessWidget {
             onTap: () => Navigator.of(context).push(
               MaterialPageRoute<void>(
                 builder: (_) => const TranslationSettingsPage(),
+              ),
+            ),
+          ),
+          ListTile(
+            leading: const Icon(Icons.chat_outlined),
+            title: Text(l10n.text('阅读助手', 'Reading assistant')),
+            subtitle: Text(
+              l10n.text('对话、PDF 识别与联网搜索', 'Chat, PDF discovery and web search'),
+            ),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => const AssistantSettingsPage(),
               ),
             ),
           ),

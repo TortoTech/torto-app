@@ -1,3 +1,4 @@
+import 'package:torto/app/ai/semantic_wire.dart';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/services.dart';
@@ -45,7 +46,9 @@ void main() {
         client: OpenAiCompatibleClient(
           client: MockClient((request) async {
             final body = jsonDecode(request.body),
-                input = jsonDecode(body['messages'][1]['content']);
+                input = SemanticWire.decode(
+                  jsonDecode(body['messages'][1]['content']),
+                );
             expect(input['blocks'][1]['text'], '— Author');
             expect(input['blocks'][1]['math_texts'], isEmpty);
             return http.Response(
@@ -247,7 +250,9 @@ void main() {
           client: MockClient((request) async {
             final body = jsonDecode(request.body);
             final prompt = body['messages'][0]['content'] as String;
-            final input = jsonDecode(body['messages'][1]['content']);
+            final input = SemanticWire.decode(
+              jsonDecode(body['messages'][1]['content']),
+            );
             metrics.addAll({
               'system_prompt_chars': prompt.length,
               'user_input_chars':

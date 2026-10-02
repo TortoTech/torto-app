@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:torto/app/ai/ai_models.dart';
 import 'package:torto/app/ai/ai_settings_store.dart';
 import 'package:torto/app/ai/openai_compatible_client.dart';
+import 'package:torto/app/ai/translation_glossary.dart';
 import 'package:torto/app/progress_store.dart';
 import 'package:torto/app/reader/reader_controller.dart';
 import 'package:torto/core/layout/layout_types.dart';
@@ -33,6 +34,7 @@ class _DelayedClient extends OpenAiCompatibleClient {
   final requests = <String>[];
   @override
   Future<List<BlockTranslation>> translateBlocks({
+    TranslationGlossary? glossary,
     required AiProviderConfig provider,
     required String model,
     required String targetLanguage,
@@ -51,6 +53,7 @@ class _SuccessfulClient extends OpenAiCompatibleClient {
   final release = Completer<void>();
   @override
   Future<List<BlockTranslation>> translateBlocks({
+    TranslationGlossary? glossary,
     required AiProviderConfig provider,
     required String model,
     required String targetLanguage,

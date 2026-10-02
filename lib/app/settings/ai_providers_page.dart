@@ -209,12 +209,14 @@ class _AiProviderEditPageState extends State<AiProviderEditPage> {
       );
     return widget.provider.copyWith(
       kind: _kind,
-      name: _name.text.trim(),
+      name: _kind == AiProviderKind.custom ? _name.text.trim() : _kind.label,
       baseUrl: _baseUrl.text.trim(),
       apiKey: _apiKey.text.trim(),
-      models: models.isEmpty ? const ['gpt-4o-mini'] : models,
+      models: models,
     );
   }
+
+  String _providerQuery = '';
 
   void _onProviderEndpointChanged() => _scheduleModelFetch();
 
@@ -274,7 +276,9 @@ class _AiProviderEditPageState extends State<AiProviderEditPage> {
     final baseUrl = value.defaultBaseUrl;
     setState(() {
       _kind = value;
-      if (_name.text.trim().isEmpty || _name.text == oldLabel) {
+      if (value != AiProviderKind.custom ||
+          _name.text.trim().isEmpty ||
+          _name.text == oldLabel) {
         _name.text = value.label;
       }
     });
@@ -444,6 +448,14 @@ class _AiProviderEditPageState extends State<AiProviderEditPage> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          TextField(
+            decoration: InputDecoration(
+              prefixIcon: const Icon(Icons.search),
+              hintText: l10n.text('搜索提供商', 'Search providers'),
+            ),
+            onChanged: (value) => setState(() => _providerQuery = value),
+          ),
+          const SizedBox(height: 16),
           DropdownButtonFormField<AiProviderKind>(
             initialValue: _kind,
             decoration: InputDecoration(
@@ -451,13 +463,15 @@ class _AiProviderEditPageState extends State<AiProviderEditPage> {
             ),
             items: [
               for (final kind in AiProviderKind.values)
-                DropdownMenuItem(value: kind, child: Text(kind.label)),
+                if (kind == _kind || kind.matches(_providerQuery))
+                  DropdownMenuItem(value: kind, child: Text(kind.label)),
             ],
             onChanged: _selectKind,
           ),
           const SizedBox(height: 16),
           TextField(
             controller: _name,
+            enabled: _kind == AiProviderKind.custom,
             decoration: InputDecoration(labelText: l10n.text('名称', 'Name')),
           ),
           const SizedBox(height: 16),

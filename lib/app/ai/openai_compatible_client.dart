@@ -6,6 +6,9 @@ import 'package:http/http.dart' as http;
 
 import '../../core/translation/translation_models.dart';
 import 'ai_models.dart';
+import 'llm_transport.dart';
+import 'translation_glossary.dart';
+import 'semantic_wire.dart';
 
 String translationSystemPrompt(
   String targetLanguage, {
@@ -19,7 +22,7 @@ String translationSystemPrompt(
 # 翻译任务
 - 把输入 JSON 对象中的每个值翻译为$targetLanguage。
 - 不要直译，按$targetLanguage语言习惯翻译。
-- 保留 <torto-size scale="...">...</torto-size> 字号标签及其数值，翻译标签内文字，不得删除、复制或修改字号。
+- 保留 <t-size scale="...">...</t-size> 字号标签及其数值，翻译标签内文字，不得删除、复制或修改字号。
 - 忠实保留原文语气、事实、专名所指与段落结构。
 
 # 中文表达（目标语言为中文时）
@@ -28,13 +31,36 @@ String translationSystemPrompt(
 
 # 正文结构
 - 每个 JSON 值都是独立正文块。原文开头没有项目符号、编号或列表标记时，译文绝对不得新增；原文有列表标记时保持相同类型。
-- <strong>、<em>、<i>、<cite>、<torto-italic>、<u>、<s>、<sup>、<sub>、<noteref>、<noteback>、<inlinefootnote> 及其闭合标签是行内结构标记。必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。
-- <torto-math-0/>、<torto-math-1/> 等自闭合标签是不可修改的公式占位符。可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。
+- <strong>、<em>、<i>、<cite>、<t-italic>、<u>、<s>、<sup>、<sub>、<noteback> 及其闭合标签是行内结构标记。必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。
+- Preserve each <t-note-N/> footnote reference and <t-web-N/> website exactly once, attached to its corresponding claim. Never translate, expand or renumber these source identities. Keep literal websites unchanged.
+- Translate contents of <inlinefootnote id="N">...</inlinefootnote> and <citation id="N">...</citation>, preserving each group and its ID exactly once. Keep bibliographic names and years accurate; never invent or merge IDs. Untagged paragraphs must not acquire citation tags. Numeric paragraph JSON keys are not citation IDs.
+- <t-math-0/>、<t-math-1/> 等自闭合标签是不可修改的公式占位符。可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。
 $fixedPageSection
 # 输出格式
-- <torto-protected-0/> 等是文献引用或网址的原文占位符。可随语序移动，每个必须原样保留恰好一次，不得翻译、展开、删除或重编号。
-- 只返回一个 JSON 对象，保留完全相同的键；每个值只能是对应译文字符串。''';
+- Return one JSON object with exactly the requested paragraph keys, each mapped to its translated string. Optional glossary metadata is g; never add another paragraph key.''';
 }
+
+const translationResponseSchema = <String, dynamic>{
+  'type': 'object',
+  'properties': {
+    'g': {
+      'type': 'array',
+      'items': {
+        'type': 'object',
+        'properties': {
+          's': {'type': 'string'},
+          't': {'type': 'string'},
+        },
+        'required': ['s', 't'],
+        'additionalProperties': false,
+      },
+    },
+  },
+  'patternProperties': {
+    r'^[0-9]+$': {'type': 'string', 'minLength': 1},
+  },
+  'additionalProperties': false,
+};
 
 String preserveLeadingListMarker(String source, String translation) {
   final sourceMarker = _leadingListMarker(source);
@@ -86,52 +112,21 @@ class OpenAiCompatibleClient {
     String schemaName = 'ebook_semantic_groups',
     int? maxTokens,
     ReasoningEffort reasoningEffort = ReasoningEffort.defaultLevel,
+    bool compact = false,
   }) async {
-    _validateProvider(provider, model);
-    final response = await _client
-        .post(
-          _chatCompletionsUri(provider.baseUrl),
-          headers: {
-            ..._headers(provider.apiKey),
-            'Content-Type': 'application/json',
-          },
-          body: jsonEncode({
-            'model': model,
-            'max_tokens': ?maxTokens,
-            if (reasoningEffort.apiValue != null)
-              'reasoning_effort': reasoningEffort.apiValue,
-            'temperature': 0,
-            'messages': [
-              {'role': 'system', 'content': prompt},
-              {
-                'role': 'user',
-                'content': images.isEmpty
-                    ? jsonEncode(input)
-                    : [
-                        {'type': 'text', 'text': jsonEncode(input)},
-                        ...images,
-                      ],
-              },
-            ],
-            'response_format': {
-              'type': 'json_schema',
-              'json_schema': {
-                'name': schemaName,
-                'strict': true,
-                'schema': schema,
-              },
-            },
-          }),
-        )
-        .timeout(const Duration(seconds: 90));
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw StateError('AI layout HTTP ${response.statusCode}');
-    }
-    final result = jsonDecode(_messageContent(response.body));
-    if (result is! Map<String, dynamic>) {
-      throw const FormatException('Invalid AI layout response');
-    }
-    return result;
+    final content = await LlmTransport(_client).generate(
+      provider: provider,
+      model: model,
+      system: compact ? SemanticWire.instructions(prompt) : prompt,
+      input: compact ? SemanticWire.convert(input) : input,
+      images: images,
+      schema: compact ? SemanticWire.schema(schema) : schema,
+      schemaName: schemaName,
+      maxTokens: maxTokens,
+      effort: reasoningEffort,
+    );
+    final result = decodeLlmObject(content);
+    return compact ? SemanticWire.convert(result, decode: true) : result;
   }
 
   static const _maxTranslationChars = 2000;
@@ -145,25 +140,7 @@ class OpenAiCompatibleClient {
   void close() => _client.close();
 
   Future<List<String>> fetchModels(AiProviderConfig provider) async {
-    final response = await _client
-        .get(_modelsUri(provider.baseUrl), headers: _headers(provider.apiKey))
-        .timeout(const Duration(seconds: 20));
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw AiRequestException(_httpError('Failed to load models', response));
-    }
-    final decoded = jsonDecode(response.body);
-    if (decoded is! Map || decoded['data'] is! List) {
-      throw const AiRequestException('The model response is invalid.');
-    }
-    final models =
-        <String>{
-          for (final value in (decoded['data'] as List).whereType<Map>())
-            if ((value['id'] as String? ?? '').trim().isNotEmpty)
-              (value['id'] as String).trim(),
-        }.toList()..sort(
-          (left, right) => left.toLowerCase().compareTo(right.toLowerCase()),
-        );
-    return models;
+    return LlmTransport(_client).models(provider);
   }
 
   Future<List<BlockTranslation>> translateBlocks({
@@ -172,6 +149,7 @@ class OpenAiCompatibleClient {
     required String targetLanguage,
     required List<TranslationBlockInput> blocks,
     ReasoningEffort reasoningEffort = ReasoningEffort.defaultLevel,
+    TranslationGlossary? glossary,
     FutureOr<void> Function(List<BlockTranslation> translations)? validate,
   }) async {
     _validateProvider(provider, model);
@@ -185,6 +163,7 @@ class OpenAiCompatibleClient {
           blocks: batch,
           reasoningEffort: reasoningEffort,
           validate: validate,
+          glossary: glossary,
         ),
       );
     }
@@ -197,6 +176,7 @@ class OpenAiCompatibleClient {
     required String targetLanguage,
     required List<TranslationBlockInput> blocks,
     required ReasoningEffort reasoningEffort,
+    TranslationGlossary? glossary,
     required FutureOr<void> Function(List<BlockTranslation> translations)?
     validate,
   }) async {
@@ -207,31 +187,21 @@ class OpenAiCompatibleClient {
     Object? lastError;
     for (var attempt = 0; attempt < _maxAttempts; attempt++) {
       try {
-        final response = await _client
-            .post(
-              _chatCompletionsUri(provider.baseUrl),
-              headers: {
-                ..._headers(provider.apiKey),
-                'content-type': 'application/json',
-              },
-              body: jsonEncode({
-                'model': model,
-                'temperature': 0.2,
-                'reasoning_effort': ?reasoningEffort.apiValue,
-                'messages': [
-                  {
-                    'role': 'system',
-                    'content': translationSystemPrompt(targetLanguage),
-                  },
-                  {'role': 'user', 'content': jsonEncode(input)},
-                ],
-              }),
-            )
-            .timeout(const Duration(seconds: 90));
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-          throw AiRequestException(_httpError('Translation failed', response));
-        }
-        final content = _messageContent(response.body);
+        final context = glossary == null ? '' : await glossary.prompt(blocks);
+        final content = await LlmTransport(_client).generate(
+          provider: provider,
+          model: model,
+          system:
+              translationSystemPrompt(targetLanguage) +
+              (glossary == null
+                  ? '\nTerminology extraction is disabled.'
+                  : TranslationGlossary.instructions),
+          input:
+              '${jsonEncode(input)}${context.isEmpty ? '' : '\n$context'}${lastError == null ? '' : '\nPrevious response failed validation: $lastError. Translate the original input again; preserve only existing source identities.'}',
+          schema: translationResponseSchema,
+          schemaName: 'translation',
+          effort: reasoningEffort,
+        );
         final values = _translationObject(content, blocks.length);
         final translations = [
           for (var index = 0; index < blocks.length; index++)
@@ -245,6 +215,9 @@ class OpenAiCompatibleClient {
             ),
         ];
         await validate?.call(translations);
+        if (glossary != null) {
+          await glossary.merge(content, blocks, translations);
+        }
         return translations;
       } catch (error) {
         lastError = error;
@@ -258,7 +231,7 @@ class OpenAiCompatibleClient {
     if (provider.baseUrl.trim().isEmpty) {
       throw const AiRequestException('Configure the AI provider URL first.');
     }
-    if (provider.apiKey.trim().isEmpty) {
+    if (provider.kind.requiresApiKey && provider.apiKey.trim().isEmpty) {
       throw const AiRequestException(
         'Configure the AI provider API Key first.',
       );
@@ -266,7 +239,7 @@ class OpenAiCompatibleClient {
     if (model.trim().isEmpty) {
       throw const AiRequestException('Select a translation model first.');
     }
-    _chatCompletionsUri(provider.baseUrl);
+    LlmTransport.endpoint(provider.baseUrl);
   }
 
   static List<List<TranslationBlockInput>> _batches(
@@ -290,19 +263,13 @@ class OpenAiCompatibleClient {
   }
 
   static List<String> _translationObject(String content, int count) {
-    var candidate = content.trim();
-    if (candidate.startsWith('```')) {
-      candidate = candidate.replaceFirst(RegExp(r'^```(?:json)?\s*'), '');
-      candidate = candidate.replaceFirst(RegExp(r'\s*```$'), '');
-    }
-    final start = candidate.indexOf('{');
-    final end = candidate.lastIndexOf('}');
-    if (start < 0 || end < start) {
-      throw const FormatException('Translation did not return a JSON object.');
-    }
-    final decoded = jsonDecode(candidate.substring(start, end + 1));
-    if (decoded is! Map) {
-      throw const FormatException('Translation did not return a JSON object.');
+    final decoded = decodeLlmObject(content);
+    if (decoded.keys.any(
+      (key) => key != 'g' && !List.generate(count, (i) => '$i').contains(key),
+    )) {
+      throw const FormatException(
+        'Translation returned an unrequested text block.',
+      );
     }
     return [
       for (var index = 0; index < count; index++)
@@ -312,70 +279,6 @@ class OpenAiCompatibleClient {
         else
           throw const FormatException('Translation omitted a text block.'),
     ];
-  }
-
-  static String _messageContent(String body) {
-    final decoded = jsonDecode(body);
-    if (decoded is! Map || decoded['choices'] is! List) {
-      throw const FormatException('The AI response is invalid.');
-    }
-    final choices = decoded['choices'] as List;
-    if (choices.isEmpty || choices.first is! Map) {
-      throw const FormatException('The AI response is empty.');
-    }
-    final message = (choices.first as Map)['message'];
-    if (message is! Map || message['content'] is! String) {
-      throw const FormatException('The AI response is empty.');
-    }
-    return message['content'] as String;
-  }
-
-  static Map<String, String> _headers(String apiKey) => {
-    'accept': 'application/json',
-    if (apiKey.trim().isNotEmpty) 'authorization': 'Bearer ${apiKey.trim()}',
-  };
-
-  static Uri _modelsUri(String baseUrl) {
-    var base = _normalizedBase(baseUrl);
-    if (base.endsWith('/chat/completions')) {
-      base = base.substring(0, base.length - '/chat/completions'.length);
-    }
-    if (!base.endsWith('/models')) base = '$base/models';
-    return Uri.parse(base);
-  }
-
-  static Uri _chatCompletionsUri(String baseUrl) {
-    var base = _normalizedBase(baseUrl);
-    if (!base.endsWith('/chat/completions')) {
-      if (base.endsWith('/models')) {
-        base = base.substring(0, base.length - '/models'.length);
-      }
-      base = '$base/chat/completions';
-    }
-    return Uri.parse(base);
-  }
-
-  static String _normalizedBase(String value) {
-    final base = value.trim().replaceFirst(RegExp(r'/+$'), '');
-    final uri = Uri.tryParse(base);
-    if (uri == null ||
-        !const {'http', 'https'}.contains(uri.scheme) ||
-        uri.host.isEmpty) {
-      throw const AiRequestException(
-        'The AI provider URL must use HTTP or HTTPS.',
-      );
-    }
-    return base;
-  }
-
-  static String _httpError(String prefix, http.Response response) {
-    final detail = response.body.trim();
-    final clipped = detail.length <= 240
-        ? detail
-        : '${detail.substring(0, 240)}…';
-    return clipped.isEmpty
-        ? '$prefix: HTTP ${response.statusCode}'
-        : '$prefix: HTTP ${response.statusCode} · $clipped';
   }
 }
 

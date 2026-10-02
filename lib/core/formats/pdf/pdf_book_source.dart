@@ -14,6 +14,7 @@ import '../../diagnostics.dart';
 import 'package:dart_pdf_editor/dart_pdf_editor.dart'
     show
         PdfRenderWorker,
+        PdfPageRenderer,
         pdfRenderWorkerPoolSize,
         pdfRenderWorkerCacheBudgetBytes,
         pdfRenderWorkerCacheMaxEntries;
@@ -209,6 +210,13 @@ class PdfBookSource
     final pageIndex = _pageIndexFromHref(href);
     if (pageIndex == null) return null;
     return _renderPage(pageIndex, maxDimension);
+  }
+
+  ui.Size? resourceSize(String href) {
+    final index = _pageIndexFromHref(href);
+    return index == null
+        ? null
+        : PdfPageRenderer.pageSize(_activeDocument.page(index));
   }
 
   Future<ui.Image> _renderPage(

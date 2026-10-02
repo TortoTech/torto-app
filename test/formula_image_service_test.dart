@@ -1,3 +1,4 @@
+import 'package:torto/app/ai/semantic_wire.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -83,7 +84,7 @@ void main() {
         client: MockClient((request) async {
           final body = jsonDecode(request.body),
               content = body['messages'][1]['content'] as List;
-          final input = jsonDecode(content.first['text']);
+          final input = SemanticWire.decode(jsonDecode(content.first['text']));
           final images = input['images'] as List;
           counts.add(images.length);
           expect(
@@ -154,7 +155,7 @@ void main() {
           calls++;
           final body = jsonDecode(request.body);
           final images =
-              jsonDecode(body['messages'][1]['content'][0]['text'])['images']
+              SemanticWire.decode(jsonDecode(body['messages'][1]['content'][0]['text']))['images']
                   as List;
           expect(images, hasLength(1));
           return response([
@@ -204,7 +205,7 @@ void main() {
           calls++;
           final body = jsonDecode(request.body);
           final images =
-              jsonDecode(body['messages'][1]['content'][0]['text'])['images']
+              SemanticWire.decode(jsonDecode(body['messages'][1]['content'][0]['text']))['images']
                   as List;
           if (calls == 1) {
             failed = images.last['image_id'];
@@ -250,7 +251,7 @@ void main() {
         calls++;
         final body = jsonDecode(request.body);
         final images =
-            jsonDecode(body['messages'][1]['content'][0]['text'])['images']
+            SemanticWire.decode(jsonDecode(body['messages'][1]['content'][0]['text']))['images']
                 as List;
         return response([
           item(images.single['image_id'], latex: r'\unknown{x}'),
@@ -292,9 +293,7 @@ void main() {
       client: MockClient((request) {
         final body = jsonDecode(request.body);
         requested.complete(
-          jsonDecode(
-            body['messages'][1]['content'][0]['text'],
-          )['images'][0]['image_id'],
+          SemanticWire.decode(jsonDecode(body['messages'][1]['content'][0]['text']))['images'][0]['image_id'],
         );
         return reply.future;
       }),

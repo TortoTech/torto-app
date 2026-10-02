@@ -10,6 +10,7 @@ import 'dart:math' as math;
 import 'package:xml/xml.dart';
 
 import '../ir/ir.dart';
+import '../ir/inline_content.dart' show standaloneTableLabel;
 import 'package_path.dart';
 import 'tolerant_xml.dart';
 
@@ -505,12 +506,25 @@ bool _hasQuoteSemanticWord(XmlElement element) {
 }
 
 bool _isQuoteTextCandidate(XmlElement element) {
-  if (!_isBlockBoundary(_name(element)) || _nodeText(element).isEmpty) {
+  if (!_isBlockBoundary(_name(element)) ||
+      _nodeText(element).isEmpty ||
+      _isNumberedMediaParagraph(element)) {
     return false;
   }
   return !element.descendants.whereType<XmlElement>().any(
     (node) => !identical(node, element) && _isBlockBoundary(_name(node)),
   );
+}
+
+bool _isNumberedMediaParagraph(XmlElement element) {
+  if (!element.descendants.whereType<XmlElement>().any(
+    (node) => const {'img', 'image'}.contains(_name(node)),
+  )) {
+    return false;
+  }
+  final text = _nodeText(element).trim();
+  return text.isEmpty ||
+      RegExp(r'^[（(]?[0-9０-９]+(?:[.．-][0-9０-９]+)*[）)]?$').hasMatch(text);
 }
 
 bool _isNoteSectionLabel(String value) {
@@ -535,6 +549,7 @@ TextBlock _copyTextBlock(
   listOrdered: block.listOrdered,
   listOrdinal: block.listOrdinal,
   listDepth: block.listDepth,
+  listGroupId: block.listGroupId,
   listMarkerVisible: block.listMarkerVisible,
   inlines: inlines ?? block.inlines,
   style: style ?? block.style,
@@ -636,6 +651,18 @@ class _SectionParser {
   final List<Block> blocks = [];
   final Map<XmlElement, SourceAnchor> _elementSources = Map.identity();
   final Map<Block, XmlElement> _blockElements = Map.identity();
+  final Map<XmlElement, String> _listGroups = Map.identity();
+
+  String? _listGroup(XmlElement item) {
+    final root = item.ancestors
+        .whereType<XmlElement>()
+        .where((node) => const {'ul', 'ol'}.contains(_name(node)))
+        .lastOrNull;
+    return root == null
+        ? null
+        : _listGroups.putIfAbsent(root, () => 'list-${_listGroups.length}');
+  }
+
   bool _insideNestedMedia = false;
   final List<double> _paragraphListIndents = [];
   int _nextNode = 0;
@@ -1342,7 +1369,8 @@ class _SectionParser {
           break;
         }
         var style = _blockStyleFor(element);
-        if (_hasStandaloneQuoteLayout(element) &&
+        if (!_isNumberedMediaParagraph(element) &&
+            _hasStandaloneQuoteLayout(element) &&
             (_hasQuoteSemanticWord(element) ||
                 _hasDistinctQuoteTypography(element))) {
           _parseQuoteElements([element], null);
@@ -1714,6 +1742,13 @@ class _SectionParser {
         (reversed ? items.length : 1);
     for (final item in items) {
       final blockStart = blocks.length;
+      if (_isSemanticFootnoteDefinition(item) ||
+          (!_insideNote && _startsImplicitNoteEntry(item))) {
+        _parseNoteDefinition(item, depth);
+        _rememberElementSource(item, blockStart);
+        ordinal += reversed ? -1 : 1;
+        continue;
+      }
       final explicit = int.tryParse(_attr(item, 'value') ?? '');
       if (explicit != null) ordinal = explicit;
       _emitListItem(item, ordered: ordered, ordinal: ordinal, depth: depth);
@@ -1804,6 +1839,7 @@ class _SectionParser {
         listOrdered: ordered,
         listOrdinal: ordinal,
         listDepth: depth,
+        listGroupId: _listGroup(item),
       );
     }
     final images = _descendantImages(item, skipNestedLists: true)
@@ -2063,6 +2099,15 @@ class _SectionParser {
         caseSensitive: false,
       ).hasMatch(text);
       if (proseReference) return false;
+      final previous = label > 0 ? original[label - 1] : null;
+      final pairedTitle =
+          previous is TextBlock &&
+          standaloneTableLabel(previous.plainText) &&
+          (label + 1 == media || label - 1 == media + 1) &&
+          !b.inlines.any(
+            (inline) => inline is InlineImageRun || inline is BreakInline,
+          );
+      if (pairedTitle) return true;
       if (numbered ||
           classes.contains('tablecaption') ||
           classes.contains('tabletitle')) {
@@ -2405,6 +2450,9 @@ class _SectionParser {
         listOrdered: listOrdered,
         listOrdinal: listOrdinal,
         listDepth: listDepth,
+        listGroupId: kind == TextBlockKind.listItem
+            ? _listGroup(element)
+            : null,
         listMarkerVisible: listMarkerVisible,
         sourceNode: sourceNode,
       );
@@ -2435,6 +2483,7 @@ class _SectionParser {
     bool listOrdered = false,
     int listOrdinal = 0,
     int listDepth = 0,
+    String? listGroupId,
     bool listMarkerVisible = true,
     String? sourceNode,
   }) {
@@ -2456,6 +2505,7 @@ class _SectionParser {
         listOrdered: listOrdered,
         listOrdinal: listOrdinal,
         listDepth: listDepth,
+        listGroupId: listGroupId,
         listMarkerVisible: listMarkerVisible,
         inlines: inlines,
         style: style,
@@ -2466,12 +2516,24 @@ class _SectionParser {
   }
 
   void _parseFigure(XmlElement figure, int listDepth) {
+    bool captionContainer(XmlElement node) =>
+        _name(node) == 'figcaption' ||
+        const {'p', 'div'}.contains(_name(node)) &&
+            _nodeHasVisibleText(node) &&
+            !_hasDescendantImage(node) &&
+            !node.descendants.whereType<XmlElement>().any(
+              (child) => const {'table', 'figure'}.contains(_name(child)),
+            );
     final captionNodes = figure.descendants
         .whereType<XmlElement>()
         .where(
           (node) =>
-              _name(node) == 'figcaption' &&
-              !_hasNamedAncestor(node, figure, 'figure'),
+              captionContainer(node) &&
+              !_hasNamedAncestor(node, figure, 'figure') &&
+              !node.ancestors
+                  .whereType<XmlElement>()
+                  .takeWhile((parent) => !identical(parent, figure))
+                  .any(captionContainer),
         )
         .toList();
     final imageNodes = figure.descendants
@@ -2489,7 +2551,12 @@ class _SectionParser {
             const {'figure', 'img', 'image', 'table'}.contains(_name(node)),
       ),
     );
-    if (imageNodes.isEmpty || unsupportedCaption) {
+    final unclaimedText = figure.descendants.whereType<XmlText>().any(
+      (text) =>
+          text.value.trim().isNotEmpty &&
+          !text.ancestors.whereType<XmlElement>().any(captionNodes.contains),
+    );
+    if (imageNodes.isEmpty || unsupportedCaption || unclaimedText) {
       _parseContainer(figure, listDepth);
       return;
     }
@@ -2500,7 +2567,7 @@ class _SectionParser {
     for (final node in figure.descendants.whereType<XmlElement>()) {
       if (_hasNamedAncestor(node, figure, 'figure')) continue;
       final name = _name(node);
-      if (name == 'figcaption') {
+      if (captionNodes.contains(node)) {
         captionPosition = CaptionPosition.before;
         break;
       }
@@ -3347,9 +3414,12 @@ class _StyleRule {
 
 class _StyleSheet {
   final List<_StyleRule> rules = [];
+  final Map<String, List<_StyleRule>> _byId = {}, _byClass = {}, _byTag = {};
+  final Map<XmlElement, Map<String, String>> _elementCache = Map.identity();
   int _nextOrder = 0;
 
   void addCss(String css) {
+    _elementCache.clear();
     final cleaned = _stripCssComments(css);
     var cursor = 0;
     while (true) {
@@ -3365,14 +3435,23 @@ class _StyleSheet {
         for (final rawSelector in prelude.split(',')) {
           final selector = _SimpleSelector.parse(rawSelector);
           if (selector == null) continue;
-          rules.add(
-            _StyleRule(
-              selector,
-              selector.specificity,
-              _nextOrder,
-              declarations,
-            ),
+          final rule = _StyleRule(
+            selector,
+            selector.specificity,
+            _nextOrder,
+            declarations,
           );
+          rules.add(rule);
+          // A supported selector needs every component, so indexing any one
+          // required component cannot omit a matching rule. Each rule goes
+          // into exactly one bucket, preserving grouped-selector semantics.
+          if (selector.id case final id?) {
+            (_byId[id] ??= []).add(rule);
+          } else if (selector.classes.isNotEmpty) {
+            (_byClass[selector.classes.first] ??= []).add(rule);
+          } else if (selector.tag case final tag?) {
+            (_byTag[tag] ??= []).add(rule);
+          }
         }
         _nextOrder++;
       }
@@ -3383,8 +3462,22 @@ class _StyleSheet {
   /// All properties applying to [element]: matching rules sorted by
   /// (specificity, source order), then the inline `style` attribute.
   Map<String, String> cascadedProperties(XmlElement element) {
+    final cached = _elementCache[element];
+    if (cached != null) return cached;
+    final name = _name(element), id = _attr(element, 'id');
+    final classes = (_attr(element, 'class') ?? '')
+        .split(RegExp(r'\s+'))
+        .where((c) => c.isNotEmpty)
+        .toSet();
+    final candidates = <_StyleRule>[
+      ...?_byTag[name],
+      if (id != null) ...?_byId[id],
+      for (final value in classes) ...?_byClass[value],
+    ];
     final matching =
-        rules.where((rule) => rule.selector.matches(element)).toList()
+        candidates
+            .where((rule) => rule.selector.matches(name, id, classes))
+            .toList()
           ..sort((a, b) {
             final bySpecificity = a.specificity.compareTo(b.specificity);
             return bySpecificity != 0
@@ -3399,7 +3492,9 @@ class _StyleSheet {
     if (inline != null) {
       _insertDeclarations(props, _parseDeclarations(inline));
     }
-    return props;
+    return _elementCache[element] = props.isEmpty
+        ? const {}
+        : Map.unmodifiable(props);
   }
 }
 
@@ -3465,16 +3560,12 @@ class _SimpleSelector {
     return (input.substring(0, end), input.substring(end));
   }
 
-  bool matches(XmlElement element) {
+  bool matches(String name, String? elementId, Set<String> elementClasses) {
     final elementTag = tag;
-    if (elementTag != null && _name(element) != elementTag) return false;
+    if (elementTag != null && name != elementTag) return false;
     final selectorId = id;
-    if (selectorId != null && _attr(element, 'id') != selectorId) return false;
+    if (selectorId != null && elementId != selectorId) return false;
     if (classes.isEmpty) return true;
-    final elementClasses = (_attr(element, 'class') ?? '')
-        .split(RegExp(r'\s+'))
-        .where((c) => c.isNotEmpty)
-        .toSet();
     return classes.every(elementClasses.contains);
   }
 }
