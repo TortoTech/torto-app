@@ -293,7 +293,7 @@ class _ReaderPageState extends State<ReaderPage>
     final unit = page.focusUnits.elementAtOrNull(selected);
     return ClipRect(
       clipper: page.scrollExtent > 0
-          ? _FocusContentClipper(_style.marginTop, _style.marginBottom)
+          ? _FocusContentClipper(FocusNavigation.viewport(page))
           : null,
       child: Stack(
         fit: StackFit.expand,
@@ -341,22 +341,6 @@ class _ReaderPageState extends State<ReaderPage>
                   ),
                 ),
               ),
-          if (page.focusUnits.length > 1 && selected < page.focusUnits.length)
-            Positioned(
-              left: 8,
-              top:
-                  (page.focusUnits[selected].paintBounds.firstOrNull ??
-                          page.focusUnits[selected].bounds)
-                      .top +
-                  4,
-              child: IgnorePointer(
-                child: Container(
-                  width: 2,
-                  height: 18,
-                  color: _foreground.withValues(alpha: .45),
-                ),
-              ),
-            ),
         ],
       ),
     );
@@ -1265,6 +1249,7 @@ class _ReaderPageState extends State<ReaderPage>
           publicationLanguage: controller.publicationLanguage,
           writingSystem: controller.style.writingSystem,
           typography: controller.style.typography,
+          typesettingMode: controller.style.typesettingMode,
           entries: entries,
           initialCitation: link.citationOrdinal,
           initialFootnoteNumber: link.footnoteNumber,
@@ -1870,6 +1855,32 @@ class _ReaderPageState extends State<ReaderPage>
                 onPressed: () => Navigator.of(context).maybePop(),
               ),
               const Spacer(),
+              if (_controller?.pdfOcrAvailable == true)
+                IconButton(
+                  key: const Key('reader-pdf-reflow-button'),
+                  icon: Icon(
+                    _controller!.pdfReflowEnabled
+                        ? Icons.picture_as_pdf_outlined
+                        : Icons.text_snippet_outlined,
+                    color: _chromeForeground,
+                  ),
+                  tooltip: _controller!.pdfReflowEnabled
+                      ? context.l10n.text('显示 PDF 原版', 'Show original PDF')
+                      : context.l10n.text('显示 OCR 重排', 'Show OCR reflow'),
+                  onPressed: _controller!.busy
+                      ? null
+                      : () async {
+                          try {
+                            await _controller!.togglePdfReflow();
+                          } catch (error) {
+                            if (mounted) {
+                              ScaffoldMessenger.of(
+                                context,
+                              ).showSnackBar(SnackBar(content: Text('$error')));
+                            }
+                          }
+                        },
+                ),
               IconButton(
                 icon: const Icon(Icons.chat_outlined),
                 tooltip: context.l10n.text('阅读助手', 'Reading assistant'),
@@ -2643,16 +2654,11 @@ class _ReaderPageState extends State<ReaderPage>
 }
 
 class _FocusContentClipper extends CustomClipper<Rect> {
-  final double top, bottom;
-  const _FocusContentClipper(this.top, this.bottom);
+  final Rect bounds;
+  const _FocusContentClipper(this.bounds);
   @override
-  Rect getClip(Size size) => Rect.fromLTRB(
-    0,
-    top,
-    size.width,
-    (size.height - bottom).clamp(top, double.infinity),
-  );
+  Rect getClip(Size size) => bounds.intersect(Offset.zero & size);
   @override
   bool shouldReclip(_FocusContentClipper oldClipper) =>
-      top != oldClipper.top || bottom != oldClipper.bottom;
+      bounds != oldClipper.bounds;
 }

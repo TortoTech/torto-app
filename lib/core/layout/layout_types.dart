@@ -613,6 +613,9 @@ class PageLayout {
   /// Complete semantic units in page coordinates; empty in ordinary mode.
   final List<FocusUnitLayout> focusUnits;
   final double scrollExtent;
+
+  /// Visible focus content after the reader's top and bottom clipping.
+  final ui.Rect? focusContentBounds;
   final LayoutViewport viewport;
   final List<PageItem> items;
 
@@ -634,6 +637,7 @@ class PageLayout {
     this.endProgression,
     this.focusUnits = const [],
     this.scrollExtent = 0,
+    this.focusContentBounds,
     required this.viewport,
     required this.items,
     required this.firstAnchor,

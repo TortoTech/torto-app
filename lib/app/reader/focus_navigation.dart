@@ -6,6 +6,10 @@ typedef FocusDestination = ({int active, double offset});
 
 /// Pure navigation policy: a gesture advances one block or one overflow stop.
 class FocusNavigation {
+  static Rect viewport(PageLayout page) =>
+      page.focusContentBounds ??
+      Rect.fromLTWH(0, 0, page.viewport.width, page.viewport.height);
+
   static Duration duration(double distance) =>
       Duration(milliseconds: distance.abs().round().clamp(160, 360));
 
@@ -18,7 +22,8 @@ class FocusNavigation {
     int index,
   ) {
     final rect = body(page.focusUnits[index]);
-    final height = page.viewport.height;
+    final visible = viewport(page);
+    final height = visible.height;
     if (rect.height <= height) return null;
     final window = math.min(height, 240.0);
     final images = page.items
@@ -35,14 +40,12 @@ class FocusNavigation {
         if (caption.height <= height) {
           final top =
               (image.height <= height
-                      ? image.center.dy - height / 2
-                      : image.top - (height - window) / 2)
+                      ? image.center.dy - visible.center.dy
+                      : image.top - visible.top - (height - window) / 2)
                   .clamp(0.0, page.scrollExtent);
-          final imageEnd = (image.bottom - (height + window) / 2).clamp(
-            top,
-            page.scrollExtent,
-          );
-          final bottom = (caption.center.dy - height / 2).clamp(
+          final imageEnd = (image.bottom - visible.top - (height + window) / 2)
+              .clamp(top, page.scrollExtent);
+          final bottom = (caption.center.dy - visible.center.dy).clamp(
             imageEnd,
             page.scrollExtent,
           );
@@ -54,11 +57,11 @@ class FocusNavigation {
         }
       }
     }
-    final top = (rect.top - (height - window) / 2).clamp(
+    final top = (rect.top - visible.top - (height - window) / 2).clamp(
       0.0,
       page.scrollExtent,
     );
-    final bottom = (rect.bottom - (height + window) / 2).clamp(
+    final bottom = (rect.bottom - visible.top - (height + window) / 2).clamp(
       top,
       page.scrollExtent,
     );
@@ -69,15 +72,16 @@ class FocusNavigation {
     final unit = page.focusUnits[index];
     final rect = body(unit);
     final stops = overflow(page, index);
-    final height = page.viewport.height;
+    final visible = viewport(page);
+    final height = visible.height;
     var y =
         stops?.top ??
         (rect.height > height
-            ? rect.top - (height - math.min(height, 240)) / 2
-            : rect.top + math.max(240, rect.height) / 2 - height / 2);
+            ? rect.top - visible.top - (height - math.min(height, 240)) / 2
+            : rect.top + math.max(240, rect.height) / 2 - visible.center.dy);
     // Center the body when possible while retaining its leading heading.
     if (index == 0 && unit.bounds.top < rect.top) {
-      y = math.min(y, math.max(0.0, unit.bounds.top - 28));
+      y = math.min(y, math.max(0.0, unit.bounds.top - visible.top - 28));
     }
     return y.clamp(0.0, page.scrollExtent);
   }
@@ -89,7 +93,7 @@ class FocusNavigation {
     int direction,
   ) {
     if (page.focusUnits.isEmpty) return (active: active, offset: offset);
-    final height = page.viewport.height;
+    final height = viewport(page).height;
     final stops = overflow(page, active);
     if (stops != null) {
       final window = math.min(height, 240.0);

@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_math_fork/flutter_math.dart' as fm;
+import 'package:url_launcher/url_launcher.dart';
 import '../../core/ir/ir.dart' as ir;
 import '../../core/semantic_layout/web_links.dart';
 import 'reader_controller.dart' show ReaderFootnote;
@@ -25,6 +26,7 @@ Future<void> showReaderFootnoteSheet(
   String publicationLanguage = '',
   WritingSystem writingSystem = WritingSystem.unknown,
   ReaderTypography typography = const ReaderTypography(),
+  TypesettingMode typesettingMode = TypesettingMode.unified,
   List<ReaderFootnote> entries = const [],
   int initialCitation = 0,
   int initialFootnoteNumber = 0,
@@ -72,6 +74,7 @@ Future<void> showReaderFootnoteSheet(
         publicationLanguage: publicationLanguage,
         writingSystem: writingSystem,
         typography: typography,
+        typesettingMode: typesettingMode,
         entries: entries,
         initialCitation: initialCitation,
         initialFootnoteNumber: initialFootnoteNumber,
@@ -87,6 +90,7 @@ class ReaderFootnoteSheet extends StatelessWidget {
   final String publicationLanguage;
   final WritingSystem writingSystem;
   final ReaderTypography typography;
+  final TypesettingMode typesettingMode;
   final List<ReaderFootnote> entries;
   final int initialCitation;
   final int initialFootnoteNumber;
@@ -99,6 +103,7 @@ class ReaderFootnoteSheet extends StatelessWidget {
     this.publicationLanguage = '',
     this.writingSystem = WritingSystem.unknown,
     this.typography = const ReaderTypography(),
+    this.typesettingMode = TypesettingMode.unified,
     this.entries = const [],
     this.initialCitation = 0,
     this.initialFootnoteNumber = 0,
@@ -124,9 +129,14 @@ class ReaderFootnoteSheet extends StatelessWidget {
                   markerColor ??
                       footnoteIconColor(Theme.of(context).colorScheme.surface),
                   publicationLanguage,
+                  typesettingMode == TypesettingMode.unified,
                 )
-              : OptimizedJustifiedText(
-                  text,
+              : _PopupText(
+                  inlines: [ir.TextRun(text)],
+                  websiteIcons: typesettingMode == TypesettingMode.unified,
+                  linkColor:
+                      markerColor ??
+                      footnoteIconColor(Theme.of(context).colorScheme.surface),
                   publicationLanguage: publicationLanguage,
                   style: TextStyle(
                     color: foreground,
@@ -163,6 +173,7 @@ class _ReferenceRows extends StatefulWidget {
   final Color color;
   final Color markerColor;
   final String publicationLanguage;
+  final bool websiteIcons;
   const _ReferenceRows(
     this.entries,
     this.selected,
@@ -170,6 +181,7 @@ class _ReferenceRows extends StatefulWidget {
     this.color,
     this.markerColor,
     this.publicationLanguage,
+    this.websiteIcons,
   );
   @override
   State<_ReferenceRows> createState() => _ReferenceRowsState();
@@ -227,6 +239,8 @@ class _ReferenceRowsState extends State<_ReferenceRows> {
               note,
               widget.color,
               publicationLanguage: widget.publicationLanguage,
+              websiteIcons: widget.websiteIcons,
+              linkColor: widget.markerColor,
               leadingWidth: slot + gap,
               leading: WidgetSpan(
                 alignment: PlaceholderAlignment.middle,
@@ -261,34 +275,162 @@ class _NoteContent extends StatelessWidget {
   final InlineSpan leading;
   final String publicationLanguage;
   final double leadingWidth;
+  final bool websiteIcons;
+  final Color linkColor;
   const _NoteContent(
     this.note,
     this.color, {
     required this.leading,
     required this.publicationLanguage,
     required this.leadingWidth,
+    required this.websiteIcons,
+    required this.linkColor,
   });
   @override
   Widget build(BuildContext context) {
-    final inlines = translationInlines(note.inlines ?? []);
+    return _PopupText(
+      inlines: _noteInlines(note),
+      style: TextStyle(color: color, fontSize: 17, height: 1.55),
+      leading: leading,
+      leadingWidth: leadingWidth,
+      publicationLanguage: publicationLanguage,
+      websiteIcons: websiteIcons,
+      linkColor: linkColor,
+    );
+  }
+}
+
+List<ir.Inline> _noteInlines(ReaderFootnote note) {
+  final source = note.inlines;
+  if (source == null || source.isEmpty) return [ir.TextRun(note.popupText)];
+  // Linked definitions can retain their authored marker in the rich content.
+  // Remove it without discarding links or formulas in the remaining runs.
+  final prefix = source
+      .takeWhile((i) => i is ir.TextRun)
+      .cast<ir.TextRun>()
+      .map((r) => r.text)
+      .join();
+  final marker = note.marker.trim();
+  var skip = 0;
+  final trimmed = prefix.trimLeft();
+  if (marker.isNotEmpty && trimmed.startsWith(marker)) {
+    skip = prefix.length - trimmed.length + marker.length;
+    skip +=
+        RegExp(
+          r'^[\s.。．、,，:：;；)）\]】]+',
+        ).firstMatch(prefix.substring(skip))?.end ??
+        0;
+  }
+  final result = <ir.Inline>[];
+  for (final inline in source) {
+    if (inline is ir.TextRun && skip > 0) {
+      if (skip < inline.text.length) {
+        result.add(
+          ir.TextRun(
+            inline.text.substring(skip),
+            style: inline.style,
+            link: inline.link,
+            language: inline.language,
+            displayWritingSystem: inline.displayWritingSystem,
+          ),
+        );
+      }
+      skip = math.max(0, skip - inline.text.length);
+    } else {
+      result.add(inline);
+    }
+  }
+  return result;
+}
+
+typedef PopupInlineWidget = ({WidgetSpan span, double width, double height});
+
+class _PopupText extends StatelessWidget {
+  final List<ir.Inline> inlines;
+  final TextStyle style;
+  final String publicationLanguage;
+  final bool websiteIcons;
+  final Color linkColor;
+  final InlineSpan? leading;
+  final double leadingWidth;
+  const _PopupText({
+    required this.inlines,
+    required this.style,
+    required this.publicationLanguage,
+    required this.websiteIcons,
+    required this.linkColor,
+    this.leading,
+    this.leadingWidth = 0,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    // Popup content is a new paragraph: a citation's outer semantic role must
+    // not suppress detection of a URL inside its expanded text.
+    final inlines = translationInlines([
+      for (final inline in this.inlines)
+        if (inline is ir.TextRun)
+          ir.TextRun(
+            inline.text,
+            style: inline.style.copyWith(
+              inlineCitation: 0,
+              inlineRole: ir.InlineRole.normal,
+              linkRole: ir.LinkRole.normal,
+            ),
+            link: inline.style.linkRole == ir.LinkRole.footnoteBacklink
+                ? null
+                : inline.link,
+          )
+        else
+          inline,
+    ]);
     if (!inlines.any((inline) => inline is ir.MathInline)) {
+      final text = StringBuffer();
+      final widgets = <int, PopupInlineWidget>{};
+      final em = MediaQuery.textScalerOf(context).scale(style.fontSize ?? 17);
+      for (final inline in inlines) {
+        if (inline is ir.TextRun) {
+          if (websiteIcons && inline.style.website && inline.link != null) {
+            widgets[text.length] = (
+              span: _websiteSpan(inline.link!, em, linkColor),
+              width: em * 1.25,
+              height: em,
+            );
+            text.write('\ufffc');
+          } else {
+            text.write(inline.text);
+          }
+        } else if (inline is ir.BreakInline) {
+          text.write('\n');
+        }
+      }
       return OptimizedJustifiedText(
-        note.popupText,
-        style: TextStyle(color: color, fontSize: 17, height: 1.55),
+        text.toString(),
+        style: style,
         leading: leading,
         leadingWidth: leadingWidth,
         publicationLanguage: publicationLanguage,
+        inlineWidgets: widgets,
       );
     }
     return LayoutBuilder(
       builder: (context, constraints) => Text.rich(
         TextSpan(
-          style: TextStyle(color: color, fontSize: 17, height: 1.55),
+          style: style,
           children: [
-            leading,
+            ?leading,
             for (final inline in inlines)
               if (inline is ir.TextRun)
-                TextSpan(text: inline.text)
+                if (websiteIcons && inline.style.website && inline.link != null)
+                  _websiteSpan(
+                    inline.link!,
+                    MediaQuery.textScalerOf(
+                      context,
+                    ).scale(style.fontSize ?? 17),
+                    linkColor,
+                  )
+                else
+                  TextSpan(text: inline.text)
               else if (inline is ir.BreakInline)
                 const TextSpan(text: '\n')
               else if (inline is ir.MathInline)
@@ -306,7 +448,7 @@ class _NoteContent extends StatelessWidget {
                         child: fm.Math.tex(
                           inline.latex,
                           mathStyle: fm.MathStyle.text,
-                          textStyle: TextStyle(color: color, fontSize: 17),
+                          textStyle: style.copyWith(height: 1),
                           onErrorFallback: (_) => Text(
                             inline.sourceText.isEmpty
                                 ? inline.latex
@@ -324,6 +466,29 @@ class _NoteContent extends StatelessWidget {
   }
 }
 
+WidgetSpan _websiteSpan(String url, double em, Color color) => WidgetSpan(
+  alignment: PlaceholderAlignment.middle,
+  child: Semantics(
+    link: true,
+    label: url,
+    child: Tooltip(
+      message: url,
+      child: GestureDetector(
+        onTap: () =>
+            launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication),
+        onLongPress: () => Clipboard.setData(ClipboardData(text: url)),
+        child: SizedBox(
+          width: em * 1.25,
+          height: em,
+          child: Center(
+            child: Icon(Icons.language, size: em * .9, color: color),
+          ),
+        ),
+      ),
+    ),
+  ),
+);
+
 /// Plain-text adapter for the same whole-paragraph optimizer used by the
 /// reader layout engine. Explicit line breaks and per-cluster spacing keep
 /// popup notes consistent with unified body text.
@@ -334,6 +499,7 @@ class OptimizedJustifiedText extends StatelessWidget {
   final ParagraphHyphenator? hyphenator;
   final InlineSpan? leading;
   final double leadingWidth;
+  final Map<int, PopupInlineWidget> inlineWidgets;
 
   const OptimizedJustifiedText(
     this.text, {
@@ -343,12 +509,24 @@ class OptimizedJustifiedText extends StatelessWidget {
     this.hyphenator,
     this.leading,
     this.leadingWidth = 0,
+    this.inlineWidgets = const {},
   });
 
   @override
   Widget build(BuildContext context) {
     final paragraphs = text.split(RegExp(r'\r?\n'));
     final lineHeight = (style.fontSize ?? 17) * (style.height ?? 1.0);
+    var offset = 0;
+    final paragraphWidgets = <Map<int, PopupInlineWidget>>[];
+    for (final paragraph in paragraphs) {
+      paragraphWidgets.add({
+        for (final entry in inlineWidgets.entries)
+          if (entry.key >= offset && entry.key < offset + paragraph.length)
+            entry.key - offset: entry.value,
+      });
+      offset += paragraph.length + 1;
+      if (offset < text.length && text[offset - 1] == '\r') offset++;
+    }
     return SelectionArea(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -365,6 +543,7 @@ class OptimizedJustifiedText extends StatelessWidget {
                 hyphenator: hyphenator ?? EnglishHyphenator.instance,
                 leading: index == 0 ? leading : null,
                 leadingWidth: index == 0 ? leadingWidth : 0,
+                inlineWidgets: paragraphWidgets[index],
               ),
           ],
         ],
@@ -380,6 +559,7 @@ class _OptimizedParagraphText extends StatelessWidget {
   final ParagraphHyphenator hyphenator;
   final InlineSpan? leading;
   final double leadingWidth;
+  final Map<int, PopupInlineWidget> inlineWidgets;
 
   const _OptimizedParagraphText(
     this.text, {
@@ -388,6 +568,7 @@ class _OptimizedParagraphText extends StatelessWidget {
     required this.hyphenator,
     this.leading,
     this.leadingWidth = 0,
+    this.inlineWidgets = const {},
   });
 
   @override
@@ -404,8 +585,23 @@ class _OptimizedParagraphText extends StatelessWidget {
         hyphenator,
         leading: leading,
         leadingWidth: leadingWidth,
+        inlineWidgets: inlineWidgets,
       );
       if (span == null) {
+        if (inlineWidgets.isNotEmpty) {
+          final children = <InlineSpan>[?leading];
+          var start = 0;
+          for (final entry in inlineWidgets.entries) {
+            children.add(TextSpan(text: text.substring(start, entry.key)));
+            children.add(entry.value.span);
+            start = entry.key + 1;
+          }
+          children.add(TextSpan(text: text.substring(start)));
+          return Text.rich(
+            TextSpan(style: style, children: children),
+            textAlign: TextAlign.justify,
+          );
+        }
         if (leading != null) {
           return Text.rich(
             TextSpan(
@@ -439,6 +635,7 @@ TextSpan? _optimizedTextSpan(
   ParagraphHyphenator hyphenator, {
   InlineSpan? leading,
   double leadingWidth = 0,
+  Map<int, PopupInlineWidget> inlineWidgets = const {},
 }) {
   final hyphenationBreaks = hyphenator.breakOpportunities(
     text: text,
@@ -459,7 +656,8 @@ TextSpan? _optimizedTextSpan(
 
   for (final grapheme in text.characters) {
     final start = offset;
-    if (requiresStandaloneMeasurement(grapheme)) {
+    if (inlineWidgets.containsKey(start) ||
+        requiresStandaloneMeasurement(grapheme)) {
       flushGroup();
       ranges.add((start: start, end: start + grapheme.length));
     } else {
@@ -486,7 +684,12 @@ TextSpan? _optimizedTextSpan(
       0,
       (total, box) => total + box.right - box.left,
     );
-    if (boxes.isEmpty || !advance.isFinite || advance < 0) {
+    if (inlineWidgets.containsKey(range.start)) {
+      advance = inlineWidgets[range.start]!.width;
+    }
+    if ((boxes.isEmpty && !inlineWidgets.containsKey(range.start)) ||
+        !advance.isFinite ||
+        advance < 0) {
       final fallback = TextPainter(
         text: TextSpan(
           text: text.substring(range.start, range.end),
@@ -551,6 +754,26 @@ TextSpan? _optimizedTextSpan(
       final cluster = clusters[index];
       final value = text.substring(cluster.start, cluster.end);
       final adjustment = plan.adjustments[index];
+      final inlineWidget = inlineWidgets[cluster.start];
+      if (inlineWidget != null) {
+        flushPlain();
+        children.add(
+          WidgetSpan(
+            alignment: inlineWidget.span.alignment,
+            child: SizedBox(
+              width: math.max(.1, inlineWidget.width + adjustment),
+              height: inlineWidget.height,
+              child: OverflowBox(
+                alignment: Alignment.centerLeft,
+                minWidth: inlineWidget.width,
+                maxWidth: inlineWidget.width,
+                child: inlineWidget.span.child,
+              ),
+            ),
+          ),
+        );
+        continue;
+      }
       if (adjustment.abs() <= 0.0001) {
         plain.write(value);
       } else {

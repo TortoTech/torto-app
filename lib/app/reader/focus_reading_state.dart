@@ -69,7 +69,7 @@ class FocusReadingState {
     _usesVisibleAnchor =
         offset > 0 &&
         (page.focusUnits.elementAtOrNull(active)?.bounds.height ?? 0) >
-            page.viewport.height;
+            FocusNavigation.viewport(page).height;
     backwards = false;
     final anchor =
         target ??
@@ -87,7 +87,7 @@ class FocusReadingState {
       _usesVisibleAnchor =
           offset > 0 &&
           (page.focusUnits.elementAtOrNull(active)?.bounds.height ?? 0) >
-              page.viewport.height;
+              FocusNavigation.viewport(page).height;
       return;
     }
     for (final item in page.items) {
@@ -123,7 +123,7 @@ class FocusReadingState {
     _usesVisibleAnchor =
         offset > 0 &&
         (page.focusUnits.elementAtOrNull(active)?.bounds.height ?? 0) >
-            page.viewport.height;
+            FocusNavigation.viewport(page).height;
   }
 
   SourceAnchor? get anchor {
@@ -188,7 +188,8 @@ class FocusReadingState {
   void activateVisible() {
     final page = _page;
     if (page == null || page.focusUnits.isEmpty) return;
-    final y = offset + _top + page.viewport.height * .2;
+    final visible = FocusNavigation.viewport(page);
+    final y = offset + visible.top + visible.height * .2;
     final index = page.focusUnits.indexWhere((unit) => unit.bounds.bottom > y);
     if (index >= 0) active = index;
   }
@@ -264,6 +265,7 @@ class FocusReadingState {
       progression: page.progression,
       disposalPool: page.disposalPool,
       scrollExtent: page.scrollExtent,
+      focusContentBounds: page.focusContentBounds,
       focusUnits: [
         for (final unit in page.focusUnits)
           FocusUnitLayout(

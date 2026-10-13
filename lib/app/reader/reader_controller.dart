@@ -21,6 +21,7 @@ import '../../core/ir/text_index.dart';
 import '../sync/sync_models.dart';
 import 'annotations_repository.dart';
 import 'focus_reading_state.dart';
+import 'focus_navigation.dart';
 import '../../core/formats/image_dimensions.dart';
 import '../../core/reading/rewrite_book_source.dart';
 import '../../core/layout/layout_engine.dart';
@@ -37,6 +38,7 @@ import '../ai/translation_glossary.dart';
 import '../ai/pdf_discovery_service.dart';
 import '../progress_store.dart';
 import '../sync/derived_data_store.dart';
+import '../../core/formats/pdf/pdf_ocr_book_source.dart';
 
 // Keep the isolate closure outside controller methods: their closure contexts
 // can retain native UI resources and cannot cross an isolate boundary.
@@ -364,7 +366,7 @@ class ReaderController extends ChangeNotifier {
   }
 
   Future<void> reloadSemanticLayout() async {
-    if (_disposed || _format == BookFormat.pdf) return;
+    if (_disposed || _fixedPdf) return;
     _cancelSemantic();
     final epoch = _semanticEpoch;
     _semanticSettings = null;
@@ -452,7 +454,7 @@ class ReaderController extends ChangeNotifier {
 
   bool get _semanticVisiblePending {
     if (_semanticSettings?.semanticLayout.enabled != true ||
-        _format == BookFormat.pdf ||
+        _fixedPdf ||
         semanticLayoutError != null) {
       return false;
     }
@@ -473,7 +475,7 @@ class ReaderController extends ChangeNotifier {
         !_readerVisible ||
         busy ||
         _pageTurnActive ||
-        _format == BookFormat.pdf ||
+        _fixedPdf ||
         settings == null ||
         !settings.semanticLayout.enabled) {
       return;
@@ -641,6 +643,10 @@ class ReaderController extends ChangeNotifier {
   }
 
   BookFormat? _format;
+  PdfOcrBookSource? _pdfOcr;
+  bool get pdfOcrAvailable => _pdfOcr != null;
+  bool get pdfReflowEnabled => _pdfOcr?.mode == PdfOcrViewMode.reflow;
+  bool get _fixedPdf => _format == BookFormat.pdf && !pdfReflowEnabled;
   LayoutViewport _viewport = const LayoutViewport(width: 0, height: 0);
   ReaderStyle _style = const ReaderStyle();
   int _paginationGeneration = 0;
@@ -696,6 +702,14 @@ class ReaderController extends ChangeNotifier {
     }
     final locator = await progressStore.load(_book.id);
     if (locator == null || _disposed) return;
+    final pdfTarget = await _pdfOcr?.targetForLocator(locator);
+    if (pdfTarget != null) {
+      final wasDirty = _progressDirty;
+      await goToHref(pdfTarget);
+      _saveTimer?.cancel();
+      _progressDirty = wasDirty;
+      return;
+    }
     final anchor = locator.source?.start;
     final identified = anchor == null ? -1 : _book.indexOfSpine(anchor.spine);
     final byHref = _book.spine.indexWhere(
@@ -900,7 +914,7 @@ class ReaderController extends ChangeNotifier {
   }
 
   bool get focusModeAllowed =>
-      _format != BookFormat.pdf &&
+      !_fixedPdf &&
       _source?.book.metadata.layout != RenditionLayout.prePaginated;
   SourceAnchor? get readingAnchor {
     final page = currentPage;
@@ -931,7 +945,7 @@ class ReaderController extends ChangeNotifier {
                       ?.bounds
                       .height ??
                   0) >
-              currentPage!.viewport.height,
+              FocusNavigation.viewport(currentPage!).height,
     )) {
       if (trackVisible) focusReading.activateVisible();
       notifyListeners();
@@ -953,9 +967,11 @@ class ReaderController extends ChangeNotifier {
 
   ReaderStyle get style => _style;
   String get statisticsBookId => _source?.book.id ?? '';
-  PdfBookSource? get pdfSource => _resourceSource is PdfBookSource
-      ? _resourceSource as PdfBookSource
-      : null;
+  PdfBookSource? get pdfSource {
+    final original = _pdfOcr?.original ?? _resourceSource;
+    return original is PdfBookSource ? original : null;
+  }
+
   BookMetadata? get statisticsMetadata =>
       _derivedMetadata ?? _source?.book.metadata;
 
@@ -1062,7 +1078,7 @@ class ReaderController extends ChangeNotifier {
     final fileName = _baseName(file.path);
     final format = BookFormat.fromFileName(fileName);
     _format = format;
-    final BookSource source;
+    BookSource source;
     if (format == BookFormat.epub) {
       source = await EpubBookSource.fromFileInBackground(
         file.path,
@@ -1080,6 +1096,26 @@ class ReaderController extends ChangeNotifier {
       );
     }
     if (_disposed || openingGeneration != _paginationGeneration) {
+      if (source is DisposableBookSource) {
+        (source as DisposableBookSource).dispose();
+      }
+      throw StateError('Reader was closed while opening');
+    }
+    if (source is PdfBookSource) {
+      final store = DerivedDataStore.fromBooksDirectory(file.parent);
+      try {
+        _pdfOcr = await loadPdfOcrBookSource(
+          source,
+          Directory('${store.root.path}/${source.book.id}'),
+          toc: await store.generatedToc(source.book.id, source.book),
+        );
+        final ocr = _pdfOcr;
+        if (ocr != null) source = ocr;
+      } catch (error) {
+        debugPrint('PDF OCR unavailable: $error');
+      }
+    }
+    if (_disposed) {
       if (source is DisposableBookSource) {
         (source as DisposableBookSource).dispose();
       }
@@ -1115,9 +1151,17 @@ class ReaderController extends ChangeNotifier {
         : _book.metadata.title;
 
     final locator = hintedLocator ?? await progressStore.load(_book.id);
+    final pdfTarget = locator == null
+        ? null
+        : await _pdfOcr?.targetForLocator(locator);
     final count = _book.sectionCount;
     var start = 0;
-    if (locator != null && count > 0) {
+    if (pdfTarget != null) {
+      start = _book.spine.indexWhere(
+        (item) => item.href == pdfTarget.split('#').first,
+      );
+    }
+    if (pdfTarget == null && locator != null && count > 0) {
       start = locator.position.clamp(0, count - 1);
       final id = locator.source?.start.spine;
       final identified = id == null ? -1 : _book.indexOfSpine(id);
@@ -1152,7 +1196,7 @@ class ReaderController extends ChangeNotifier {
 
       sectionIndex = target;
       pageIndex = 0;
-      if (locator != null && target == start) {
+      if (pdfTarget == null && locator != null && target == start) {
         pageIndex = await _restorePageIndex(target, locator);
       }
       _evictDistantSections();
@@ -1162,6 +1206,7 @@ class ReaderController extends ChangeNotifier {
       busy = false;
       notifyListeners();
     }
+    if (pdfTarget != null) await goToHref(pdfTarget);
     debugPrint(
       'TortoReader open source_ms=$sourceMilliseconds total_ms=${openingWatch.elapsedMilliseconds} section=$sectionIndex pages=${currentPages.length}',
     );
@@ -1177,14 +1222,17 @@ class ReaderController extends ChangeNotifier {
   ) async {
     final epoch = ++_derivedEpoch;
     final store = DerivedDataStore.fromBooksDirectory(booksDirectory);
-    final toc = await store.generatedToc(source.book.id, source.book);
+    final toc = await store.generatedToc(
+      source.book.id,
+      source is PdfOcrBookSource ? source.original.book : source.book,
+    );
     final metadata = await store.metadata(source.book.id);
     if (_disposed ||
         epoch != _derivedEpoch ||
         !identical(_resourceSource, source)) {
       return;
     }
-    if (toc.isNotEmpty) _derivedToc = toc;
+    if (toc.isNotEmpty && !pdfReflowEnabled) _derivedToc = toc;
     if (metadata != null) {
       final original = source.book.metadata;
       _derivedMetadata = BookMetadata(
@@ -1208,7 +1256,7 @@ class ReaderController extends ChangeNotifier {
     Directory booksDirectory,
   ) async {
     final source = _resourceSource;
-    if (_disposed || source is! PdfBookSource) return;
+    if (_disposed || pdfSource == null || source == null) return;
     final store = DerivedDataStore.fromBooksDirectory(booksDirectory);
     _derivedEpoch++;
     await store.savePdfDiscovery(
@@ -1220,6 +1268,66 @@ class ReaderController extends ChangeNotifier {
     );
     if (_disposed || !identical(_resourceSource, source)) return;
     await _loadDerivedToc(source, booksDirectory);
+  }
+
+  Future<void> togglePdfReflow() async {
+    final source = _pdfOcr;
+    if (source == null || busy || !opened || _disposed) return;
+    busy = true;
+    notifyListeners();
+    String? target;
+    try {
+      final content = await source.parseSection(sectionIndex);
+      final physical = source.physicalPage(
+        sectionIndex,
+        readingAnchor,
+        content,
+      );
+      _cancelSemantic();
+      _translationGeneration++;
+      _translationRefreshTimer?.cancel();
+      _translationDirty.clear();
+      translationEnabled = false;
+      _translationSource?.enabled = false;
+      _translationSource?.clear();
+      _semanticSource?.annotations.clear();
+      _semanticPlans.clear();
+      _semanticAttempted.clear();
+      _rewriteSource?.clear();
+      _textNodeCache.clear();
+      _sourceNodeOrder.clear();
+      _tocAnchors.clear();
+      _derivedToc = const [];
+      _translatedTocLabels.clear();
+      _paginationGeneration++;
+      _paginations.clear();
+      final old = _sections.values.toList();
+      _sections.clear();
+      for (final pages in old) {
+        _retirePages(pages);
+      }
+      source.mode = pdfReflowEnabled
+          ? PdfOcrViewMode.original
+          : PdfOcrViewMode.reflow;
+      target = pdfReflowEnabled
+          ? source.reflowTarget(physical)
+          : source.original.book.spine[physical].href;
+      sectionIndex = pdfReflowEnabled
+          ? source.sectionForPage(physical)
+          : physical;
+      pageIndex = 0;
+      await source.saveMode();
+    } finally {
+      busy = false;
+      if (!_disposed) notifyListeners();
+    }
+    if (_disposed) return;
+    await goToHref(target);
+    if (!pdfReflowEnabled) {
+      _derivedToc = source.originalToc;
+    }
+    await reloadSemanticLayout();
+    notifyListeners();
   }
 
   bool needsViewport(LayoutViewport next) =>
@@ -1295,7 +1403,7 @@ class ReaderController extends ChangeNotifier {
       await _refreshCurrentSectionPreservingPosition();
       return true;
     }
-    if (_format == BookFormat.pdf) {
+    if (_fixedPdf) {
       translationError =
           'Fixed-layout PDF translation is not supported in this version.';
       notifyListeners();
@@ -1756,9 +1864,7 @@ class ReaderController extends ChangeNotifier {
     _peekPreparing = true;
     try {
       var paginatedAny = false;
-      final directions = _format == BookFormat.pdf
-          ? const [1, -1]
-          : const [-1, 1];
+      final directions = _fixedPdf ? const [1, -1] : const [-1, 1];
       for (final direction in directions) {
         while (true) {
           final section = _peekCoordinate(direction).$1;
@@ -1767,7 +1873,7 @@ class ReaderController extends ChangeNotifier {
           if (_disposed || _pageTurnActive || !opened || !_readerVisible) break;
           paginatedAny = true;
           // Let the ready PDF neighbour paint before preparing the other side.
-          if (_format == BookFormat.pdf) notifyListeners();
+          if (_fixedPdf) notifyListeners();
           // If the section was empty, _peekCoordinate now skips it and the
           // loop prepares the next candidate as well.
         }
@@ -1862,6 +1968,15 @@ class ReaderController extends ChangeNotifier {
       if (fragment != null && fragment.isNotEmpty) {
         final anchor = _anchorByFragment(section, fragment);
         if (anchor != null) {
+          final imageHrefs = <String>{
+            for (final block in section.blocks)
+              for (final image in switch (block) {
+                ImageBlock() => [block],
+                FigureBlock() => block.images,
+                _ => <ImageBlock>[],
+              })
+                if (image.source?.start.node == anchor.source.node) image.href,
+          };
           final index = pages.indexWhere(
             (page) => page.items.any(
               (item) => switch (item) {
@@ -1869,6 +1984,7 @@ class ReaderController extends ChangeNotifier {
                 TableCellPlacement(
                   :final nodeId,
                 ) => nodeId == anchor.source.node,
+                ImagePlacement(:final href) => imageHrefs.contains(href),
                 _ => false,
               },
             ),
@@ -2210,8 +2326,13 @@ class ReaderController extends ChangeNotifier {
       if (_disposed) return;
       try {
         final source = _resourceSource!;
-        if (source is PdfBookSource) {
-          _imageSizes[href] = source.resourceSize(href);
+        final pdfSize = source is PdfBookSource
+            ? source.resourceSize(href)
+            : source is PdfOcrBookSource
+            ? source.originalResourceSize(href)
+            : null;
+        if (pdfSize != null) {
+          _imageSizes[href] = pdfSize;
         } else {
           final bytes = await source.resource(href);
           if (bytes == null) {

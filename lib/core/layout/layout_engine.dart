@@ -696,6 +696,9 @@ class LayoutEngine {
           endProgression: nextProgression,
           viewport: viewport,
           focusUnits: style.focusMode ? paginator.focusPages[i] : const [],
+          focusContentBounds: style.focusMode
+              ? ui.Rect.fromLTRB(0, contentTop, viewport.width, contentBottom)
+              : null,
           scrollExtent:
               style.focusMode &&
                   paginator.focusPageBottoms[i] + viewport.height / 2 >
@@ -2899,6 +2902,7 @@ class LayoutEngine {
       math.min(style.baseFontSize * 3, equalWidth),
     );
     final preferred = List.filled(columnCount, minimumWidth);
+    final minimums = List.filled(columnCount, minimumWidth);
     for (final entry in cells) {
       final measured = _buildTableCellParagraph(
         entry.cell,
@@ -2908,12 +2912,28 @@ class LayoutEngine {
         lineHeight,
         imageSizeResolver,
       ).paragraph;
-      final desired =
-          (measured.maxIntrinsicWidth +
-                  padding * 2 +
-                  style.baseFontSize * fontScale * 0.5)
-              .clamp(minimumWidth, contentWidth);
+      final inset = padding * 2 + style.baseFontSize * fontScale * 0.5;
+      final desired = (measured.maxIntrinsicWidth.ceilToDouble() + inset).clamp(
+        minimumWidth,
+        contentWidth,
+      );
+      final required = (measured.minIntrinsicWidth.ceilToDouble() + inset)
+          .clamp(minimumWidth, contentWidth);
       measured.dispose();
+      final currentMinimum = minimums
+          .skip(entry.column)
+          .take(entry.columnSpan)
+          .fold<double>(0, (sum, width) => sum + width);
+      if (required > currentMinimum) {
+        final addition = (required - currentMinimum) / entry.columnSpan;
+        for (
+          var column = entry.column;
+          column < entry.column + entry.columnSpan;
+          column++
+        ) {
+          minimums[column] += addition;
+        }
+      }
       final current = preferred
           .skip(entry.column)
           .take(entry.columnSpan)
@@ -2928,25 +2948,26 @@ class LayoutEngine {
         preferred[column] += addition;
       }
     }
+    final minimumTotal = minimums.fold<double>(0, (sum, width) => sum + width);
+    if (minimumTotal >= contentWidth) {
+      return List.filled(columnCount, equalWidth);
+    }
+    for (var column = 0; column < columnCount; column++) {
+      preferred[column] = math.max(preferred[column], minimums[column]);
+    }
     final preferredTotal = preferred.fold<double>(
       0,
       (sum, width) => sum + width,
     );
     if (preferredTotal <= contentWidth) return preferred;
-    final minimumTotal = minimumWidth * columnCount;
-    if (minimumTotal >= contentWidth) {
-      return List.filled(columnCount, equalWidth);
-    }
     final availableFlex = contentWidth - minimumTotal;
-    final preferredFlex = preferred.fold<double>(
-      0,
-      (sum, width) => sum + width - minimumWidth,
-    );
+    final preferredFlex = preferredTotal - minimumTotal;
     final fitted = [
-      for (final width in preferred)
-        minimumWidth +
+      for (var column = 0; column < columnCount; column++)
+        minimums[column] +
             availableFlex *
-                ((width - minimumWidth) / math.max(1, preferredFlex)),
+                ((preferred[column] - minimums[column]) /
+                    math.max(1, preferredFlex)),
     ];
     final fittedTotal = fitted.fold<double>(0, (sum, width) => sum + width);
     fitted[fitted.length - 1] += contentWidth - fittedTotal;

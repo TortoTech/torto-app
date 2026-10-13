@@ -7,12 +7,14 @@ PageLayout fixture(
   List<Rect> bounds, {
   List<PageItem> items = const [],
   List<List<Rect>>? paint,
+  Rect? contentBounds,
 }) => PageLayout(
   viewport: const LayoutViewport(width: 400, height: 700),
   items: items,
   firstAnchor: null,
   progression: 0,
   scrollExtent: 5000,
+  focusContentBounds: contentBounds,
   focusUnits: [
     for (var i = 0; i < bounds.length; i++)
       FocusUnitLayout(
@@ -24,6 +26,39 @@ PageLayout fixture(
 );
 
 void main() {
+  test('clipped margins make a nearly page-sized block overflow', () {
+    const visible = Rect.fromLTRB(0, 80, 400, 580);
+    const block = Rect.fromLTWH(20, 380, 360, 620);
+    final page = fixture([
+      block,
+      const Rect.fromLTWH(20, 1020, 360, 70),
+    ], contentBounds: visible);
+    final start = FocusNavigation.target(page, 0);
+    final stops = FocusNavigation.overflow(page, 0)!;
+    expect(block.top - start, greaterThanOrEqualTo(visible.top));
+    final middle = FocusNavigation.step(page, 0, start, 1);
+    expect(middle.active, 0);
+    final next = FocusNavigation.step(page, 0, middle.offset, 1);
+    expect(next.active, 0);
+    expect(next.offset, stops.bottom);
+    expect(block.bottom - next.offset, lessThanOrEqualTo(visible.bottom));
+    expect(FocusNavigation.step(page, 0, next.offset, 1).active, 1);
+    expect(
+      FocusNavigation.step(page, 1, FocusNavigation.target(page, 1), -1),
+      next,
+    );
+  });
+
+  test('fitting blocks and images center in the asymmetric visible area', () {
+    const visible = Rect.fromLTRB(0, 100, 400, 620);
+    const body = Rect.fromLTWH(20, 500, 360, 510);
+    final page = fixture([body], contentBounds: visible);
+    final offset = FocusNavigation.target(page, 0);
+    expect(body.top - offset, greaterThanOrEqualTo(visible.top));
+    expect(body.bottom - offset, lessThanOrEqualTo(visible.bottom));
+    expect(body.center.dy - offset, visible.center.dy);
+    expect(FocusNavigation.overflow(page, 0), isNull);
+  });
   test('first body is positioned without hiding its leading heading', () {
     const headingAndBody = Rect.fromLTWH(20, 380, 360, 150);
     const body = Rect.fromLTWH(20, 460, 360, 70);

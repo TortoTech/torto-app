@@ -14,8 +14,8 @@ class DerivedBookMetadata {
 }
 
 /// Local cache for regenerable desktop-derived data. The cache is consumed by
-/// the shelf and generated PDF TOC today; OCR archives are retained for the
-/// mobile OCR renderer without placing them in the sync database.
+/// the shelf, generated PDF TOC, and PDF OCR reflow reader. Large OCR archives
+/// remain on disk rather than in the sync database.
 class DerivedDataStore {
   static const _maxOcrBytes = 768 * 1024 * 1024;
 
