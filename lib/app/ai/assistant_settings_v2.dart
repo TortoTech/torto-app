@@ -39,6 +39,7 @@ class AssistantSettings {
   final Map<SearchService, SearchServiceConfig> services;
   final int maxToolSteps, historyTurns;
   final ReasoningEffort reasoningEffort;
+  final ReasoningEffort pdfReasoningEffort;
   const AssistantSettings({
     this.providerId = '',
     this.model = '',
@@ -53,6 +54,7 @@ class AssistantSettings {
     this.maxToolSteps = 24,
     this.historyTurns = 10,
     this.reasoningEffort = ReasoningEffort.defaultLevel,
+    this.pdfReasoningEffort = ReasoningEffort.defaultLevel,
   }) : _searchEndpoint = searchEndpoint,
        _searchKey = searchKey;
   String get searchEndpoint =>
@@ -94,6 +96,13 @@ class AssistantSettings {
                 ).contains(reasoningEffort)
                 ? reasoningEffort
                 : ReasoningEffort.defaultLevel,
+            pdfReasoningEffort:
+                SearchCapabilities.reasoningLevels(
+                  provider,
+                  model,
+                ).contains(pdfReasoningEffort)
+                ? pdfReasoningEffort
+                : ReasoningEffort.defaultLevel,
             searchMode:
                 selectionModel.isEmpty && searchMode == SearchMode.external
                 ? SearchMode.external
@@ -131,6 +140,7 @@ class AssistantSettings {
     int? maxToolSteps,
     int? historyTurns,
     ReasoningEffort? reasoningEffort,
+    ReasoningEffort? pdfReasoningEffort,
   }) => AssistantSettings(
     providerId: providerId ?? this.providerId,
     model: model ?? this.model,
@@ -143,6 +153,7 @@ class AssistantSettings {
     maxToolSteps: (maxToolSteps ?? this.maxToolSteps).clamp(1, 24),
     historyTurns: (historyTurns ?? this.historyTurns).clamp(1, 50),
     reasoningEffort: reasoningEffort ?? this.reasoningEffort,
+    pdfReasoningEffort: pdfReasoningEffort ?? this.pdfReasoningEffort,
   );
   Map<String, dynamic> toJson() => {
     'version': 2,
@@ -156,6 +167,7 @@ class AssistantSettings {
     'max_tool_steps': maxToolSteps,
     'history_turns': historyTurns,
     'reasoning_effort': reasoningEffort.name,
+    'pdf_reasoning_effort': pdfReasoningEffort.name,
     'services': {
       for (final entry in configurations.entries)
         entry.key.name: {'endpoint': entry.value.endpoint},
@@ -219,6 +231,11 @@ class AssistantSettings {
       reasoningEffort:
           ReasoningEffort.values
               .where((v) => v.name == json['reasoning_effort'])
+              .firstOrNull ??
+          ReasoningEffort.defaultLevel,
+      pdfReasoningEffort:
+          ReasoningEffort.values
+              .where((v) => v.name == json['pdf_reasoning_effort'])
               .firstOrNull ??
           ReasoningEffort.defaultLevel,
     );

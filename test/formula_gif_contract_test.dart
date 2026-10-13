@@ -148,8 +148,7 @@ void main() {
       final images = await formulaImagePrompts();
       expect(images.transcribe, contains('## Transcription self-check'));
       expect(images.transcribe, isNot(contains('## Conditional review')));
-      expect(images.verify, contains('## Conditional review'));
-      expect(images.verify, isNot(contains('## Transcription self-check')));
+      expect(images.verify, isEmpty);
     },
   );
   test(

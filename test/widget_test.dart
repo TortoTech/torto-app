@@ -9,6 +9,15 @@ import 'package:torto/app/library/library_store.dart';
 import 'package:torto/app/progress_store.dart';
 import 'package:torto/core/ir/ir.dart';
 
+class _LoadedLibraryStore extends LibraryStore {
+  final List<LibraryBook> books;
+  _LoadedLibraryStore(this.books)
+    : super(booksDir: Directory('test/__no_such_books_dir__'));
+
+  @override
+  Future<List<LibraryBook>> list() async => books;
+}
+
 void main() {
   test('ProgressStore round-trips a locator with a source anchor', () async {
     SharedPreferences.setMockInitialValues({});
@@ -52,9 +61,12 @@ void main() {
 
   testWidgets('LibraryPage renders the empty state', (tester) async {
     // A directory that never exists → empty library, no temp dirs needed.
-    final store = LibraryStore(
-      booksDir: Directory('test/__no_such_books_dir__'),
+    final books = await tester.runAsync(
+      () => LibraryStore(
+        booksDir: Directory('test/__no_such_books_dir__'),
+      ).list(),
     );
+    final store = _LoadedLibraryStore(books!);
     SharedPreferences.setMockInitialValues({});
     final progressStore = ProgressStore(await SharedPreferences.getInstance());
     await tester.pumpWidget(
@@ -62,8 +74,8 @@ void main() {
         home: LibraryPage(store: store, progressStore: progressStore),
       ),
     );
-    // Let the real async directory check complete, then rebuild.
-    await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+    // The filesystem query completed in the real async zone. Settle the UI's
+    // microtasks without relying on how fast native I/O finishes under load.
     await tester.pump();
 
     expect(find.textContaining('书架还是空的'), findsOneWidget);

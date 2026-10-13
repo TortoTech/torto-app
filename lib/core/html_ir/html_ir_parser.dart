@@ -6,6 +6,8 @@
 library;
 
 import 'dart:math' as math;
+import 'paragraph_lists.dart';
+import '../formats/reading_continuations.dart';
 
 import 'package:xml/xml.dart';
 
@@ -36,6 +38,7 @@ class HtmlIrParser {
     SectionParseHints hints = const SectionParseHints(),
     String? Function(String href)? loadStylesheet,
     bool Function(String href)? isDecorativeSeparatorImage,
+    bool Function(String href)? isSmallListMarkerImage,
   }) {
     try {
       final document = tryParsePublicationContent(xhtml);
@@ -56,6 +59,7 @@ class HtmlIrParser {
         hints,
         loadStylesheet,
         isDecorativeSeparatorImage,
+        isSmallListMarkerImage,
       ).run();
     } catch (_) {
       return Section(
@@ -551,6 +555,8 @@ TextBlock _copyTextBlock(
   listDepth: block.listDepth,
   listGroupId: block.listGroupId,
   listMarkerVisible: block.listMarkerVisible,
+  authoredListMarkerChars: block.authoredListMarkerChars,
+  authoredListMarkerImage: block.authoredListMarkerImage,
   inlines: inlines ?? block.inlines,
   style: style ?? block.style,
   source: block.source,
@@ -646,6 +652,7 @@ class _SectionParser {
   final SectionParseHints hints;
   final String? Function(String href)? loadStylesheet;
   final bool Function(String href)? isDecorativeSeparatorImage;
+  final bool Function(String href)? isSmallListMarkerImage;
   final _StyleSheet styles = _StyleSheet();
   late final Map<XmlElement, LinkRole> _footnoteLinks;
   final List<Block> blocks = [];
@@ -678,6 +685,7 @@ class _SectionParser {
     this.hints,
     this.loadStylesheet,
     this.isDecorativeSeparatorImage,
+    this.isSmallListMarkerImage,
   ) {
     _footnoteLinks = _classifyFootnoteLinks(document, href, baseDir);
     for (final element in document.descendants.whereType<XmlElement>()) {
@@ -721,6 +729,7 @@ class _SectionParser {
       _parseChildren(root);
     }
     _attachTableCaptions();
+    _attachDescribedImages();
     final anchors = <SectionAnchor>[];
     final seen = <String>{};
     for (final element in document.descendants.whereType<XmlElement>()) {
@@ -732,15 +741,114 @@ class _SectionParser {
       }
     }
     return Section(
+      continuationQuote: hints.noteSection ? null : quoteSpreadCandidate(root),
       id: spineId,
       spineIndex: spineIndex,
       href: href,
-      blocks: blocks,
+      blocks: recoverParagraphLists(
+        blocks,
+        excluded: {
+          for (final entry in _blockElements.entries)
+            if ([
+              entry.value,
+              ...entry.value.ancestors.whereType<XmlElement>(),
+            ].any(
+              (e) =>
+                  const {
+                    'nav',
+                    'table',
+                    'li',
+                    'blockquote',
+                    'figure',
+                    'pre',
+                  }.contains(_name(e)) ||
+                  RegExp(
+                    r'\b(?:bibliography|references|bibitem|footnote|endnote|doc-bibliography|doc-endnotes)\b',
+                    caseSensitive: false,
+                  ).hasMatch(
+                    '${_attr(e, 'class') ?? ''} ${_attr(e, 'role') ?? ''} ${_attr(e, 'type') ?? ''}',
+                  ),
+            ))
+              entry.key,
+        },
+        smallImage: (image) {
+          final width = image.style.width, height = image.style.height;
+          return (isSmallListMarkerImage?.call(image.href) ?? false) ||
+              width is ImagePixels &&
+                  width.value > 0 &&
+                  width.value <= 32 &&
+                  height is ImagePixels &&
+                  height.value > 0 &&
+                  height.value <= 32;
+        },
+      ),
       anchors: anchors,
     );
   }
 
   String _allocateNode() => 'n${_nextNode++}';
+
+  void _attachDescribedImages() {
+    final owners = <TextBlock, List<ImageBlock>>{};
+    final captions = <ImageBlock, List<TextBlock>>{};
+    for (final image in blocks.whereType<ImageBlock>()) {
+      final element = _blockElements[image];
+      if (element == null) continue;
+      final described = [
+        _attr(element, 'aria-describedby'),
+        ...element.descendants
+            .whereType<XmlElement>()
+            .where((e) => const {'img', 'image'}.contains(_name(e)))
+            .map((e) => _attr(e, 'aria-describedby')),
+      ].whereType<String>().expand((s) => s.split(RegExp(r'\s+'))).toSet();
+      if (described.isEmpty) continue;
+      for (final caption in blocks.whereType<TextBlock>().where(
+        (b) => const {
+          TextBlockKind.paragraph,
+          TextBlockKind.caption,
+        }.contains(b.kind),
+      )) {
+        if (!described.contains(
+          _nodeFragment(_blockElements[caption] ?? element),
+        )) {
+          continue;
+        }
+        (owners[caption] ??= []).add(image);
+        (captions[image] ??= []).add(caption);
+      }
+    }
+    final claimed = owners.entries
+        .where((e) => e.value.length == 1)
+        .map((e) => e.key)
+        .toSet();
+    final original = List<Block>.of(blocks);
+    blocks.clear();
+    for (final block in original) {
+      if (claimed.contains(block)) continue;
+      if (block is ImageBlock && captions.containsKey(block)) {
+        final values = captions[block]!.where(claimed.contains).toList();
+        if (values.isNotEmpty) {
+          final at = original.indexOf(block);
+          blocks.add(
+            FigureBlock(
+              images: [block],
+              source: block.source,
+              captions: values
+                  .where((c) => original.indexOf(c) < at)
+                  .map((c) => _copyTextBlock(c, kind: TextBlockKind.caption))
+                  .toList(),
+              afterCaptions: values
+                  .where((c) => original.indexOf(c) > at)
+                  .map((c) => _copyTextBlock(c, kind: TextBlockKind.caption))
+                  .toList(),
+            ),
+          );
+          continue;
+        }
+      }
+      blocks.add(block);
+    }
+  }
 
   SourceRange _sourceFor(String nodeId, int textLength) => SourceRange(
     start: SourceAnchor(spine: spineId, node: nodeId, textOffset: 0),
@@ -1319,9 +1427,20 @@ class _SectionParser {
     final blockStart = blocks.length;
     final name = _name(element);
     if (_skippedElements.contains(name)) return;
+    if (_isBreadcrumb(element)) return;
     if (name != 'p') _paragraphListIndents.clear();
 
     final props = styles.cascadedProperties(element);
+    final roles =
+        '${_attr(element, 'role') ?? ''} ${_attr(element, 'type') ?? ''}'.split(
+          RegExp(r'\s+'),
+        );
+    if (!_insideQuote &&
+        roles.any(const {'pullquote', 'doc-pullquote'}.contains)) {
+      _parseQuote(element);
+      _rememberElementSource(element, blockStart);
+      return;
+    }
     if (_isPageBreak(props['page-break-before'] ?? props['break-before'])) {
       blocks.add(const PageBreakBlock());
     }
@@ -1473,6 +1592,46 @@ class _SectionParser {
         return;
       }
     }
+  }
+
+  bool _isBreadcrumb(XmlElement element) {
+    final semantics =
+        '${_attr(element, 'class') ?? ''} ${_attr(element, 'aria-label') ?? ''}'
+            .toLowerCase();
+    final explicit =
+        semantics.contains('breadcrumb') || semantics.contains('面包屑');
+    final links = element.descendants
+        .whereType<XmlElement>()
+        .where((e) => _name(e) == 'a' && _attr(e, 'href') != null)
+        .toList();
+    if (links.isEmpty ||
+        element.descendants.whereType<XmlElement>().any(
+          (e) => const {'img', 'image', 'table'}.contains(_name(e)),
+        )) {
+      return false;
+    }
+    final body = document.descendants
+        .whereType<XmlElement>()
+        .where((e) => _name(e) == 'body')
+        .firstOrNull;
+    var boundary = element;
+    while (boundary.parentElement != null &&
+        !identical(boundary.parentElement, body)) {
+      boundary = boundary.parentElement!;
+    }
+    final siblings = body?.childElements.toList() ?? [];
+    final atBoundary =
+        siblings.isNotEmpty &&
+        (identical(siblings.first, boundary) ||
+            identical(siblings.last, boundary));
+    if (!explicit && !atBoundary) return false;
+    final unlinked = element.descendants
+        .whereType<XmlText>()
+        .where((t) => !t.ancestors.whereType<XmlElement>().any(links.contains))
+        .map((t) => t.value)
+        .join();
+    return RegExp(r'^[\s>›»/|·:：←→«‹]*$').hasMatch(unlinked) &&
+        (explicit || links.length >= 2);
   }
 
   SourceAnchor? _sourceForElement(XmlElement element) {
@@ -2756,7 +2915,11 @@ class _SectionParser {
       }
       return;
     }
-    if (name == 'script' || name == 'style') {
+    if (name == 'script' ||
+        name == 'style' ||
+        name == 'rt' ||
+        name == 'rp' ||
+        name == 'rtc') {
       return;
     }
     if (preserveBlockBoundaries && _isBlockBoundary(name)) {
@@ -2813,6 +2976,69 @@ class _SectionParser {
           ) ??
           1,
     );
+
+    if (name == 'ruby') {
+      final pending = <List<TextRun>>[];
+      final explicitBases = node.childElements.any((e) => _name(e) == 'rb');
+      void base(XmlNode child) {
+        final part = _InlineCollector(preserveWhitespace: false);
+        _collectInlineNode(child, style, link, part, language: childLanguage);
+        part.finish();
+        final runs = part.content.whereType<TextRun>().toList();
+        if (runs.any((r) => r.text.trim().isNotEmpty)) pending.add(runs);
+      }
+
+      for (final child in node.children) {
+        final tag = child is XmlElement ? _name(child) : '';
+        if (tag == 'rp') continue;
+        if ((tag == 'rt' || tag == 'rtc') && child is XmlElement) {
+          if (pending.isEmpty) continue;
+          final note = _InlineCollector(preserveWhitespace: false);
+          _collectInline(child, style, null, note, language: childLanguage);
+          // rtc may contain several rt children, whose text is annotation only.
+          if (tag == 'rtc') {
+            for (final rt in child.childElements.where(
+              (e) => _name(e) == 'rt',
+            )) {
+              _collectInline(rt, style, null, note, language: childLanguage);
+            }
+          }
+          note.finish();
+          final annotation = note.content.whereType<TextRun>().toList();
+          final source = explicitBases
+              ? pending.removeAt(0)
+              : pending.expand((r) => r).toList();
+          if (!explicitBases) pending.clear();
+          collector.content.add(
+            annotation.isEmpty
+                ? TextRun(
+                    source.map((r) => r.text).join(),
+                    style: style,
+                    link: link,
+                    language: childLanguage,
+                  )
+                : RubyRun(
+                    base: source,
+                    annotation: annotation,
+                    below:
+                        styles
+                            .cascadedProperties(node)['ruby-position']
+                            ?.trim() ==
+                        'under',
+                  ),
+          );
+          collector._lastWasSpace = false;
+        } else {
+          base(child);
+        }
+      }
+      for (final runs in pending) {
+        for (final run in runs) {
+          collector.pushText(run.text, run.style, run.link, run.language);
+        }
+      }
+      return;
+    }
 
     if (name == 'span' && classes.any((value) => value == 'math')) {
       final latex = node.descendants
@@ -3143,7 +3369,32 @@ class _SectionParser {
     maxHeight = _imageLength(props['max-height']);
     final authoredMarginBefore = _cssLength(props['margin-top']) ?? 0;
     final authoredMarginAfter = _cssLength(props['margin-bottom']) ?? 0;
+    var fraction = 1.0;
+    double? pixels;
+    for (final parent
+        in element.ancestors.whereType<XmlElement>().toList().reversed) {
+      final css = styles.cascadedProperties(parent);
+      var local = 1.0;
+      double? limit;
+      for (final property in ['width', 'max-width']) {
+        switch (_imageLength(css[property])) {
+          case ImageFraction(:final value):
+            local = math.min(local, value);
+          case ImagePixels(:final value):
+            limit = limit == null ? value : math.min(limit, value);
+          case null:
+            break;
+        }
+      }
+      fraction *= local;
+      if (pixels != null) pixels *= local;
+      if (limit != null) {
+        pixels = pixels == null ? limit : math.min(pixels, limit);
+      }
+    }
     return ImageStyle(
+      containerFraction: fraction.clamp(.001, 1),
+      containerPixels: pixels,
       width: width,
       height: height,
       maxWidth: maxWidth,
@@ -3297,6 +3548,7 @@ class _InlineCollector {
     if (normalized.isEmpty) return;
     final last = content.isEmpty ? null : content.last;
     if (last is TextRun &&
+        last is! RubyRun &&
         last.style == style &&
         last.link == link &&
         last.language == language) {

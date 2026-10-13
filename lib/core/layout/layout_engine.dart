@@ -9,6 +9,8 @@
 library;
 
 import 'dart:math' as math;
+import '../html_ir/paragraph_lists.dart';
+
 import 'dart:ui' as ui;
 
 import 'package:characters/characters.dart';
@@ -17,12 +19,14 @@ import 'package:flutter/foundation.dart';
 import '../ir/ir.dart';
 import '../ir/inline_content.dart';
 import '../semantic_layout/web_links.dart';
+import '../semantic_layout/media_references.dart';
 import '../render/formula_rasterizer.dart';
 import '../linebreak/english_hyphenator.dart';
 import '../linebreak/paragraph_optimizer.dart';
 import '../linebreak/measurement.dart';
 import '../linebreak/unicode_line_breaker.dart';
 import 'layout_types.dart';
+import 'heading_composition.dart';
 import 'focus_layout.dart';
 import 'footnote_numbering.dart';
 import 'footnote_spacing.dart';
@@ -202,8 +206,69 @@ bool _isSemanticOpeningPunctuation(int? rune) => const {
 }.contains(rune);
 
 class LayoutEngine {
+  static RubyLayout _rubyLayout(
+    RubyRun run,
+    double fontSize,
+    ui.Color color,
+    String? family,
+    List<String> fallback,
+    double available,
+    int weight,
+  ) {
+    ui.Paragraph build(List<TextRun> runs, double size) {
+      final builder = ui.ParagraphBuilder(
+        ui.ParagraphStyle(
+          fontFamily: family,
+          fontSize: size,
+          height: 1,
+          textDirection: ui.TextDirection.ltr,
+        ),
+      );
+      for (final r in runs) {
+        builder.pushStyle(
+          ui.TextStyle(
+            fontFamily: family,
+            fontFamilyFallback: fallback,
+            fontSize: size,
+            color: color,
+            fontWeight: r.style.bold
+                ? ui.FontWeight.w700
+                : ui.FontWeight.values[(weight ~/ 100 - 1).clamp(0, 8)],
+            fontStyle: r.style.italic
+                ? ui.FontStyle.italic
+                : ui.FontStyle.normal,
+          ),
+        );
+        builder.addText(r.text);
+        builder.pop();
+      }
+      return builder.build()
+        ..layout(const ui.ParagraphConstraints(width: 1000000));
+    }
+
+    var base = build(run.base, fontSize),
+        note = build(run.annotation, fontSize * .5);
+    var width = math.max(base.maxIntrinsicWidth, note.maxIntrinsicWidth);
+    if (width > available && width > 0) {
+      base.dispose();
+      note.dispose();
+      fontSize *= available / width;
+      base = build(run.base, fontSize);
+      note = build(run.annotation, fontSize * .5);
+      width = math.max(base.maxIntrinsicWidth, note.maxIntrinsicWidth);
+    }
+    return RubyLayout(
+      base,
+      note,
+      run.below,
+      width,
+      base.height + note.height + 1,
+      fontSize,
+    );
+  }
+
   final ParagraphHyphenator? hyphenator;
-  final FormulaRaster? Function(MathInline, int)? formulaResolver;
+  final FormulaMetrics? Function(MathInline, int)? formulaResolver;
   @visibleForTesting
   final bool cacheHyphenMeasurements;
   @visibleForTesting
@@ -423,6 +488,7 @@ class LayoutEngine {
     }
 
     final paginator = _Paginator(
+      spineIndex: section.spineIndex,
       focusMode: style.focusMode,
       top: contentTop,
       initialPadding: style.focusMode ? viewport.height / 2 : 0,
@@ -446,6 +512,90 @@ class LayoutEngine {
       }
       if (focusGroups[blockIndex] case final group?) {
         paginator.beginFocusUnit(group);
+      }
+      final headings = style.typesettingMode == TypesettingMode.unified
+          ? HeadingComposition.at(flowBlocks, blockIndex)
+          : null;
+      if (headings != null) {
+        void pair(TextBlock ordinal, TextBlock title, {bool reused = false}) {
+          final label = _prepareText(
+            HeadingComposition.presentation(ordinal, reused: reused),
+            style,
+            section.spineIndex,
+            contentLeft,
+            contentWidth,
+            textStartOf[ordinal] ?? 0,
+            imageSizeResolver: imageSizeResolver,
+          );
+          if (label == null) return;
+          final joined =
+              label.metrics.length == 1 &&
+              label.paragraph.longestLine < contentWidth - style.baseFontSize;
+          final value = _prepareText(
+            HeadingComposition.presentation(title),
+            style,
+            section.spineIndex,
+            contentLeft,
+            contentWidth,
+            textStartOf[title] ?? 0,
+            imageSizeResolver: imageSizeResolver,
+            firstLineIndentOverride: joined
+                ? label.paragraph.longestLine + style.baseFontSize * .35
+                : null,
+          );
+          if (joined && value != null) {
+            paginator.prepareGroup(
+              math.max(_preparedTextHeight(label), _preparedTextHeight(value)),
+              label.marginBefore,
+            );
+          }
+          paginator.pushText(label.copyWith(marginAfter: joined ? 0 : null));
+          if (value != null) {
+            if (joined) {
+              paginator.cursorY -=
+                  label.metrics.first.height -
+                  label.metrics.first.baseline +
+                  value.metrics.first.baseline;
+              paginator.pendingMargin = 0;
+            }
+            paginator.pushText(
+              joined
+                  ? value.copyWith(
+                      marginBefore: 0,
+                      joinOverlap:
+                          label.metrics.first.height -
+                          label.metrics.first.baseline +
+                          value.metrics.first.baseline,
+                    )
+                  : value,
+            );
+          }
+        }
+
+        pair(headings.ordinal, headings.title);
+        if (headings.translatedTitle != null) {
+          if (headings.translatedOrdinal != null || headings.canReuseOrdinal) {
+            pair(
+              headings.translatedOrdinal ?? headings.ordinal,
+              headings.translatedTitle!,
+              reused: headings.translatedOrdinal == null,
+            );
+          } else {
+            final title = _prepareText(
+              headings.translatedTitle!,
+              style,
+              section.spineIndex,
+              contentLeft,
+              contentWidth,
+              textStartOf[headings.translatedTitle] ?? 0,
+              imageSizeResolver: imageSizeResolver,
+            );
+            if (title != null) paginator.pushText(title);
+          }
+        }
+        blockIndex += headings.consumed;
+        yield blockIndex;
+        continue;
       }
       if (style.typesettingMode == TypesettingMode.unified &&
           block is ImageBlock &&
@@ -492,6 +642,7 @@ class LayoutEngine {
             contentWidth,
             contentHeight,
             viewport.width,
+            sectionTextOffset: textStartOf[block] ?? 0,
           );
         case FigureBlock():
           _pushFigure(
@@ -636,6 +787,11 @@ class LayoutEngine {
 
     final pages = <PageLayout>[];
     final disposalPool = ParagraphDisposalPool();
+    final imageTextProgression = rawPages.any(
+      (items) => items.whereType<TextPlacement>().any(
+        (text) => text.displayToSelection != null,
+      ),
+    );
     var carriedProgression = 0.0;
     for (var i = 0; i < rawPages.length; i++) {
       final items = rawPages[i];
@@ -673,9 +829,14 @@ class LayoutEngine {
         }
         carriedProgression = progression;
       }
+      if (imageTextProgression && rawPages.length > 1) {
+        progression = i / (rawPages.length - 1);
+      }
       if (i == rawPages.length - 1 && !style.focusMode) progression = 1.0;
       double nextProgression = 1;
-      if (style.focusMode && i + 1 < rawPages.length && totalText > 0) {
+      if (imageTextProgression && i + 1 < rawPages.length) {
+        nextProgression = (i + 1) / (rawPages.length - 1);
+      } else if (style.focusMode && i + 1 < rawPages.length && totalText > 0) {
         for (final item in rawPages[i + 1]) {
           if (item is TextPlacement) {
             nextProgression = item.sectionTextOffset / totalText;
@@ -775,6 +936,16 @@ class LayoutEngine {
     final unified = style.typesettingMode == TypesettingMode.unified;
     final out = <Inline>[];
     for (final value in values) {
+      if (unified && value is InlineImageRun && value.image.ocrText != null) {
+        out.add(
+          ImageTextRun(
+            value.image.ocrText!.displayText,
+            value.image.href,
+            literal: value.image.ocrText!.literal,
+          ),
+        );
+        continue;
+      }
       if (value is MathInline &&
           (!unified ||
               formulaResolver?.call(value, style.foreground) == null)) {
@@ -813,7 +984,9 @@ class LayoutEngine {
       }
     }
     return unified
-        ? coalesceNumberedFootnotes(coalesceReferences(detectWebLinks(out)))
+        ? MediaReferences.link(
+            coalesceNumberedFootnotes(coalesceReferences(detectWebLinks(out))),
+          )
         : out;
   }
 
@@ -888,6 +1061,50 @@ class LayoutEngine {
     if (style.typesettingMode == TypesettingMode.unified &&
         block.kind == TextBlockKind.caption) {
       block = withInlines(block, emphasizeCaptionLabel(block.inlines));
+    }
+    if (style.typesettingMode == TypesettingMode.unified &&
+        block.kind == TextBlockKind.heading) {
+      final lines = block.plainText.split('\n');
+      if (lines.length > 1 &&
+          RegExp(
+            r'^\s*(?:(?:chapter|part|book|section|第)\s*)?[0-9０-９IVXLCDM一二三四五六七八九十百]+\s*(?:章|节|部|卷)?\s*$',
+            caseSensitive: false,
+          ).hasMatch(lines.first)) {
+        var joined = false;
+        block = withInlines(block, [
+          for (final inline in block.inlines)
+            if (!joined && inline is BreakInline && !inline.synthetic)
+              ...(() {
+                joined = true;
+                return <Inline>[const TextRun(' ')];
+              })()
+            else
+              inline,
+        ]);
+      }
+    }
+    final sourceTextLength = block.plainText.runes.length;
+    final markerPrefix = style.typesettingMode == TypesettingMode.unified
+        ? block.authoredListMarkerChars
+        : 0;
+    if (style.typesettingMode == TypesettingMode.unified &&
+        block.authoredListMarkerImage != null) {
+      var removed = false;
+      block = withInlines(block, [
+        for (final i in block.inlines)
+          if (i is InlineImageRun &&
+              !removed &&
+              i.image.href == block.authoredListMarkerImage)
+            ...(() {
+              removed = true;
+              return <Inline>[];
+            })()
+          else
+            i,
+      ]);
+    }
+    if (markerPrefix > 0) {
+      block = withInlines(block, stripListMarker(block.inlines, markerPrefix));
     }
     final sentenceInlines =
         style.focusMode &&
@@ -997,7 +1214,8 @@ class LayoutEngine {
     var marker = '';
     var markerWidth = 0.0;
     if (isList) {
-      if (block.listMarkerVisible) {
+      if (block.listMarkerVisible &&
+          (unified || block.authoredListMarkerChars == 0)) {
         marker = block.listOrdered
             ? '${block.listOrdinal}.'
             : _bulletForDepth(block.listDepth);
@@ -1054,8 +1272,8 @@ class LayoutEngine {
                 _ => block.style.indent,
               });
     var syntheticPrefixLength = 0;
-    final normalDisplayToSource = <int>[0];
-    var sourceOffset = 0;
+    final normalDisplayToSource = <int>[markerPrefix];
+    var sourceOffset = markerPrefix;
     if (indentWidth > 0) {
       builder.addPlaceholder(
         indentWidth,
@@ -1065,7 +1283,7 @@ class LayoutEngine {
         baselineOffset: baseSize * 0.8,
       );
       syntheticPrefixLength = 1;
-      normalDisplayToSource.add(0);
+      normalDisplayToSource.add(markerPrefix);
     }
 
     final links = <TextLinkRange>[];
@@ -1082,8 +1300,81 @@ class LayoutEngine {
     final gluedRuns = _footnoteGlueRuns(block.inlines);
     for (final inline in block.inlines) {
       switch (inline) {
+        case RubyRun():
+          final ruby = _rubyLayout(
+            inline,
+            baseSize * blockScale,
+            foreground,
+            fontFamily,
+            fontFamilyFallback,
+            contentWidth,
+            typography.fontWeight,
+          );
+          final start = paragraphOffset;
+          builder.pushStyle(
+            ui.TextStyle(
+              color: const ui.Color(0x00000000),
+              fontSize: ruby.fontSize,
+              fontFamily: fontFamily,
+              fontFamilyFallback: fontFamilyFallback,
+              height: ruby.height / ruby.fontSize + .5,
+              letterSpacing:
+                  math.max(0, ruby.width - ruby.base.maxIntrinsicWidth) /
+                  math.max(1, inline.text.runes.length),
+            ),
+          );
+          final runes = inline.text.runes.toList();
+          for (var i = 0; i < runes.length; i++) {
+            if (i > 0) {
+              builder.addText('\u2060');
+              paragraphOffset++;
+              normalDisplayToSource.add(sourceOffset);
+            }
+            final text = String.fromCharCode(runes[i]);
+            builder.addText(text);
+            paragraphOffset += text.length;
+            appendSourceText(text);
+          }
+          builder.pop();
+          inlineImages.add(
+            InlineImageRange(
+              start: start,
+              end: paragraphOffset,
+              href: '',
+              width: ruby.width,
+              height: ruby.height,
+              ruby: ruby,
+            ),
+          );
         case TextRun(:final text, style: final runStyle, :final link):
           if (text.isEmpty) continue;
+          if (inline is ImageTextRun) {
+            links.add(
+              TextLinkRange(
+                start: paragraphOffset,
+                end: paragraphOffset + text.length,
+                href: '',
+                marker: '',
+                role: LinkRole.normal,
+                originalImage: inline.originalImage,
+              ),
+            );
+          }
+          if (inline is ImageTextRun && inline.literal) {
+            builder.pushStyle(
+              ui.TextStyle(
+                fontFamily: 'monospace',
+                fontSize: baseSize * blockScale,
+                color: foreground,
+                height: paragraphLineHeight,
+              ),
+            );
+            builder.addText(text);
+            builder.pop();
+            paragraphOffset += text.length;
+            appendSourceText(text);
+            continue;
+          }
           final footnoteIcon = _usesFootnoteIcon(runStyle, link);
           if (footnoteIcon) {
             builder.addText('\u2060');
@@ -1366,7 +1657,9 @@ class LayoutEngine {
         inlineImages
           ..clear()
           ..addAll(optimized.inlineImages);
-        displayToSource = optimized.displayToSource;
+        displayToSource = [
+          for (final value in optimized.displayToSource) value + markerPrefix,
+        ];
       }
     }
     if (block.nodeId.endsWith('@rewrite') &&
@@ -1394,12 +1687,20 @@ class LayoutEngine {
       top += m.height;
     }
 
+    final derived = block.inlines.any((i) => i is ImageTextRun);
+    final displayToSelection = derived ? List<int>.of(displayToSource) : null;
+    if (derived) {
+      final projection = imageTextProjection(block.inlines).$2;
+      displayToSource = [
+        for (final offset in displayToSource)
+          projection[offset.clamp(0, projection.length - 1)],
+      ];
+    }
     return _PreparedText(
-      baselineRegions: _baselineRegions(
-        block.inlines,
-        paragraph,
-        displayToSource,
-      ),
+      displayToSelection: displayToSelection,
+      baselineRegions: _baselineRegions(block.inlines, paragraph, [
+        for (final value in displayToSource) value - markerPrefix,
+      ]),
       paragraph: paragraph,
       metrics: metrics,
       lineTops: lineTops,
@@ -1412,7 +1713,7 @@ class LayoutEngine {
       markerParagraph: markerParagraph,
       markerX: contentLeft + marginStart,
       markerWidth: markerWidth,
-      textLength: block.plainText.runes.length,
+      textLength: sourceTextLength,
       source: block.source,
       nodeId: block.nodeId,
       spineIndex: spineIndex,
@@ -1594,6 +1895,9 @@ class LayoutEngine {
     required WritingSystem writingSystem,
     required ui.Size? Function(String href)? imageSizeResolver,
   }) {
+    if (block.inlines.any((i) => i is RubyRun || i is ImageTextRun)) {
+      return null;
+    }
     final slices = <_SourceRunSlice>[];
     final text = StringBuffer();
     var sourceOffset = 0;
@@ -2624,6 +2928,9 @@ class LayoutEngine {
     required ui.Size? Function(String href)? imageSizeResolver,
   }) {
     final intrinsic = imageSizeResolver?.call(run.image.href);
+    availableWidth = run.image.style
+        .containingWidth(availableWidth)
+        .clamp(1, availableWidth);
     final aspectRatio = intrinsic == null || intrinsic.height <= 0
         ? 1.0
         : intrinsic.width / intrinsic.height;
@@ -2821,6 +3128,7 @@ class LayoutEngine {
       }
       cells.add(
         _PreparedTableCell(
+          displayToSelection: builtCell.displayToSelection,
           baselineRegions: _baselineRegions(
             gridCell.cell.inlines,
             paragraph,
@@ -3007,7 +3315,9 @@ class LayoutEngine {
     final cjkFont = typography.cjkFontFor(style.writingSystem);
     final fontFamily = latinFont.family;
     final fontFamilyFallback = <String>[cjkFont.family];
-    final alignment = cell.authoredAlignment ?? BlockAlign.center;
+    final alignment =
+        cell.authoredAlignment ??
+        (unified ? BlockAlign.start : BlockAlign.center);
     final builder = ui.ParagraphBuilder(
       ui.ParagraphStyle(
         textAlign: switch (alignment) {
@@ -3028,8 +3338,69 @@ class LayoutEngine {
     var paragraphOffset = 0;
     for (final inline in cell.inlines) {
       switch (inline) {
+        case RubyRun():
+          final ruby = _rubyLayout(
+            inline,
+            style.baseFontSize * fontScale,
+            foreground,
+            fontFamily,
+            fontFamilyFallback,
+            width,
+            typography.fontWeight,
+          );
+          builder.pushStyle(
+            ui.TextStyle(
+              color: const ui.Color(0x00000000),
+              fontSize: ruby.fontSize,
+              fontFamily: fontFamily,
+              fontFamilyFallback: fontFamilyFallback,
+              height: ruby.height / ruby.fontSize + .5,
+              letterSpacing:
+                  math.max(0, ruby.width - ruby.base.maxIntrinsicWidth) /
+                  math.max(1, inline.text.runes.length),
+            ),
+          );
+          builder.addText(inline.text);
+          builder.pop();
+          inlineImages.add(
+            InlineImageRange(
+              start: paragraphOffset,
+              end: paragraphOffset + inline.text.length,
+              href: '',
+              width: ruby.width,
+              height: ruby.height,
+              ruby: ruby,
+            ),
+          );
+          paragraphOffset += inline.text.length;
         case TextRun(:final text, style: final runStyle, :final link):
           if (text.isEmpty) continue;
+          if (inline is ImageTextRun) {
+            links.add(
+              TextLinkRange(
+                start: paragraphOffset,
+                end: paragraphOffset + text.length,
+                href: '',
+                marker: '',
+                role: LinkRole.normal,
+                originalImage: inline.originalImage,
+              ),
+            );
+          }
+          if (inline is ImageTextRun && inline.literal) {
+            builder.pushStyle(
+              ui.TextStyle(
+                fontFamily: 'monospace',
+                fontSize: style.baseFontSize * fontScale,
+                color: foreground,
+                height: lineHeight,
+              ),
+            );
+            builder.addText(text);
+            builder.pop();
+            paragraphOffset += text.length;
+            continue;
+          }
           final footnoteIcon = _usesFootnoteIcon(runStyle, link);
           if (footnoteIcon) {
             if (runStyle.referencePaintOffset != 0) {
@@ -3231,11 +3602,23 @@ class LayoutEngine {
     }
     final paragraph = builder.build()
       ..layout(ui.ParagraphConstraints(width: width));
+    final derived = cell.inlines.any((i) => i is ImageTextRun);
+    final selection = inlineDisplayToSource(
+      cell.inlines,
+      referenceLeading: true,
+    );
+    final projection = derived ? imageTextProjection(cell.inlines).$2 : null;
     return _BuiltTableCellParagraph(
       paragraph,
       links,
       inlineImages,
-      inlineDisplayToSource(cell.inlines, referenceLeading: true),
+      projection == null
+          ? selection
+          : [
+              for (final offset in selection)
+                projection[offset.clamp(0, projection.length - 1)],
+            ],
+      derived ? selection : null,
     );
   }
 
@@ -3325,9 +3708,41 @@ class LayoutEngine {
     ui.Size? Function(String href)? imageSizeResolver,
     double contentWidth,
     double contentHeight,
-    double viewportWidth,
-  ) {
+    double viewportWidth, {
+    double sectionTextOffset = 0,
+  }) {
     final mathValue = block.formula;
+    if (style.typesettingMode == TypesettingMode.unified &&
+        block.ocrText != null &&
+        block.source != null) {
+      final prepared = _prepareText(
+        TextBlock(
+          kind: block.ocrText!.literal
+              ? TextBlockKind.preformatted
+              : TextBlockKind.paragraph,
+          nodeId:
+              '${block.source!.start.spine.value}/${block.source!.start.node}@image-text',
+          source: block.source,
+          inlines: [
+            ImageTextRun(
+              block.ocrText!.displayText,
+              block.href,
+              literal: block.ocrText!.literal,
+            ),
+          ],
+        ),
+        style,
+        paginator.spineIndex,
+        paginator.left,
+        contentWidth,
+        sectionTextOffset,
+        imageSizeResolver: imageSizeResolver,
+      );
+      if (prepared != null) {
+        paginator.pushText(prepared);
+        return;
+      }
+    }
     if (mathValue != null && style.typesettingMode == TypesettingMode.unified) {
       final display = MathInline(
         mathValue.latex,
@@ -3389,6 +3804,9 @@ class LayoutEngine {
     double viewportWidth,
   ) {
     final em = style.baseFontSize;
+    contentWidth = block.style
+        .containingWidth(contentWidth)
+        .clamp(1, contentWidth);
     final intrinsic = imageSizeResolver?.call(block.href);
     final availableWidth = block.fixedPage ? viewportWidth : contentWidth;
     double width;
@@ -3464,6 +3882,50 @@ class LayoutEngine {
     double sectionTextOffset,
   ) {
     final unified = style.typesettingMode == TypesettingMode.unified;
+    if (unified && figure.images.any((image) => image.ocrText != null)) {
+      var offset = sectionTextOffset;
+      void caption(TextBlock text) {
+        final prepared = _prepareText(
+          text,
+          style,
+          spineIndex,
+          contentLeft,
+          contentWidth,
+          offset,
+          imageSizeResolver: imageSizeResolver,
+          allowSentenceSplit: false,
+        );
+        if (prepared != null) paginator.pushText(prepared);
+        offset += text.plainText.runes.length;
+      }
+
+      if (figure.captionPosition == CaptionPosition.before) {
+        for (final text in figure.primaryCaptions) {
+          caption(text);
+        }
+      }
+      for (final image in figure.images) {
+        _pushImage(
+          paginator,
+          image,
+          style,
+          imageSizeResolver,
+          contentWidth,
+          contentHeight,
+          viewportWidth,
+          sectionTextOffset: offset,
+        );
+      }
+      if (figure.captionPosition == CaptionPosition.after) {
+        for (final text in figure.primaryCaptions) {
+          caption(text);
+        }
+      }
+      for (final text in figure.afterCaptions) {
+        caption(text);
+      }
+      return;
+    }
     final images = figure.images
         .map(
           (image) => _prepareImage(
@@ -3701,6 +4163,7 @@ class _GridTableCell {
 }
 
 class _BuiltTableCellParagraph {
+  final List<int>? displayToSelection;
   final List<int> displayToSource;
   final ui.Paragraph paragraph;
   final List<TextLinkRange> links;
@@ -3711,6 +4174,7 @@ class _BuiltTableCellParagraph {
     this.links,
     this.inlineImages,
     this.displayToSource,
+    this.displayToSelection,
   );
 }
 
@@ -3766,6 +4230,7 @@ class _OptimizedParagraphBuild {
 }
 
 class _PreparedTableCell {
+  final List<int>? displayToSelection;
   final List<TextBaselineRegion> baselineRegions;
   final List<int> displayToSource;
   final _GridTableCell grid;
@@ -3776,6 +4241,7 @@ class _PreparedTableCell {
   final double sectionTextOffset;
 
   const _PreparedTableCell({
+    this.displayToSelection,
     required this.baselineRegions,
     required this.displayToSource,
     required this.grid,
@@ -3811,6 +4277,7 @@ class _PreparedTable {
 
 /// A shaped paragraph plus the metadata the paginator needs to slice it.
 class _PreparedText {
+  final List<int>? displayToSelection;
   final double joinOverlap;
   final List<TextBaselineRegion> baselineRegions;
   final ui.Paragraph paragraph;
@@ -3842,6 +4309,7 @@ class _PreparedText {
   final List<int> displayToSource;
 
   const _PreparedText({
+    this.displayToSelection,
     this.joinOverlap = 0,
     required this.baselineRegions,
     required this.paragraph,
@@ -3871,6 +4339,7 @@ class _PreparedText {
     double? marginAfter,
     double? joinOverlap,
   }) => _PreparedText(
+    displayToSelection: displayToSelection,
     joinOverlap: joinOverlap ?? this.joinOverlap,
     baselineRegions: baselineRegions,
     paragraph: paragraph,
@@ -3923,6 +4392,7 @@ class _ActiveQuote {
 
 /// Port of torto's Paginator: a single-column cursor over the content area.
 class _Paginator {
+  final int spineIndex;
   final double top;
   final double pageBottom;
   double get bottom => focusMode ? double.infinity : pageBottom;
@@ -3944,6 +4414,7 @@ class _Paginator {
   _ActiveQuote? activeQuote;
 
   _Paginator({
+    required this.spineIndex,
     required this.top,
     required double bottom,
     this.focusMode = false,
@@ -4100,6 +4571,7 @@ class _Paginator {
       }
       items.add(
         TextPlacement(
+          displayToSelection: prepared.displayToSelection,
           baselineRegions: prepared.baselineRegions,
           displayToSource: prepared.displayToSource,
           syntheticPrefixLength: prepared.syntheticPrefixLength,
@@ -4225,6 +4697,7 @@ class _Paginator {
             .fold(0.0, (sum, height) => sum + height);
         items.add(
           TableCellPlacement(
+            displayToSelection: prepared.displayToSelection,
             baselineRegions: prepared.baselineRegions,
             displayToSource: prepared.displayToSource,
             paragraph: prepared.paragraph,

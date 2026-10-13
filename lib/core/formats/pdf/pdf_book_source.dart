@@ -64,6 +64,7 @@ Future<BookSource> openPdf(
     /* Cache availability must not determine whether a PDF opens. */
   }
   return PdfBookSource._(
+    contentSha256: data.$3,
     document: data.$1,
     book: data.$2,
     workerBytes: bytes,
@@ -140,6 +141,7 @@ class PdfBookSource
 
   @override
   final Book book;
+  final String contentSha256;
 
   pdf.PdfDocument? _document;
   final Uint8List _workerBytes;
@@ -152,6 +154,7 @@ class PdfBookSource
   PdfBookSource._({
     required pdf.PdfDocument document,
     required this.book,
+    required this.contentSha256,
     required Uint8List workerBytes,
     required PdfRasterCache? rasterCache,
   }) : _document = document,

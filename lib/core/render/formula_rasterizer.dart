@@ -9,17 +9,21 @@ import '../ir/ir.dart';
 import '../ir/inline_content.dart';
 import '../semantic_layout/formula_validation.dart';
 
-class FormulaRaster {
+class FormulaMetrics {
   final String href;
-  final ui.Image image;
   final double width, height, baseline;
+  const FormulaMetrics(this.href, this.width, this.height, this.baseline);
+}
+
+class FormulaRaster extends FormulaMetrics {
+  final ui.Image image;
   const FormulaRaster(
-    this.href,
+    String href,
     this.image,
-    this.width,
-    this.height,
-    this.baseline,
-  );
+    double width,
+    double height,
+    double baseline,
+  ) : super(href, width, height, baseline);
 }
 
 class _MathBoundary extends RenderRepaintBoundary {
@@ -35,35 +39,90 @@ class _MathBoundary extends RenderRepaintBoundary {
 }
 
 /// Rasterizes Flutter math into the reader's existing Canvas/image pipeline.
-/// Live page rasters are never evicted underneath retained page frames. Once
-/// the bounded session budget is exhausted new formulas use their originals.
+/// Dimensions stay stable; the reader retains visible textures and reclaims
+/// off-screen pixels within a bounded session budget.
 class FormulaRasterizer {
   static const em = 32.0;
   final Map<String, FormulaRaster> _cache = {};
+  final Map<String, FormulaMetrics> _geometry = {};
+  final Map<String, (MathInline, int)> _recipes = {};
   final Set<String> _failed = {};
   final Map<String, Future<FormulaRaster?>> _pending = {};
+  Set<String>? _visible;
   int _bytes = 0;
   bool _disposed = false;
   static String key(MathInline value, int color) =>
       'torto-formula:${sha256.convert(utf8.encode(jsonEncode([value.latex, value.display, value.equationNumber, color])))}';
-  FormulaRaster? lookup(MathInline value, int color) =>
-      _cache[key(value, color)];
+  FormulaMetrics? lookup(MathInline value, int color) =>
+      _cache[key(value, color)] ?? _geometry[key(value, color)];
+  bool owns(String href) => _recipes.containsKey(href);
+  Future<FormulaRaster?> renderHref(
+    String href, {
+    int maxDimension = 8192,
+  }) async {
+    final recipe = _recipes[href];
+    return recipe == null
+        ? null
+        : render(recipe.$1, recipe.$2, maxDimension: maxDimension);
+  }
+
+  Future<FormulaMetrics?> measure(MathInline value, int color) async {
+    if (_failed.contains(key(value, color))) return null;
+    final cached = lookup(value, color);
+    if (cached != null) return cached;
+    if (_disposed || _geometry.length >= 4096) return null;
+    return _render(value, color, key(value, color), pixels: false);
+  }
+
+  void retainVisible(Set<String> hrefs) {
+    _visible = hrefs;
+  }
+
+  void _makeRoom(int bytes, String current) {
+    if (_visible == null) return;
+    for (final href in _cache.keys.toList()) {
+      if (_bytes + bytes <= 32 * 1024 * 1024) break;
+      if (href == current || _visible!.contains(href)) continue;
+      final image = _cache.remove(href)!.image;
+      _bytes -= image.width * image.height * 4;
+      image.dispose();
+    }
+  }
+
   ui.Image? image(String href) => _cache[href]?.image;
-  Future<FormulaRaster?> render(MathInline value, int color) async {
+  Future<FormulaRaster?> render(
+    MathInline value,
+    int color, {
+    int maxDimension = 8192,
+  }) async {
     final href = key(value, color);
     if (_disposed || _failed.contains(href)) return null;
-    if (_cache.containsKey(href)) return _cache[href];
+    final cached = _cache[href];
+    if (cached != null &&
+        math.max(cached.image.width, cached.image.height) >=
+            math
+                .min(maxDimension, math.max(cached.width, cached.height) * 2)
+                .floor()) {
+      return cached;
+    }
     return _pending
-        .putIfAbsent(href, () => _render(value, color, href))
+        .putIfAbsent(
+          href,
+          () async =>
+              await _render(value, color, href, maxDimension: maxDimension)
+                  as FormulaRaster?,
+        )
         .whenComplete(() => _pending.remove(href));
   }
 
-  Future<FormulaRaster?> _render(
+  Future<FormulaMetrics?> _render(
     MathInline value,
     int color,
-    String href,
-  ) async {
-    if (_bytes >= 32 * 1024 * 1024 || formulaError(value.latex) != null) {
+    String href, {
+    bool pixels = true,
+    int maxDimension = 8192,
+  }) async {
+    if (formulaError(value.latex) != null) {
       _failed.add(href);
       return null;
     }
@@ -125,8 +184,6 @@ class FormulaRasterizer {
     try {
       owner.buildScope(element);
       pipeline.flushLayout();
-      pipeline.flushCompositingBits();
-      pipeline.flushPaint();
       final size = boundary.size;
       if (failed ||
           size.isEmpty ||
@@ -138,15 +195,28 @@ class FormulaRasterizer {
         return null;
       }
       final baseline = boundary.baseline ?? size.height * .8;
+      final metrics = FormulaMetrics(href, size.width, size.height, baseline);
+      if (_disposed) return null;
+      _geometry[href] = metrics;
+      _recipes[href] = (value, color);
+      if (!pixels) return metrics;
+      pipeline.flushCompositingBits();
+      pipeline.flushPaint();
       final scale = math.min(
-        2.0,
+        math.min(2.0, maxDimension / math.max(size.width, size.height)),
         math.sqrt(4 * 1024 * 1024 / (size.width * size.height)),
       );
       // Do not leave a temporary render tree attached across an async gap:
       // system-font callbacks must never target a half-torn-down tree.
       final image = boundary.toImageSync(pixelRatio: scale);
+      _makeRoom(image.width * image.height * 4, href);
+      final previous = _cache[href];
+      final previousBytes = previous == null
+          ? 0
+          : previous.image.width * previous.image.height * 4;
       if (_disposed ||
-          _bytes + image.width * image.height * 4 > 32 * 1024 * 1024) {
+          _bytes - previousBytes + image.width * image.height * 4 >
+              32 * 1024 * 1024) {
         image.dispose();
         return null;
       }
@@ -158,7 +228,8 @@ class FormulaRasterizer {
         baseline,
       );
       _cache[href] = raster;
-      _bytes += image.width * image.height * 4;
+      _bytes += image.width * image.height * 4 - previousBytes;
+      previous?.image.dispose();
       return raster;
     } on Object {
       _failed.add(href);
@@ -177,7 +248,12 @@ class FormulaRasterizer {
     }
   }
 
-  Future<void> prepare(Section section, int color) async {
+  Future<void> prepare(
+    Section section,
+    int color, {
+    bool deferPixels = false,
+    bool Function()? shouldCancel,
+  }) async {
     final math = <MathInline>[];
     for (final block in section.blocks) {
       mapBlockContent(
@@ -203,8 +279,16 @@ class FormulaRasterizer {
       );
     }
     for (final value in math) {
-      if (_disposed) return;
-      await render(value, color);
+      if (_disposed || (shouldCancel?.call() ?? false)) return;
+      final href = key(value, color);
+      if (deferPixels) {
+        if (!_geometry.containsKey(href) && _geometry.length < 4096) {
+          await _render(value, color, href, pixels: false);
+          await Future<void>.delayed(Duration.zero);
+        }
+      } else {
+        await render(value, color);
+      }
     }
   }
 
@@ -214,5 +298,7 @@ class FormulaRasterizer {
       entry.image.dispose();
     }
     _cache.clear();
+    _geometry.clear();
+    _recipes.clear();
   }
 }

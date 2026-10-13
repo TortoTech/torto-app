@@ -14,8 +14,9 @@ import '../../ir/ir.dart';
 import '../../ir/text_index.dart';
 import '../image_dimensions.dart';
 import 'pdf_book_source.dart';
-
-enum PdfOcrViewMode { original, reflow }
+import 'ocr_markup.dart';
+import 'pdf_reflow_source.dart';
+export 'pdf_reflow_source.dart';
 
 /// Reads the desktop's derived-sync-v1 OCR archive. Extraction and Markdown
 /// parsing run off the UI thread; only requested image bytes enter memory.
@@ -118,12 +119,17 @@ bool _safeArchiveName(String name) =>
     (name.startsWith('resources/') &&
         _safeResourceName(name.substring('resources/'.length)));
 
-class PdfOcrBookSource
-    implements BookSource, RasterResourceSource, DisposableBookSource {
+class PdfOcrBookSource implements PdfReflowSource {
+  @override
+  String get label => 'OCR';
+  @override
   final BookSource original;
   final Directory directory;
+  @override
   PdfOcrViewMode mode;
+  @override
   late final Book reflowBook;
+  @override
   late final List<TocEntry> originalToc;
   late final List<String> _pages;
   final List<(int, int)> _ranges = [];
@@ -263,14 +269,17 @@ class PdfOcrBookSource
   @override
   Book get book => mode == PdfOcrViewMode.reflow ? reflowBook : original.book;
 
+  @override
   int sectionForPage(int page) {
     final index = _ranges.indexWhere((r) => page >= r.$1 && page < r.$2);
     return index < 0 ? 0 : index;
   }
 
+  @override
   String reflowTarget(int page) =>
       'Text/ocr-reflow-${sectionForPage(page) + 1}.xhtml#pdf-page-${page + 1}';
 
+  @override
   int physicalPage(int section, SourceAnchor? anchor, Section? content) {
     if (mode == PdfOcrViewMode.original) return section;
     return _physicalReflowPage(section, anchor, content);
@@ -302,6 +311,7 @@ class PdfOcrBookSource
     return result;
   }
 
+  @override
   Future<String?> targetForLocator(LocatorV1 locator) async {
     final path = locator.href.split('#').first;
     if (book.spine.any((item) => item.href == path)) return null;
@@ -320,11 +330,15 @@ class PdfOcrBookSource
         : original.book.spine[physical].href;
   }
 
+  @override
   Future<void> saveMode() async {
     await directory.create(recursive: true);
     await File(
       '${directory.path}/view-mode.json',
     ).writeAsString(jsonEncode(mode.name));
+    await File('${directory.path}/pdf-source.json').writeAsString(
+      jsonEncode(mode == PdfOcrViewMode.reflow ? 'ocr' : 'original'),
+    );
   }
 
   void _joinPageParagraphs() {
@@ -497,7 +511,7 @@ String _markdownHtml(
   String publicationLanguage,
 ) {
   final rendered = md.markdownToHtml(
-    markdown.replaceAllMapped(
+    escapeUnpairedOcrTags(markdown).replaceAllMapped(
       RegExp(r'\$\$([\s\S]+?)\$\$'),
       (m) => '\$\$${m[1]!.trim().replaceAll('\n', ' ')}\$\$',
     ),

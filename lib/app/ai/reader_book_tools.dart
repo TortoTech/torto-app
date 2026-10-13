@@ -252,7 +252,10 @@ class ReaderBookTools {
       };
     }
     final section = await source.parseSection(index);
-    Iterable<BookTextNode> nodes = sectionTextNodes(section);
+    Iterable<BookTextNode> nodes = sectionTextNodes(
+      section,
+      includeImageText: true,
+    );
     if (index == controller.sectionIndex &&
         (action == 'getCurrentContext' || args['scope'] == 'chapter')) {
       final anchor = controller.readingAnchor;

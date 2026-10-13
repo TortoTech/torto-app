@@ -21,6 +21,7 @@ import 'package:crypto/crypto.dart';
 import 'package:xml/xml.dart';
 
 import '../html_ir/html_ir_parser.dart';
+import '../html_ir/note_references.dart';
 import '../html_ir/package_path.dart';
 import '../html_ir/tolerant_xml.dart';
 import '../ir/ir.dart';
@@ -269,6 +270,15 @@ class EpubBookSource implements BookSource, DisposableBookSource {
             final bytes = _readEntry(href);
             return bytes == null ? null : decodeXmlBytes(bytes);
           },
+          isSmallListMarkerImage: (href) {
+            final bytes = _readEntry(href);
+            final size = bytes == null ? null : readImageDimensions(bytes);
+            return size != null &&
+                size.$1 <= 32 &&
+                size.$2 <= 32 &&
+                size.$1 > 0 &&
+                size.$2 > 0;
+          },
           isDecorativeSeparatorImage: (href) {
             final bytes = _readEntry(href);
             return bytes != null && isDecorativeSeparatorImage(bytes);
@@ -288,6 +298,7 @@ class EpubBookSource implements BookSource, DisposableBookSource {
         blocks: const [],
       );
     }
+    section = markNoteReferences(section, book);
     _sectionCache[index] = section;
     return section;
   }
@@ -322,7 +333,7 @@ class EpubBookSource implements BookSource, DisposableBookSource {
         final isNotes = RegExp(
           r'^(?:footnotes?|endnotes?|notes?|脚注|尾注|注释|注解)(?:\s+\d+)?$',
         ).hasMatch(label);
-        if (isNotes && entry.spineIndex != null) {
+        if (isNotes && entry.spineIndex != null && !entry.href.contains('#')) {
           result.add(entry.spineIndex!);
         }
         visit(entry.children);
@@ -532,6 +543,7 @@ class _PackageModel {
   final Map<String, _ManifestItem> manifest;
   final List<_ManifestItem> items; // manifest order
   final List<String> spineIdrefs;
+  final Set<String> nonLinearIds;
   final String? ncxId;
   final String? coverHref;
 
@@ -540,6 +552,7 @@ class _PackageModel {
     required this.manifest,
     required this.items,
     required this.spineIdrefs,
+    this.nonLinearIds = const {},
     this.ncxId,
     this.coverHref,
   });
@@ -620,6 +633,7 @@ class _PackageModel {
 
     // ---- spine
     final spineIdrefs = <String>[];
+    final nonLinearIds = <String>{};
     String? ncxId;
     for (final child in package.childElements) {
       if (_localName(child) != 'spine') continue;
@@ -628,6 +642,10 @@ class _PackageModel {
         if (_localName(itemref) != 'itemref') continue;
         final idref = _localAttr(itemref, 'idref');
         if (idref != null) spineIdrefs.add(idref);
+        if (idref != null &&
+            (_localAttr(itemref, 'linear') ?? '').toLowerCase() == 'no') {
+          nonLinearIds.add(idref);
+        }
       }
       break;
     }
@@ -654,6 +672,7 @@ class _PackageModel {
       manifest: manifest,
       items: items,
       spineIdrefs: spineIdrefs,
+      nonLinearIds: nonLinearIds,
       ncxId: ncxId,
       coverHref: coverHref,
     );
@@ -667,6 +686,7 @@ class _PackageModel {
       spine.add(
         SpineItem(
           id: SpineItemId(item.id),
+          linear: !nonLinearIds.contains(idref),
           index: spine.length,
           href: item.href,
         ),

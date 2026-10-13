@@ -340,6 +340,7 @@ class TextBaselineRegion {
 
 /// A line slice of a shaped paragraph placed on a page.
 class TextPlacement extends PageItem {
+  final List<int>? displayToSelection;
   final List<TextBaselineRegion> baselineRegions;
 
   /// Display offsets include indentation placeholders and synthetic breaks.
@@ -395,6 +396,7 @@ class TextPlacement extends PageItem {
   final List<InlineImageRange> inlineImages;
 
   const TextPlacement({
+    this.displayToSelection,
     this.baselineRegions = const [],
     required this.displayToSource,
     this.syntheticPrefixLength = 0,
@@ -419,6 +421,7 @@ class TextPlacement extends PageItem {
 
 /// One inline image occupying a paragraph placeholder range.
 class InlineImageRange {
+  final RubyLayout? ruby;
   final int start;
   final int end;
   final String href;
@@ -427,6 +430,7 @@ class InlineImageRange {
   final double paintOffsetY;
 
   const InlineImageRange({
+    this.ruby,
     required this.start,
     required this.end,
     required this.href,
@@ -434,6 +438,20 @@ class InlineImageRange {
     required this.height,
     this.paintOffsetY = 0,
   });
+}
+
+class RubyLayout {
+  final ui.Paragraph base, annotation;
+  final bool below;
+  final double width, height, fontSize;
+  const RubyLayout(
+    this.base,
+    this.annotation,
+    this.below,
+    this.width,
+    this.height,
+    this.fontSize,
+  );
 }
 
 /// One linked UTF-16 range inside a laid-out paragraph.
@@ -506,6 +524,7 @@ class ListMarkerPlacement extends PageItem {
 /// One laid-out table cell. Borders and header fill are painted by the render
 /// stage so a table remains crisp at every device density.
 class TableCellPlacement extends PageItem {
+  final List<int>? displayToSelection;
   final List<TextBaselineRegion> baselineRegions;
   final List<int> displayToSource;
   final ui.Paragraph paragraph;
@@ -520,6 +539,7 @@ class TableCellPlacement extends PageItem {
   final List<InlineImageRange> inlineImages;
 
   const TableCellPlacement({
+    this.displayToSelection,
     this.baselineRegions = const [],
     this.displayToSource = const [0],
     required this.paragraph,
@@ -689,6 +709,11 @@ class PageLayout {
       if (links.isEmpty) continue;
       if (!slice.contains(position)) continue;
       for (final link in links) {
+        if (link.href.isEmpty &&
+            link.latex == null &&
+            link.originalImage != null) {
+          continue;
+        }
         for (final box in paragraph.getBoxesForRange(link.start, link.end)) {
           if (link.footnoteIcon && box.right - box.left < 0.5) continue;
           var rect = ui.Rect.fromLTRB(
@@ -738,6 +763,18 @@ class PageLayout {
           ? pool.markDisposed(paragraph)
           : seen.add(paragraph);
       if (firstSeen) paragraph.dispose();
+      final inlines = switch (item) {
+        TextPlacement(:final inlineImages) ||
+        TableCellPlacement(:final inlineImages) => inlineImages,
+        _ => <InlineImageRange>[],
+      };
+      for (final image in inlines) {
+        final ruby = image.ruby;
+        if (ruby == null) continue;
+        for (final p in [ruby.base, ruby.annotation]) {
+          if (pool != null ? pool.markDisposed(p) : seen.add(p)) p.dispose();
+        }
+      }
     }
   }
 }

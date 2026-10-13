@@ -75,7 +75,7 @@ Future<List<Map<String, dynamic>>> recognizeFormulaImages({
       .convert(
         utf8.encode(
           jsonEncode([
-            'formula-3',
+            'image-content-4',
             id,
             provider.baseUrl,
             model,
@@ -95,6 +95,11 @@ Future<List<Map<String, dynamic>>> recognizeFormulaImages({
       check();
       if (value is Map<String, dynamic> &&
           (value['status'] == 'not_formula' ||
+              (value['status'] == 'recognized_text' &&
+                  validImageText(value['text'], literal: value['literal'] == true) &&
+                  value['literal'] is bool &&
+                  value['latex'] == null &&
+                  value['equation_number'] == null) ||
               (value['status'] == 'recognized' &&
                   value['latex'] is String &&
                   formulaError(value['latex']) == null))) {
@@ -120,8 +125,8 @@ Future<List<Map<String, dynamic>>> recognizeFormulaImages({
       offset++;
     }
     final review = <String, Map<String, dynamic>>{};
-    for (var stage = 0; stage < 2; stage++) {
-      var pending = stage == 0 ? List<String>.of(batch) : review.keys.toList();
+    {
+      var pending = List<String>.of(batch);
       for (var attempt = 0; attempt < 2 && pending.isNotEmpty; attempt++) {
         check();
         final response = await client.recognizeLayout(
@@ -129,11 +134,12 @@ Future<List<Map<String, dynamic>>> recognizeFormulaImages({
           provider: provider,
           model: model,
           reasoningEffort: effort,
-          prompt: stage == 0 ? prompts.transcribe : prompts.verify,
+          prompt: prompts.transcribe,
           schema: formulaImageSchema,
           schemaName: 'formula_image_batch',
           maxTokens: 16384,
           input: {
+            'retry': attempt > 0,
             'requested_ids': [for (final id in pending) wireIds[id]],
             'images': [
               for (final id in pending)
@@ -160,7 +166,7 @@ Future<List<Map<String, dynamic>>> recognizeFormulaImages({
                         .runes
                         .take(900),
                   ),
-                  if (stage == 1) ...review[id]!,
+                  if (review.containsKey(id)) ...review[id]!,
                 },
             ],
           },
@@ -193,11 +199,15 @@ Future<List<Map<String, dynamic>>> recognizeFormulaImages({
                       m['status'],
                       m['latex'],
                       m['equation_number'],
+                      m['text'],
+                      m['literal'],
                     ]) !=
                     jsonEncode([
                       matches.first['status'],
                       matches.first['latex'],
                       matches.first['equation_number'],
+                      matches.first['text'],
+                      matches.first['literal'],
                     ]),
               )) {
             next.add(id);
@@ -209,12 +219,27 @@ Future<List<Map<String, dynamic>>> recognizeFormulaImages({
                 'recognized',
                 'not_formula',
                 'unreadable',
+                'recognized_text',
+                'unreadable_text',
               }.contains(status) ||
               (status == 'recognized'
                   ? value['latex'] is! String
                   : value['latex'] != null) ||
               (value['equation_number'] != null &&
                   value['equation_number'] is! String)) {
+            next.add(id);
+            continue;
+          }
+          if (status == 'recognized_text') {
+            if (!validImageText(value['text'], literal: value['literal'] == true) ||
+                value['literal'] is! bool ||
+                value['equation_number'] != null) {
+              next.add(id);
+              continue;
+            }
+          } else if (value['text'] != null ||
+              value['literal'] == true ||
+              status != 'recognized' && value['equation_number'] != null) {
             next.add(id);
             continue;
           }
@@ -233,12 +258,8 @@ Future<List<Map<String, dynamic>>> recognizeFormulaImages({
             );
             check();
             if (error != null) {
-              if (stage == 0) {
-                review[id] = {
-                  'proposal': {'latex': latex, 'equation_number': number},
-                  'local_validation_error': error,
-                };
-              }
+              review[id] = {'local_validation_error': error};
+              next.add(id);
               continue;
             }
           }
@@ -257,7 +278,10 @@ Future<List<Map<String, dynamic>>> recognizeFormulaImages({
   }
   for (final entry in accepted.entries) {
     check();
-    if (entry.value['status'] != 'unreadable') {
+    if (!const {
+      'unreadable',
+      'unreadable_text',
+    }.contains(entry.value['status'])) {
       try {
         await cache.create(recursive: true);
         check();
@@ -277,6 +301,17 @@ Future<List<Map<String, dynamic>>> recognizeFormulaImages({
     }
     if (entry.value['status'] == 'not_formula') continue;
     for (final source in items[entry.key]!.sources) {
+      if (entry.value['status'] == 'recognized_text') {
+        out.add({
+          'kind': 'image_text',
+          'block': source.$1,
+          'href': source.$2.href,
+          'text': entry.value['text'],
+          'literal': entry.value['literal'],
+        });
+        continue;
+      }
+      if (entry.value['status'] == 'unreadable_text') continue;
       out.add({
         'kind': 'image_formula',
         'block': source.$1,

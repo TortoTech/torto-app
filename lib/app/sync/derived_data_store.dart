@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 
 import '../../core/ir/ir.dart';
+import '../../core/formats/pdf/native_store.dart';
 import 'webdav_client.dart';
 
 class DerivedBookMetadata {
@@ -96,17 +97,89 @@ class DerivedDataStore {
       }
     }
 
-    final manifestObject = await webdav.getOptional('derived/$bookId/ocr.json');
-    if (manifestObject == null) return changed;
+    changed += await _syncArchive(webdav, bookId, 'ocr', directory, onProgress);
+    changed += await _syncArchive(
+      webdav,
+      bookId,
+      'native-pdf',
+      directory,
+      onProgress,
+    );
+    return changed;
+  }
+
+  Future<int> _syncArchive(
+    WebDavClient webdav,
+    String bookId,
+    String kind,
+    Directory directory,
+    void Function(int, int)? onProgress,
+  ) async {
+    final manifestObject = await webdav.getOptional(
+      'derived/$bookId/$kind.json',
+    );
+    if (kind == 'native-pdf') {
+      final file = File('${directory.path}/$kind.json');
+      Map<String, dynamic>? pending;
+      try {
+        pending = Map<String, dynamic>.from(
+          jsonDecode(await file.readAsString()) as Map,
+        );
+      } catch (_) {}
+      if (pending?['pending_upload'] == true) {
+        final remote = manifestObject == null
+            ? null
+            : jsonDecode(utf8.decode(manifestObject.bytes)) as Map;
+        final hash = remote?['content_sha256'];
+        if (hash == pending!['content_sha256']) {
+          await _acknowledgeNative(directory, pending);
+          return 0;
+        }
+        if (hash != pending['base_content_sha256']) {
+          throw const WebDavException(
+            'The cloud has a different PDF generation. Your local generation was preserved.',
+          );
+        }
+        final archive = File('${directory.path}/$kind.zip');
+        final upload = await archive.copy(
+          '${directory.path}/native-upload-${DateTime.now().microsecondsSinceEpoch}.zip',
+        );
+        try {
+          final length = _validateOcrManifest(bookId, pending);
+          if (await upload.length() != length ||
+              (await sha256.bind(upload.openRead()).first).toString() !=
+                  pending['content_sha256']) {
+            throw const WebDavException(
+              'Local PDF generation checksum failed.',
+            );
+          }
+          final published = Map<String, dynamic>.of(pending)
+            ..remove('pending_upload')
+            ..remove('base_content_sha256');
+          await webdav.publishDerivedArchive(
+            'derived/$bookId/$kind.zip',
+            upload,
+            'derived/$bookId/$kind.json',
+            published,
+            manifestObject,
+          );
+          await _acknowledgeNative(directory, pending);
+          return 1;
+        } finally {
+          if (await upload.exists()) await upload.delete();
+        }
+      }
+    }
+    if (manifestObject == null) return 0;
     final manifest = jsonDecode(utf8.decode(manifestObject.bytes));
     if (manifest is! Map<String, dynamic>) {
       throw const WebDavException('PDF OCR manifest is invalid.');
     }
     final length = _validateOcrManifest(bookId, manifest);
     final expectedHash = manifest['content_sha256'] as String;
-    final archive = File('${directory.path}${Platform.pathSeparator}ocr.zip');
+    final archive = File('${directory.path}${Platform.pathSeparator}$kind.zip');
     final localManifest = File(
-      '${directory.path}${Platform.pathSeparator}ocr.json',
+      '${directory.path}${Platform.pathSeparator}$kind.json',
     );
     if (await archive.exists() && await localManifest.exists()) {
       try {
@@ -114,7 +187,7 @@ class DerivedDataStore {
         if (cached is Map &&
             cached['content_sha256'] == expectedHash &&
             await archive.length() == length) {
-          return changed;
+          return 0;
         }
       } catch (_) {
         // Replace an incomplete or corrupt cache below.
@@ -122,10 +195,10 @@ class DerivedDataStore {
     }
 
     final partial = File(
-      '${directory.path}${Platform.pathSeparator}ocr.zip.part',
+      '${directory.path}${Platform.pathSeparator}$kind.zip.part',
     );
     await webdav.downloadToFile(
-      'derived/$bookId/ocr.zip',
+      'derived/$bookId/$kind.zip',
       partial,
       length,
       onProgress: onProgress,
@@ -135,11 +208,47 @@ class DerivedDataStore {
       await partial.delete();
       throw const WebDavException('PDF OCR archive checksum failed.');
     }
+    if (kind == 'native-pdf') {
+      return withNativeStore(directory, () async {
+        Map? latest;
+        try {
+          latest = jsonDecode(await localManifest.readAsString()) as Map;
+        } catch (_) {}
+        if (latest?['pending_upload'] == true) {
+          await partial.delete();
+          return 0;
+        }
+        await installNativePair(directory, partial, manifestObject.bytes);
+        return 1;
+      });
+    }
     if (await archive.exists()) await archive.delete();
     await partial.rename(archive.path);
     await _writeAtomic(localManifest, manifestObject.bytes);
-    return changed + 1;
+    return 1;
   }
+
+  Future<void> _acknowledgeNative(
+    Directory directory,
+    Map<String, dynamic> published,
+  ) => withNativeStore(directory, () async {
+    final file = File('${directory.path}/native-pdf.json');
+    final latest = Map<String, dynamic>.from(
+      jsonDecode(await file.readAsString()) as Map,
+    );
+    if (latest['content_sha256'] == published['content_sha256']) {
+      latest.remove('pending_upload');
+      latest.remove('base_content_sha256');
+    } else if (latest['pending_upload'] == true &&
+        latest['base_content_sha256'] == published['base_content_sha256']) {
+      // Regeneration during an upload retains its archive and queues against
+      // the generation just published, rather than losing the new phone work.
+      latest['base_content_sha256'] = published['content_sha256'];
+    } else {
+      return;
+    }
+    await _writeAtomic(file, utf8.encode(jsonEncode(latest)));
+  });
 
   Future<DerivedBookMetadata?> metadata(String bookId) async {
     final file = File(

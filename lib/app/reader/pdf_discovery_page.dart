@@ -70,6 +70,7 @@ class _PdfDiscoveryPageState extends State<PdfDiscoveryPage> {
         pageCount: source.pageCount,
         provider: provider,
         model: settings.resolvedModel(ai),
+        reasoningEffort: settings.pdfReasoningEffort,
         goals: Set.of(_goals),
         pageText: (page) async => source.pageText(page - 1)?.text ?? '',
         pageCrop: (page, rect) async {

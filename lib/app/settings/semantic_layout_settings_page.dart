@@ -94,8 +94,8 @@ class _SemanticLayoutSettingsPageState
                   title: Text(l.text('启用 AI 排版', 'Enable AI layout')),
                   subtitle: Text(
                     l.text(
-                      '自动识别引用、图注、小节标题和公式',
-                      'Recognize quotations, captions, section headings and formulas',
+                      '自动识别引用、图注、小节标题、公式和文字图片',
+                      'Recognize quotations, captions, section headings, formulas and text images',
                     ),
                   ),
                   value: enabled,

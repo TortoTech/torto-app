@@ -178,7 +178,10 @@ bool introducesQuote(String value) {
 }
 
 List<int> groupIds(SemanticGroup g) => switch (g['kind']) {
-  'citation' || 'text_formula' || 'image_formula' => [g['block'] as int],
+  'citation' ||
+  'text_formula' ||
+  'image_formula' ||
+  'image_text' => [g['block'] as int],
   'section_heading' => [g['block'] as int],
   'figure' => [
     ...(g['images'] as List).cast<int>(),
@@ -234,7 +237,7 @@ List<SemanticGroup> validateGroups(
         }
         continue;
       }
-      if (kind == 'image_formula') {
+      if (kind == 'image_formula' || kind == 'image_text') {
         if (validImageAnnotation(
           section,
           g,
@@ -377,6 +380,8 @@ TextBlock copyText(
   listOrdinal: b.listOrdinal,
   listDepth: b.listDepth,
   listMarkerVisible: b.listMarkerVisible,
+  authoredListMarkerChars: b.authoredListMarkerChars,
+  authoredListMarkerImage: b.authoredListMarkerImage,
   inlines: inlines ?? b.inlines,
   style: b.style.copyWith(semanticAlignment: alignment),
   source: source ?? b.source,
@@ -479,6 +484,7 @@ Section composeSemanticLayout(
       'citation',
       'text_formula',
       'image_formula',
+      'image_text',
     }.contains(g['kind'])) {
       continue;
     }
@@ -664,6 +670,7 @@ class SemanticLayoutBookSource implements BookSource {
                   'citation',
                   'text_formula',
                   'image_formula',
+                  'image_text',
                 }.contains(g['kind']),
               )
               .toList()

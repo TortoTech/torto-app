@@ -1,7 +1,8 @@
+import { createServer } from 'node:http';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease, updateManifest } from './sync-gitee-release.mjs';
+import { requiredAssets, validateRelease, verifyAsset, planAssets, syncRelease, updateManifest, request, uploadAttachment, createArtifactSource, createAssetDownloader, artifactName } from './sync-gitee-release.mjs';
 
 const bytes = Buffer.from('installer fixture');
 const digest = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -72,4 +73,153 @@ test('does not mark a mirror verified when remote content is corrupt', async () 
     throw new Error('Must not update notes on failed verification');
   };
   await assert.rejects(syncRelease(source, api, async () => Buffer.alloc(bytes.length)), /verification failed/);
+});
+
+test('curl uploads authenticated multipart bytes, reports metrics and redacts HTTP errors', async () => {
+  let status = 200;
+  const asset = { ...release().assets[0], name: 'installer with spaces.msi' };
+  const server = createServer(async (req, res) => {
+    assert.equal(req.headers.authorization, undefined);
+    assert.match(req.headers['content-type'], /^multipart\/form-data; boundary=/);
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks).toString();
+    assert.match(body, /filename="installer with spaces.msi"/);
+    assert.match(body, /name="access_token"\r\n\r\nsecret-token/);
+    assert.ok(body.includes(bytes.toString()));
+    res.writeHead(status, { 'Content-Type': 'application/json' });
+    res.end(status === 200 ? '{"id":123}' : 'secret-token private response');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const logs = [];
+  const url = `http://127.0.0.1:${server.address().port}/upload`;
+  try {
+    assert.deepEqual(await uploadAttachment(url, 'secret-token', { asset, bytes }, { log: line => logs.push(line) }), { id: 123 });
+    assert.ok(logs.some(line => /http_code=200; size_upload=\d+; speed_upload=/.test(line)));
+    status = 401;
+    await assert.rejects(uploadAttachment(url, 'secret-token', { asset, bytes }, { log: line => logs.push(line) }), error => {
+      assert.match(error.message, /http_code=401/);
+      assert.doesNotMatch(error.message, /secret-token|private response/);
+      return true;
+    });
+    assert.doesNotMatch(logs.join('\n'), /secret-token|Authorization|private response/);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('uses Gitee Bearer authentication and retains GitHub token authentication', async () => {
+  const originalFetch = globalThis.fetch;
+  const authorization = [];
+  globalThis.fetch = async (_url, options) => {
+    authorization.push(options.headers.Authorization);
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  try {
+    await request('https://gitee.com/api/v5/user', { token: 'fixture-token' });
+    await request('https://api.github.com/user', { token: 'fixture-token' });
+    assert.deepEqual(authorization, ['Bearer fixture-token', 'token fixture-token']);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('curl timeout reports actual bytes sent when the server withholds its response', async () => {
+  let received = 0;
+  const server = createServer(async req => {
+    for await (const chunk of req) received += chunk.length;
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await assert.rejects(uploadAttachment(`http://127.0.0.1:${server.address().port}/upload`, 'secret-token',
+      { asset: release().assets[0], bytes }, { timeoutSeconds: 0.3, log: () => {} }), error => {
+      assert.match(error.message, /curl_exit=28/);
+      assert.match(error.message, /http_code=000/);
+      assert.ok(Number(/size_upload=(\d+)/.exec(error.message)[1]) >= bytes.length);
+      return true;
+    });
+    assert.ok(received >= bytes.length);
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test('reports nested transport failures without leaking credentials or arbitrary messages', async () => {
+  const originalFetch = globalThis.fetch;
+  const cause = Object.assign(new Error('secret-token in transport message'), {
+    code: 'UND_ERR_HEADERS_TIMEOUT', headers: { Authorization: 'secret-token' },
+  });
+  cause.cause = cause; // Cycles must not break diagnostic reporting.
+  globalThis.fetch = async () => { throw new TypeError('secret-token', { cause }); };
+  try {
+    await assert.rejects(request('https://example.com/upload?access_token=secret-token', {
+      token: 'secret-token', method: 'POST', form: new FormData(),
+    }), error => {
+      assert.match(error.message, /phase=waiting-for-response-headers/);
+      assert.match(error.message, /elapsed_ms=\d+; timeout_ms=3600000/);
+      assert.match(error.message, /UND_ERR_HEADERS_TIMEOUT/);
+      assert.doesNotMatch(error.message, /secret-token|access_token|Authorization/);
+      return true;
+    });
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('distinguishes response body failures and aggregate connection errors', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    status: 200, ok: true,
+    json: async () => { throw Object.assign(new Error('private response'), { code: 'UND_ERR_BODY_TIMEOUT' }); },
+  });
+  try {
+    await assert.rejects(request('https://example.com/api'), /HTTP 200; phase=reading-response-body;.*UND_ERR_BODY_TIMEOUT/);
+    globalThis.fetch = async () => {
+      throw new TypeError('private URL', { cause: new AggregateError([
+        Object.assign(new Error('private address'), { code: 'ECONNREFUSED' }),
+        Object.assign(new Error('private address'), { code: 'ENETUNREACH' }),
+      ]) });
+    };
+    await assert.rejects(request('https://example.com/api'), error => {
+      assert.match(error.message, /ECONNREFUSED/);
+      assert.match(error.message, /ENETUNREACH/);
+      assert.doesNotMatch(error.message, /private/);
+      return true;
+    });
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+
+test('Android ABIs share one verified Actions artifact extraction', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'torto-artifacts-'));
+  const sourceAssets = release().assets.filter(a => a.name.endsWith('.apk'));
+  let lists = 0, extracts = 0;
+  const source = createArtifactSource(directory, 'test-token', {
+    list: async name => { lists++; return { artifacts: [{ id: 1, name, expired: false, workflow_run: { id: 12 } }] }; },
+    extract: async (_, destination) => {
+      extracts++; fs.mkdirSync(destination, { recursive: true });
+      for (const asset of sourceAssets) fs.writeFileSync(path.join(destination, asset.name), bytes);
+    }, log: () => {},
+  });
+  try {
+    for (const asset of sourceAssets) {
+      assert.equal(artifactName(asset), 'Torto-0.7.0-android-apks');
+      assert.deepEqual(await source(asset), bytes);
+    }
+    assert.equal(lists, 1); assert.equal(extracts, 1);
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('stale artifact falls back to Release and verified cache avoids repeated downloads', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'torto-download-'));
+  let downloads = 0;
+  const download = createAssetDownloader(directory, {
+    artifactSource: async () => null,
+    download: async () => { downloads++; return bytes; }, log: () => {},
+  });
+  try {
+    assert.deepEqual(await download(release().assets[0]), bytes);
+    assert.deepEqual(await download(release().assets[0]), bytes);
+    assert.equal(downloads, 1);
+    assert.equal(download.audit()[0].verified, 1);
+    assert.equal(download.audit()[0].reused, 1);
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });

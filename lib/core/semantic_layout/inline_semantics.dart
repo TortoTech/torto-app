@@ -1,6 +1,7 @@
 import '../ir/ir.dart';
 import '../ir/inline_content.dart';
 import 'formula_validation.dart';
+import 'media_references.dart';
 
 class MathText {
   final String text;
@@ -130,11 +131,12 @@ List<Map<String, dynamic>> citationCandidates(Section section) {
             continue;
           }
           final value = String.fromCharCodes(chars.sublist(start, i + 1));
-          if (!RegExp(r'[0-9]').hasMatch(value) ||
-              (chars[start] != 91 &&
-                  chars[start] != 0xff3b &&
-                  RegExp(r'\p{L}', unicode: true).allMatches(value).length <
-                      2)) {
+          if (!MediaReferences.isCitation(value) &&
+              (!RegExp(r'[0-9]').hasMatch(value) ||
+                  (chars[start] != 91 &&
+                      chars[start] != 0xff3b &&
+                      RegExp(r'\p{L}', unicode: true).allMatches(value).length <
+                          2))) {
             continue;
           }
           out.add({
@@ -162,6 +164,7 @@ List<Map<String, dynamic>> citationCandidates(Section section) {
 }
 
 bool localCitation(Map<String, dynamic> candidate) {
+  if (MediaReferences.isCitation(candidate['text'] as String)) return true;
   var value = candidate['text'] as String;
   const normalize = {
     '（': '(',
@@ -499,20 +502,23 @@ Section composeInlineAnnotations(
   List<Map<String, dynamic>> groups,
 ) {
   final byNode = <String, List<Map<String, dynamic>>>{};
+  String identity(TextBlock text) => text.source == null
+      ? text.nodeId
+      : '${text.source!.start.spine.value}/${text.source!.start.node}';
   for (final g in groups.where(
     (g) => const {'citation', 'text_formula'}.contains(g['kind']),
   )) {
     final source = blockTexts(
       original.blocks[g['block'] as int],
     )[g['paragraph'] as int];
-    final key = source.source?.start.node ?? source.nodeId;
+    final key = identity(source);
     byNode.putIfAbsent(key, () => []).add(g);
   }
   if (byNode.isEmpty) return displayed;
   return withBlocks(displayed, [
     for (final block in displayed.blocks)
       mapBlockContent(block, (text) {
-        final annotations = byNode[text.source?.start.node ?? text.nodeId];
+        final annotations = byNode[identity(text)];
         if (annotations == null ||
             text.inlines.any(
               (inline) => inline is TextRun && inline.style.inlineCitation > 0,

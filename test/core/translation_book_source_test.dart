@@ -258,7 +258,7 @@ void main() {
   });
 
   test(
-    'translation restores inline images near their relative text position',
+    'translation preserves inline image identity at the translated position',
     () {
       const image = InlineImageRun(
         image: ImageBlock(href: 'images/chapter-icon.png'),
@@ -267,11 +267,15 @@ void main() {
       );
       const original = <Inline>[TextRun('Chapter '), image, TextRun('title')];
 
-      expect(TranslationMarkupCodec.encode(original), 'Chapter title');
+      expect(
+        TranslationMarkupCodec.encode(original),
+        'Chapter <t-img-0/>title',
+      );
       final translated = TranslationMarkupCodec.decode(
-        '章节标题',
+        '章节<t-img-0/>标题',
         original,
         language: 'zh-CN',
+        requireSizeMarkup: true,
       );
 
       final imageIndex = translated.indexWhere(
@@ -411,4 +415,81 @@ void main() {
       '引用译文',
     );
   });
+  test(
+    'standalone image text translates in replace and bilingual modes without source drift',
+    () async {
+      final anchor = SourceAnchor(
+        spine: SpineItemId.generated(0),
+        node: 'image',
+        textOffset: 0,
+      );
+      final image = ImageBlock(
+        href: 'image.png',
+        source: SourceRange(start: anchor, end: anchor),
+        ocrText: const ImageText('Original image text'),
+      );
+      final section = Section(
+        id: anchor.spine,
+        spineIndex: 0,
+        href: 'chapter.xhtml',
+        blocks: [image],
+      );
+      for (final mode in TranslationMode.values) {
+        final source = TranslationBookSource(_Source(section), mode: mode)
+          ..enabled = true;
+        final input = await source.untranslatedBlocksForNodes(0, {
+          '${anchor.spine.value}/image@image-text',
+        });
+        expect(input, hasLength(1));
+        expect(input.single.text, '<t-img-0>Original image text</t-img-0>');
+        await source.storeBatch(0, const [
+          BlockTranslation(blockIndex: 0, text: '<t-img-0>图片译文</t-img-0>'),
+        ]);
+        final translated =
+            (await source.parseSection(0)).blocks.single as ImageBlock;
+        expect(translated.source, same(image.source));
+        expect(translated.ocrText!.text, 'Original image text');
+        expect(
+          translated.ocrText!.displayText,
+          mode == TranslationMode.replace
+              ? '图片译文'
+              : 'Original image text\n图片译文',
+        );
+        final node = sectionTextNodes(
+          await source.parseSection(0),
+          includeImageText: true,
+        ).single;
+        expect(node.sourceOffsets, everyElement(0));
+      }
+    },
+  );
+  test(
+    'literal image examples are never sent for independent translation',
+    () async {
+      final anchor = SourceAnchor(
+        spine: SpineItemId.generated(0),
+        node: 'image',
+        textOffset: 0,
+      );
+      final section = Section(
+        id: anchor.spine,
+        spineIndex: 0,
+        href: 'chapter.xhtml',
+        blocks: [
+          ImageBlock(
+            href: 'literal.png',
+            source: SourceRange(start: anchor, end: anchor),
+            ocrText: const ImageText('<div>\tcode</div>', literal: true),
+          ),
+        ],
+      );
+      final source = TranslationBookSource(_Source(section));
+      expect(
+        await source.untranslatedBlocksForNodes(0, {
+          '${anchor.spine.value}/image@image-text',
+        }),
+        isEmpty,
+      );
+    },
+  );
 }

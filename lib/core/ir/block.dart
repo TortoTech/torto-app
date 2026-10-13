@@ -103,10 +103,36 @@ class TextRun extends Inline {
 }
 
 /// Explicit line break (<br>).
+class ImageTextRun extends TextRun {
+  final String originalImage;
+  final bool literal;
+  const ImageTextRun(
+    super.text,
+    this.originalImage, {
+    super.style,
+    super.link,
+    this.literal = false,
+  });
+}
+
 class BreakInline extends Inline {
   /// Mobile visual boundary which does not add a character to desktop source text.
   final bool synthetic;
   const BreakInline({this.synthetic = false});
+}
+
+/// Pronunciation is separate from the source prose used for copy and anchors.
+class RubyRun extends TextRun {
+  final List<TextRun> base;
+  final List<TextRun> annotation;
+  final bool below;
+  RubyRun({required this.base, required this.annotation, this.below = false})
+    : super(
+        base.map((r) => r.text).join(),
+        style: base.firstOrNull?.style ?? TextStyle.plain,
+        link: base.firstOrNull?.link,
+        language: base.firstOrNull?.language,
+      );
 }
 
 /// TeX source retained as semantic inline content. The current Flutter
@@ -185,6 +211,8 @@ sealed class Block {
 }
 
 class TextBlock extends Block {
+  final String? authoredListMarkerImage;
+  final int authoredListMarkerChars;
   final bool headingOrdinal;
   final TextBlockKind kind;
 
@@ -212,6 +240,8 @@ class TextBlock extends Block {
   final String nodeId;
 
   TextBlock({
+    this.authoredListMarkerImage,
+    this.authoredListMarkerChars = 0,
     this.headingOrdinal = false,
     this.kind = TextBlockKind.paragraph,
     this.headingLevel = 0,
@@ -231,6 +261,8 @@ class TextBlock extends Block {
     final buf = StringBuffer();
     for (final inline in inlines) {
       switch (inline) {
+        case ImageTextRun():
+          break;
         case TextRun(:final text):
           buf.write(text);
         case BreakInline(:final synthetic):
@@ -351,6 +383,8 @@ class TableCell {
     final buffer = StringBuffer();
     for (final inline in inlines) {
       switch (inline) {
+        case ImageTextRun():
+          break;
         case TextRun(:final text):
           buffer.write(text);
         case BreakInline():
@@ -366,6 +400,8 @@ class TableCell {
 }
 
 class ImageBlock extends Block {
+  final ImageText? ocrText;
+
   /// Root-relative href of the image resource within the publication.
   final String href;
   final String alt;
@@ -379,6 +415,7 @@ class ImageBlock extends Block {
   final MathInline? formula;
 
   const ImageBlock({
+    this.ocrText,
     required this.href,
     this.alt = '',
     this.style = ImageStyle.normal,
@@ -386,6 +423,14 @@ class ImageBlock extends Block {
     this.fixedPage = false,
     this.formula,
   });
+}
+
+class ImageText {
+  final String text;
+  final bool literal;
+  final String? translated;
+  const ImageText(this.text, {this.literal = false, this.translated});
+  String get displayText => translated ?? text;
 }
 
 enum CaptionPosition { before, after }

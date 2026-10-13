@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const github = 'https://api.github.com/repos/TortoTech/torto-app';
@@ -43,6 +43,115 @@ export function verifyAsset(asset, bytes) {
   if (bytes.length !== asset.size || digest !== asset.digest) throw new Error(`Attachment verification failed: ${asset.name}`);
 }
 
+// Actions downloads do not access Release asset URLs. Always compare extracted
+// files against Release digests: a rebuilt version can have several artifacts.
+export function artifactName(asset) {
+  const match = /^(Torto-\d+\.\d+\.\d+)-android-(?:armeabi-v7a|arm64-v8a|x86_64)\.apk$/.exec(asset.name)
+    ?? /^(Torto-\d+\.\d+\.\d+)-android\.sha256$/.exec(asset.name);
+  return match ? `${match[1]}-android-apks` : null;
+}
+export function createArtifactSource(directory, token, {
+  list = name => request(`${github}/actions/artifacts?name=${encodeURIComponent(name)}&per_page=100`, { token }),
+  extract = (artifact, destination) => execFileSync('gh', ['run', 'download', String(artifact.workflow_run.id),
+    '--repo', 'TortoTech/torto-app', '--name', artifact.name, '--dir', destination], {
+    env: { ...process.env, GH_TOKEN: token }, stdio: ['ignore', 'pipe', 'pipe'], timeout: 600_000,
+  }),
+  log = console.log,
+} = {}) {
+  const groups = new Map();
+  return async asset => {
+    const name = artifactName(asset);
+    if (!name || !token) return null;
+    if (!groups.has(name)) {
+      let candidates = [];
+      try {
+        const response = await list(name);
+        candidates = response.artifacts.filter(item => item.name === name && !item.expired &&
+          Number.isSafeInteger(item.id) && Number.isSafeInteger(item.workflow_run?.id))
+          .sort((a, b) => b.id - a.id).slice(0, 3);
+      } catch { log(`Actions artifacts unavailable for ${name}; Release fallback may be needed`); }
+      groups.set(name, candidates.map(artifact => ({ artifact, extracted: false, unavailable: false })));
+    }
+    for (const candidate of groups.get(name)) {
+      if (candidate.unavailable) continue;
+      const destination = path.join(directory, String(candidate.artifact.id));
+      if (!candidate.extracted) {
+        try { await extract(candidate.artifact, destination); candidate.extracted = true; }
+        catch {
+          candidate.unavailable = true;
+          log(`Actions artifact ${candidate.artifact.id} unavailable; checking other sources`);
+          continue;
+        }
+      }
+      try {
+        const bytes = fs.readFileSync(path.join(destination, asset.name));
+        verifyAsset(asset, bytes);
+        return bytes;
+      } catch { /* Missing or stale rebuild: never upload unverified artifact bytes. */ }
+    }
+    return null;
+  };
+}
+
+export function createAssetDownloader(directory, {
+  artifactDirectory, artifactSource = async () => null,
+  download = asset => request(asset.browser_download_url, { binary: true }), log = console.log,
+} = {}) {
+  fs.mkdirSync(directory, { recursive: true });
+  const records = new Map();
+  const get = async asset => {
+    // Gitee verification must read the remote file, never a cached source copy.
+    if (new URL(asset.browser_download_url).hostname !== 'github.com') return download(asset);
+    const key = createHash('sha256').update(`${asset.browser_download_url}\n${asset.digest}`).digest('hex');
+    const file = path.join(directory, key);
+    if (!records.has(key)) records.set(key, { name: asset.name, requests: 0, verified: 0, reused: 0, source: '' });
+    const record = records.get(key);
+    if (fs.existsSync(file)) {
+      const bytes = fs.readFileSync(file);
+      verifyAsset(asset, bytes);
+      record.reused++;
+      log(`Reusing verified source: ${asset.name}`);
+      return bytes;
+    }
+    let bytes;
+    if (artifactDirectory) {
+      try {
+        bytes = fs.readFileSync(path.join(artifactDirectory, asset.name));
+        verifyAsset(asset, bytes);
+        record.source = 'local build';
+      } catch { bytes = null; }
+    }
+    if (!bytes) {
+      bytes = await artifactSource(asset);
+      if (bytes) { verifyAsset(asset, bytes); record.source = 'Actions artifact'; }
+    }
+    if (!bytes) {
+      record.requests++;
+      record.source = 'GitHub Release';
+      log(`Automatic Release download request #${record.requests}: ${asset.name}`);
+      bytes = await download(asset);
+      verifyAsset(asset, bytes);
+      record.verified++;
+    }
+    fs.writeFileSync(file, bytes);
+    log(`Verified source ${asset.name}: ${record.source}`);
+    return bytes;
+  };
+  get.audit = () => [...records.values()].map(record => ({ ...record }));
+  return get;
+}
+
+function reportDownloads(tag, download) {
+  const rows = download.audit();
+  const report = [`### Gitee mirror download accounting: ${tag}`, '',
+    '| File | Source | Release requests | Verified Release downloads | Cache reuse |',
+    '| --- | --- | ---: | ---: | ---: |',
+    ...rows.map(row => `| ${row.name.replaceAll('|', '\\|')} | ${row.source} | ${row.requests} | ${row.verified} | ${row.reused} |`), '',
+    'Requests include failed attempts; GitHub exposes no exact per-request download-count attribution. Gitee verification downloads are separate.', ''].join('\n');
+  console.log(report);
+  if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, report);
+}
+
 export function planAssets(source, target) {
   return source.filter(asset => {
     const matches = target.filter(file => file.name === asset.name);
@@ -65,25 +174,53 @@ export function updateManifest(release) {
     digest: `sha256:${createHash('sha256').update(bytes).digest('hex')}` } };
 }
 
-async function request(url, { token, method = 'GET', json, form, optional = false, binary = false } = {}) {
+const transportCodes = new Set([
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_SOCKET', 'UND_ERR_ABORTED', 'UND_ERR_REQ_CONTENT_LENGTH_MISMATCH',
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN',
+  'ENETUNREACH', 'EHOSTUNREACH', 'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+]);
+const transportNames = new Set(['Error', 'TypeError', 'TimeoutError', 'AbortError', 'AggregateError', 'SyntaxError']);
+
+function transportDiagnostics(error, seen = new Set()) {
+  if (!error || typeof error !== 'object' || seen.has(error) || seen.size >= 8) return [];
+  seen.add(error);
+  const details = [];
+  if (transportNames.has(error.name)) details.push(error.name);
+  if (transportCodes.has(error.code)) details.push(error.code);
+  details.push(...transportDiagnostics(error.cause, seen));
+  if (Array.isArray(error.errors)) {
+    for (const nested of error.errors.slice(0, 8)) details.push(...transportDiagnostics(nested, seen));
+  }
+  return [...new Set(details)];
+}
+
+export async function request(url, { token, method = 'GET', json, form, optional = false, binary = false } = {}) {
   const headers = { 'User-Agent': 'Torto-release-mirror', Accept: binary ? 'application/octet-stream' : 'application/json' };
-  if (token) headers.Authorization = `token ${token}`;
+  if (token) headers.Authorization = `${new URL(url).hostname === 'gitee.com' ? 'Bearer' : 'token'} ${token}`;
   if (json) headers['Content-Type'] = 'application/json';
+  const started = performance.now();
+  const timeoutMs = binary || form ? 3_600_000 : 60_000;
+  let phase = 'waiting-for-response-headers';
   let response;
   try {
     response = await fetch(url, {
       method, headers, body: form ?? (json ? JSON.stringify(json) : undefined),
-      signal: AbortSignal.timeout(binary || form ? 600_000 : 60_000),
+      signal: AbortSignal.timeout(timeoutMs),
       // Authenticated API calls must never redirect credentials to another host.
       redirect: token ? 'error' : 'follow',
     });
     if (optional && response.status === 404) return null;
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    phase = 'reading-response-body';
     return binary ? Buffer.from(await response.arrayBuffer()) : await response.json();
   } catch (error) {
-    // Do not print response bodies, headers or nested transport errors containing credentials.
+    // Only allowlisted names/codes: never serialize transport objects or messages,
+    // which can contain authenticated URLs, headers or response bodies.
     const status = response ? `HTTP ${response.status}` : 'network/timeout failure';
-    throw new Error(`${method} ${new URL(url).pathname}: ${status}`);
+    const elapsedMs = Math.round(performance.now() - started);
+    const details = transportDiagnostics(error).join(', ') || 'unknown';
+    throw new Error(`${method} ${new URL(url).pathname}: ${status}; phase=${phase}; elapsed_ms=${elapsedMs}; timeout_ms=${timeoutMs}; transport=${details}`);
   }
 }
 
@@ -96,8 +233,82 @@ async function attachments(id, token) {
   }
 }
 
+export async function uploadAttachment(url, token, { asset, bytes }, { log = console.log, timeoutSeconds = 3600 } = {}) {
+  verifyAsset(asset, bytes);
+  if (/[\r\n\0]/.test(token)) throw new Error('Invalid Gitee token');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'torto-upload-'));
+  const file = path.join(directory, 'attachment');
+  const responseFile = path.join(directory, 'response.json');
+  const quote = value => `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
+  const started = performance.now();
+  try {
+    fs.writeFileSync(file, bytes, { mode: 0o600 });
+    log(`Uploading ${asset.name} (${bytes.length} bytes) with curl`);
+    const stats = ['http_code', 'size_upload', 'speed_upload', 'time_connect', 'time_starttransfer', 'time_total'];
+    const args = ['--disable', '--config', '-', '--silent', '--show-error',
+      '--connect-timeout', '30', '--max-time', String(timeoutSeconds),
+      '--user-agent', 'Torto-release-mirror', '--header', 'Accept: application/json',
+      '--form', `file=@${quote(file)};filename=${quote(asset.name)}`,
+      '--output', responseFile, '--write-out', stats.map(key => `%{${key}}`).join(' '), url];
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn('curl', args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+      let output = '';
+      child.stdout.on('data', chunk => { if (output.length < 4096) output += chunk.toString(); });
+      // Consume but never print curl errors: they can include authenticated URLs.
+      child.stderr.resume();
+      child.stdin.on('error', () => {});
+      child.on('error', () => reject(new Error('Could not start curl for Gitee upload')));
+      child.on('close', (code, signal) => resolve({ code, signal, output }));
+      // Keep credentials out of argv and logs. Never follow upload redirects.
+      child.stdin.end(`form-string = ${quote(`access_token=${token}`)}\n`);
+    });
+    const values = result.output.trim().split(/\s+/);
+    const metrics = values.length === stats.length && values.every(value => /^\d+(\.\d+)?$/.test(value))
+      ? stats.map((key, index) => `${key}=${values[index]}`).join('; ') : 'metrics=unavailable';
+    log(`Upload result ${asset.name}: curl_exit=${result.code}; elapsed_ms=${Math.round(performance.now() - started)}; ${metrics}`);
+    const httpCode = Number(values[0]);
+    if (result.code !== 0 || result.signal || !(httpCode >= 200 && httpCode < 300)) {
+      throw new Error(`Gitee upload failed for ${asset.name}: curl_exit=${result.code}; ${metrics}`);
+    }
+    try { return JSON.parse(fs.readFileSync(responseFile, 'utf8')); }
+    catch { throw new Error(`Invalid Gitee upload response for ${asset.name}`); }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 function tagCommit(tag) {
   return execFileSync('git', ['rev-parse', '--verify', `refs/tags/${tag}^{commit}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+}
+
+export function gitPushDiagnostics(error) {
+  // Never print arbitrary stderr: remote servers can echo credentials or URLs.
+  // Preserve only numeric exit information and recognized transport messages.
+  const stderr = String(error?.stderr || '');
+  const details = [];
+  if (Number.isInteger(error?.status)) details.push(`exit=${error.status}`);
+  if (/^SIG[A-Z0-9]+$/.test(error?.signal || '')) details.push(`signal=${error.signal}`);
+  if (['ETIMEDOUT', 'ENOENT', 'ENOBUFS'].includes(error?.code)) details.push(`code=${error.code}`);
+  const patterns = [
+    ['authentication-failed', /Authentication failed|could not read Username|could not read Password/i],
+    ['permission-denied', /permission denied|access denied|not allowed to push|403 Forbidden/i],
+    ['connection-timeout', /timed out|timeout was reached/i],
+    ['connection-reset', /connection reset|recv failure/i],
+    ['connection-refused', /failed to connect|connection refused/i],
+    ['dns-failure', /could not resolve host/i],
+    ['tls-failure', /SSL certificate|SSL connect error|TLS connection|SSL_ERROR/i],
+    ['http2-failure', /HTTP\/2 stream|HTTP2 framing/i],
+    ['rpc-failed', /RPC failed/i],
+    ['remote-disconnected', /remote end hung up|unexpected disconnect/i],
+    ['remote-rejected', /remote rejected|pre-receive hook declined/i],
+    ['ref-conflict', /already exists|would clobber|non-fast-forward/i],
+    ['repository-not-found', /repository .*not found/i],
+  ];
+  for (const [label, pattern] of patterns) if (pattern.test(stderr)) details.push(label);
+  for (const match of stderr.matchAll(/(?:HTTP(?: error)?[: ]+|returned error: )(\d{3})\b/gi)) details.push(`http=${match[1]}`);
+  for (const match of stderr.matchAll(/\bcurl[ :]+(\d{1,3})\b/gi)) details.push(`curl=${match[1]}`);
+  details.push(`stderr_bytes=${Buffer.byteLength(stderr)}`);
+  return [...new Set(details)].join('; ');
 }
 
 async function mirrorTag(tag, token, directory) {
@@ -115,13 +326,16 @@ async function mirrorTag(tag, token, directory) {
   const user = await request('https://gitee.com/api/v5/user', { token });
   const askpass = path.join(directory, 'askpass.sh');
   fs.writeFileSync(askpass, '#!/bin/sh\ncase "$1" in *Username*) printf "%s\\n" "$TORTO_GITEE_LOGIN" ;; *) printf "%s\\n" "$GITEE_TOKEN" ;; esac\n', { mode: 0o700 });
+  const started = performance.now();
   try {
+    console.log(`Pushing Gitee tag ${tag} at ${commit}; timeout_ms=600000`);
     execFileSync('git', ['-c', 'credential.helper=', 'push', 'https://gitee.com/TortoTech/torto-app.git', `refs/tags/${tag}:refs/tags/${tag}`], {
       env: { ...process.env, GIT_ASKPASS: askpass, GIT_TERMINAL_PROMPT: '0', TORTO_GITEE_LOGIN: user.login, GITEE_TOKEN: token },
       stdio: ['ignore', 'pipe', 'pipe'], timeout: 600_000,
     });
-  } catch {
-    throw new Error('Could not push the release tag to Gitee (check token repository write permissions)');
+    console.log(`Gitee tag push completed: ${tag}; elapsed_ms=${Math.round(performance.now() - started)}`);
+  } catch (error) {
+    throw new Error(`Could not push the release tag to Gitee: elapsed_ms=${Math.round(performance.now() - started)}; ${gitPushDiagnostics(error)}`);
   }
 }
 
@@ -135,7 +349,8 @@ export async function syncRelease(release, api, download) {
   };
   if (!target) target = await api('POST', '/releases', metadata);
   const files = await api('LIST', `/releases/${target.id}/attach_files`);
-  const missing = planAssets(release.assets, files);
+  // Test the same authenticated upload path with small real checksum files first.
+  const missing = planAssets(release.assets, files).sort((a, b) => a.size - b.size);
   for (const asset of missing) {
     const bytes = await download(asset);
     verifyAsset(asset, bytes);
@@ -193,29 +408,32 @@ async function main() {
   }
   if (!token) throw new Error('GITEE_TOKEN is required');
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'torto-gitee-'));
+  const download = createAssetDownloader(path.join(directory, 'source-cache'), {
+    artifactDirectory: value('--artifact-dir'),
+    artifactSource: createArtifactSource(path.join(directory, 'artifacts'), githubToken),
+  });
   try {
     await mirrorTag(release.tag_name, token, directory);
     const api = async (method, suffix, data, optional = false) => {
       if (method === 'LIST') return attachments(Number(suffix.split('/')[2]), token);
       if (method === 'UPLOAD') {
-        const form = new FormData();
-        form.append('file', new Blob([data.bytes]), data.asset.name);
-        return request(`${gitee}${suffix}`, { token, method: 'POST', form });
+        return uploadAttachment(`${gitee}${suffix}`, token, data);
       }
       return request(`${gitee}${suffix}`, { token, method, json: data, optional });
     };
     for (let attempt = 1; ; attempt++) {
       try {
-        await syncRelease(release, api, asset => request(asset.browser_download_url, { binary: true }));
+        await syncRelease(release, api, download);
         console.log(`Gitee mirror verified: ${release.tag_name}`);
         break;
       } catch (error) {
         if (attempt === 3) throw error;
-        console.log(`Sync attempt ${attempt} failed; retrying from remote attachment state`);
+        console.log(`Sync attempt ${attempt} failed: ${error.message}; retrying from remote attachment state`);
         await new Promise(resolve => setTimeout(resolve, 10_000));
       }
     }
   } finally {
+    reportDownloads(release.tag_name, download);
     fs.rmSync(directory, { recursive: true, force: true });
   }
 }

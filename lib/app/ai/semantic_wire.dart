@@ -170,6 +170,47 @@ class SemanticWire {
     return out.toString();
   }
 
-  static String instructions(String text) =>
-      '${prompt(text)}\nCompact JSON transport: use supplied schema and compact keys exclusively. Field meanings: ${fields.entries.map((e) => '${e.value}=${e.key}').join(', ')}. Enum meanings (only in k/ty/ss/ni/m): ${enums.entries.map((e) => '${e.value}=${e.key}').join(', ')}. Source strings, IDs and LaTeX remain exact.';
+  static String instructions(String text, [Iterable<Object?>? inputs]) {
+    final presentFields = <String>{}, presentEnums = <String>{};
+    void visit(Object? value) {
+      if (value is List) {
+        for (final child in value) {
+          visit(child);
+        }
+      }
+      if (value is! Map) return;
+      for (final entry in value.entries) {
+        if (fields.containsKey(entry.key)) {
+          presentFields.add(entry.key as String);
+        }
+        if (enumFields.contains(entry.key) &&
+            entry.value is String &&
+            enums.containsKey(entry.value)) {
+          presentEnums.add(entry.value as String);
+        }
+        visit(entry.value);
+      }
+    }
+
+    if (inputs == null) {
+      presentFields.addAll(fields.keys);
+      presentEnums.addAll(enums.keys);
+    } else {
+      for (final input in inputs) {
+        visit(input);
+      }
+    }
+    final fieldMeanings = fields.entries
+        .where((e) => presentFields.contains(e.key))
+        .map((e) => '${e.value}=${e.key}')
+        .join(', ');
+    final enumMeanings = enums.entries
+        .where((e) => presentEnums.contains(e.key))
+        .map((e) => '${e.value}=${e.key}')
+        .join(', ');
+    return '${prompt(text)}\nCompact JSON transport: use supplied schema and compact keys exclusively.'
+        '${fieldMeanings.isEmpty ? '' : ' Input fields: $fieldMeanings.'}'
+        '${enumMeanings.isEmpty ? '' : ' Input enums: $enumMeanings.'}'
+        ' Source strings, IDs and LaTeX remain exact.';
+  }
 }

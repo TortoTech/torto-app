@@ -10,6 +10,7 @@ import 'text_selection_layer.dart';
 import 'book_search_page.dart';
 import 'chat_page.dart';
 import 'pdf_discovery_page.dart';
+import 'pdf_reflow_generation_page.dart';
 import '../statistics/reading_tracker.dart';
 import '../statistics/statistics_store.dart';
 import '../statistics/statistics_model.dart';
@@ -29,6 +30,7 @@ import '../settings/ai_providers_page.dart';
 import '../settings/app_preferences.dart';
 import 'footnote_sheet.dart';
 import 'media_preview.dart';
+import 'media_reference_preview.dart';
 import 'reader_controller.dart';
 import 'reader_preferences_store.dart';
 import 'toc_drawer.dart';
@@ -71,6 +73,7 @@ class _ReaderPageState extends State<ReaderPage>
   double _readerWidth = 0;
   AnimationController? _focusMotion;
   bool _focusDragging = false;
+  FocusStyle _focusStyle = FocusStyle.dimSurroundings;
 
   void _stopFocusMotion() {
     _focusMotion?.stop();
@@ -219,25 +222,92 @@ class _ReaderPageState extends State<ReaderPage>
     final position = _imageTapPosition;
     final page = controller.displayPage;
     if (position == null || page == null) return;
-    final images = page.items.whereType<ImagePlacement>().where(
-      (image) => image.rect.contains(position),
-    );
-    if (images.isEmpty) return;
+    final target = readerImagePreviewTarget(page, position);
+    if (target == null) return;
     _stopFocusMotion();
-    final href = images.first.originalImage ?? images.first.href;
+    final href = target.href;
     final texture = controller.imagePreview(href);
+    final text = await controller.recognizedImageText(href);
+    if (!mounted) {
+      (await texture)?.dispose();
+      return;
+    }
     controller.setPageTurnActive(true);
     try {
       await showReaderImagePreview(
         context,
         texture,
-        formula: images.first.latex != null,
+        formula: target.formula,
+        recognizedText: text,
       );
     } finally {
       try {
         (await texture)?.dispose();
       } catch (_) {}
       if (mounted) controller.setPageTurnActive(_selecting);
+    }
+  }
+
+  Future<void> _choosePdfTextSource() async {
+    final controller = _controller;
+    if (controller == null || controller.busy) return;
+    final sources = await controller.availablePdfTextSources();
+    if (!mounted) return;
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (sources.isEmpty)
+              Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text(
+                  context.l10n.text('暂无可用文字版本', 'No text version available'),
+                ),
+              ),
+            for (final source in sources)
+              ListTile(
+                title: Text(
+                  source == 'native'
+                      ? context.l10n.text('本地文字', 'Local text')
+                      : 'OCR',
+                ),
+                subtitle: Text(
+                  context.l10n.text(
+                    '重新打开本书后使用',
+                    'Use when this book is reopened',
+                  ),
+                ),
+                trailing: source == controller.preferredPdfTextSource
+                    ? const Icon(Icons.check)
+                    : null,
+                onTap: () => Navigator.pop(context, source),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    try {
+      if (await controller.preferPdfTextSource(choice) && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              context.l10n.text(
+                '已返回 PDF 原页；重新打开本书后使用所选文字',
+                'Returned to the original PDF page. Reopen this book to use the selected text.',
+              ),
+            ),
+          ),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('$error')));
+      }
     }
   }
 
@@ -309,6 +379,14 @@ class _ReaderPageState extends State<ReaderPage>
             background: _background,
             foreground: _foreground,
           ),
+          if (_focusStyle == FocusStyle.dimSurroundings && unit != null)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: CustomPaint(
+                  painter: _FocusSurroundingsPainter(unit.bounds, _background),
+                ),
+              ),
+            ),
           for (var i = 0; i < page.focusUnits.length; i++)
             for (final paintRect
                 in page.focusUnits[i].paintBounds.isEmpty
@@ -320,9 +398,10 @@ class _ReaderPageState extends State<ReaderPage>
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 120),
                     decoration: BoxDecoration(
-                      color: _background.withValues(
-                        alpha: i == selected ? 0 : .48,
-                      ),
+                      color:
+                          _focusStyle == FocusStyle.highlight && i == selected
+                          ? _foreground.withValues(alpha: .07)
+                          : null,
                       border:
                           i == selected &&
                               page.items.any(
@@ -440,8 +519,8 @@ class _ReaderPageState extends State<ReaderPage>
       }
       if (_searchChoice != null) {
         marks.add(
-          ReaderPaintMark(
-            _searchChoice!.matches[_searchIndex].range,
+          ReaderPaintMark.search(
+            _searchChoice!.matches[_searchIndex],
             const Color(0x7791BDF5),
           ),
         );
@@ -498,7 +577,16 @@ class _ReaderPageState extends State<ReaderPage>
   Future<void> _searchBook() async {
     final choice = await Navigator.push<BookSearchChoice>(
       context,
-      MaterialPageRoute(builder: (_) => BookSearchPage(file: widget.file)),
+      MaterialPageRoute(
+        builder: (_) => BookSearchPage(
+          file: widget.file,
+          search:
+              _controller?.pdfSource != null &&
+                  _controller?.pdfReflowEnabled != true
+              ? null
+              : _controller?.searchReadingText,
+        ),
+      ),
     );
     if (!mounted || choice == null || choice.matches.isEmpty) return;
     _searchChoice = choice;
@@ -508,7 +596,7 @@ class _ReaderPageState extends State<ReaderPage>
 
   Future<void> _jumpSearch() async {
     final result = _searchChoice!.matches[_searchIndex];
-    await _controller!.goToTextRange(result.range);
+    await _controller!.goToSearchMatch(result);
     if (mounted) {
       setState(() {
         _interactionPage = null;
@@ -526,6 +614,7 @@ class _ReaderPageState extends State<ReaderPage>
       try {
         final (ranges, quote) = await _controller!.originalParagraphSelection(
           selection.ranges,
+          fallbackQuote: selection.quote,
         );
         if (!mounted) return;
         selection = ReaderSelection(ranges, quote);
@@ -1069,6 +1158,7 @@ class _ReaderPageState extends State<ReaderPage>
         ? await _preferencesStore.loadDarkMode()
         : inheritedDarkMode;
     _darkMode = darkMode;
+    _focusStyle = await _preferencesStore.loadFocusStyle();
     _style = _themedStyle(
       _baseStyle.copyWith(
         baseFontSize: typography.fontSize,
@@ -1210,6 +1300,10 @@ class _ReaderPageState extends State<ReaderPage>
     TextLinkRange link,
   ) async {
     _stopFocusMotion();
+    if (link.href.startsWith('torto-media:')) {
+      await _openMediaReference(link.href);
+      return;
+    }
     if (link.latex != null) {
       await showReaderFormulaPreview(context, link.latex!);
       return;
@@ -1253,7 +1347,9 @@ class _ReaderPageState extends State<ReaderPage>
           entries: entries,
           initialCitation: link.citationOrdinal,
           initialFootnoteNumber: link.footnoteNumber,
+          blockNavigation: controller.style.focusMode,
           markerColor: footnoteIconColor(_background),
+          onMediaReference: _openMediaReference,
         );
       } finally {
         _statisticsFootnote = false;
@@ -1274,6 +1370,30 @@ class _ReaderPageState extends State<ReaderPage>
           ),
         ),
       );
+    }
+  }
+
+  Future<void> _openMediaReference(String href) async {
+    final controller = _controller, source = _controller?.previewSource;
+    if (controller == null || source == null) return;
+    _stopFocusMotion();
+    controller.setPageTurnActive(true);
+    try {
+      await showMediaReferencePreview(
+        context,
+        source,
+        controller.sectionIndex,
+        controller.style,
+        href,
+      );
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('$error')));
+      }
+    } finally {
+      if (mounted) controller.setPageTurnActive(_selecting);
     }
   }
 
@@ -1650,13 +1770,22 @@ class _ReaderPageState extends State<ReaderPage>
     final background = _background;
     final foreground = _foreground;
     final systemOverlay = _systemUiStyle(darkMode: _darkMode);
+    final media = MediaQuery.of(context);
+    final sideChat = media.size.width >= 840;
+    final chatHeight =
+        (media.size.height - media.viewInsets.bottom - media.padding.vertical) *
+        .45;
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: systemOverlay,
       child: Theme(
         data: _readerThemeData(Theme.of(context), background, foreground),
         child: PopScope(
-          canPop: !_selecting && !_showBookEnd,
+          canPop: !_selecting && !_showBookEnd && _chatPanel == null,
           onPopInvokedWithResult: (didPop, result) {
+            if (!didPop && _chatPanel != null) {
+              setState(() => _chatPanel = null);
+              return;
+            }
             if (!didPop && _selecting) _selectionKey.currentState?.clear();
             if (!didPop && _showBookEnd) {
               _resetTurn();
@@ -1675,6 +1804,8 @@ class _ReaderPageState extends State<ReaderPage>
             body: Stack(
               children: [
                 Positioned.fill(
+                  right: _chatPanel != null && sideChat ? 360 : 0,
+                  bottom: _chatPanel != null && !sideChat ? chatHeight : 0,
                   child: SafeArea(
                     child: LayoutBuilder(
                       builder: (context, constraints) {
@@ -1702,7 +1833,16 @@ class _ReaderPageState extends State<ReaderPage>
                     ),
                   ),
                 ),
-                if (_overlayVisible) ...[
+                if (_chatPanel != null)
+                  Positioned(
+                    right: 0,
+                    bottom: 0,
+                    top: sideChat ? 0 : null,
+                    width: sideChat ? 360 : media.size.width,
+                    height: sideChat ? null : chatHeight,
+                    child: Material(elevation: 8, child: _chatPanel!),
+                  ),
+                if (_overlayVisible && _chatPanel == null) ...[
                   _buildReaderHeader(),
                   _buildReaderFooter(),
                 ],
@@ -1767,6 +1907,7 @@ class _ReaderPageState extends State<ReaderPage>
     );
   }
 
+  Widget? _chatPanel;
   Future<void> _chat() async {
     final controller = _controller;
     if (controller == null || controller.busy) return;
@@ -1780,57 +1921,48 @@ class _ReaderPageState extends State<ReaderPage>
         ? nodes.take(8)
         : nodes.where((node) => unit.contains(node.source.start));
     final excerpt = selected.map((node) => node.text).join('\n');
-    controller.setReaderVisible(false);
-    try {
-      await Navigator.push(
-        context,
-        MaterialPageRoute<void>(
-          builder: (_) => ChatPage(
-            bookId: controller.statisticsBookId,
-            title: controller.title,
-            excerpt: excerpt.substring(0, excerpt.length.clamp(0, 10000)),
-            blockId:
-                unit?.anchor?.toString() ??
-                controller.readingAnchor?.toString() ??
-                '${controller.sectionIndex}',
-            file: widget.file.path,
-            tools: ReaderBookTools(
-              controller,
-              selection: _selectionKey.currentState?.selection,
-            ),
-            onBookReference: (uri) async {
-              Navigator.pop(context);
-              if (uri.host == 'source') {
-                try {
-                  final encoded = uri.queryParameters['range']!;
-                  final range = SourceRange.fromJson(
-                    Map<String, dynamic>.from(
-                      jsonDecode(
-                        utf8.decode(
-                          base64Url.decode(base64Url.normalize(encoded)),
-                        ),
-                      ),
-                    ),
-                  );
-                  await controller.goToTextRange(range);
-                } catch (_) {}
-              } else if (uri.host == 'page') {
-                final index = int.tryParse(uri.queryParameters['unit'] ?? '');
-                if (index != null &&
-                    index >= 0 &&
-                    index < controller.sectionCount) {
-                  await controller.goToSection(index);
-                }
-              } else if (uri.host == 'toc') {
-                await controller.goToHref(uri.queryParameters['href'] ?? '');
-              }
-            },
-          ),
+    setState(() {
+      _overlayVisible = false;
+      _chatPanel = ChatPage(
+        onClose: () => setState(() => _chatPanel = null),
+        bookId: controller.statisticsBookId,
+        title: controller.title,
+        excerpt: excerpt.substring(0, excerpt.length.clamp(0, 10000)),
+        blockId:
+            unit?.anchor?.toString() ??
+            controller.readingAnchor?.toString() ??
+            '${controller.sectionIndex}',
+        file: widget.file.path,
+        tools: ReaderBookTools(
+          controller,
+          selection: _selectionKey.currentState?.selection,
         ),
+        onBookReference: (uri) async {
+          if (uri.host == 'source') {
+            try {
+              final encoded = uri.queryParameters['range']!;
+              final range = SourceRange.fromJson(
+                Map<String, dynamic>.from(
+                  jsonDecode(
+                    utf8.decode(base64Url.decode(base64Url.normalize(encoded))),
+                  ),
+                ),
+              );
+              await controller.goToTextRange(range);
+            } catch (_) {}
+          } else if (uri.host == 'page') {
+            final index = int.tryParse(uri.queryParameters['unit'] ?? '');
+            if (index != null &&
+                index >= 0 &&
+                index < controller.sectionCount) {
+              await controller.goToSection(index);
+            }
+          } else if (uri.host == 'toc') {
+            await controller.goToHref(uri.queryParameters['href'] ?? '');
+          }
+        },
       );
-    } finally {
-      if (mounted) controller.setReaderVisible(true);
-    }
+    });
   }
 
   Widget _buildReaderHeader() => Positioned(
@@ -1866,7 +1998,9 @@ class _ReaderPageState extends State<ReaderPage>
                   ),
                   tooltip: _controller!.pdfReflowEnabled
                       ? context.l10n.text('显示 PDF 原版', 'Show original PDF')
-                      : context.l10n.text('显示 OCR 重排', 'Show OCR reflow'),
+                      : _controller!.pdfReflowLabel == 'OCR'
+                      ? context.l10n.text('显示 OCR 重排', 'Show OCR reflow')
+                      : context.l10n.text('显示本地重排', 'Show local text reflow'),
                   onPressed: _controller!.busy
                       ? null
                       : () async {
@@ -1888,6 +2022,22 @@ class _ReaderPageState extends State<ReaderPage>
                     ? null
                     : _chat,
               ),
+              if (_controller?.pdfSource != null)
+                IconButton(
+                  icon: const Icon(Icons.article_outlined),
+                  tooltip: context.l10n.text('本地 PDF 重排', 'Local PDF reflow'),
+                  onPressed: _controller!.busy
+                      ? null
+                      : () => Navigator.push(
+                          context,
+                          MaterialPageRoute<void>(
+                            builder: (_) => PdfReflowGenerationPage(
+                              controller: _controller!,
+                              file: widget.file,
+                            ),
+                          ),
+                        ),
+                ),
               if (_controller?.pdfSource != null)
                 IconButton(
                   icon: const Icon(Icons.auto_awesome_outlined),
@@ -2183,6 +2333,51 @@ class _ReaderPageState extends State<ReaderPage>
                           }
                         : null,
                   ),
+                  if (controller.canChoosePdfTextSource)
+                    ListTile(
+                      key: const Key('reader-pdf-text-source'),
+                      title: Text(
+                        context.l10n.text('PDF 文字来源', 'PDF text source'),
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: controller.busy
+                          ? null
+                          : () {
+                              Navigator.of(sheetContext).pop();
+                              _choosePdfTextSource();
+                            },
+                    ),
+                  if (_style.focusMode && controller.focusModeAllowed)
+                    DropdownButtonFormField<FocusStyle>(
+                      key: const Key('reader-focus-style'),
+                      initialValue: _focusStyle,
+                      decoration: InputDecoration(
+                        labelText: context.l10n.text('专注样式', 'Focus style'),
+                      ),
+                      items: [
+                        DropdownMenuItem(
+                          value: FocusStyle.highlight,
+                          child: Text(
+                            context.l10n.text(
+                              '突出当前内容',
+                              'Highlight current block',
+                            ),
+                          ),
+                        ),
+                        DropdownMenuItem(
+                          value: FocusStyle.dimSurroundings,
+                          child: Text(
+                            context.l10n.text('周边淡化', 'Dim surroundings'),
+                          ),
+                        ),
+                      ],
+                      onChanged: (value) {
+                        if (value == null) return;
+                        setState(() => _focusStyle = value);
+                        unawaited(_preferencesStore.saveFocusStyle(value));
+                        Navigator.of(sheetContext).pop();
+                      },
+                    ),
                   if (controller.semanticLayoutError != null)
                     ListTile(
                       leading: const Icon(Icons.info_outline),
@@ -2661,4 +2856,24 @@ class _FocusContentClipper extends CustomClipper<Rect> {
   @override
   bool shouldReclip(_FocusContentClipper oldClipper) =>
       bounds != oldClipper.bounds;
+}
+
+class _FocusSurroundingsPainter extends CustomPainter {
+  final Rect clear;
+  final Color background;
+  const _FocusSurroundingsPainter(this.clear, this.background);
+  @override
+  void paint(Canvas canvas, Size size) {
+    final viewport = Offset.zero & size;
+    final path = Path()
+      ..fillType = PathFillType.evenOdd
+      ..addRect(viewport);
+    final active = clear.intersect(viewport);
+    if (!active.isEmpty) path.addRect(active);
+    canvas.drawPath(path, Paint()..color = background.withValues(alpha: .55));
+  }
+
+  @override
+  bool shouldRepaint(_FocusSurroundingsPainter old) =>
+      clear != old.clear || background != old.background;
 }

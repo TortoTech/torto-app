@@ -10,8 +10,9 @@ import 'sync_store.dart';
 
 class WebDavObject {
   final Uint8List bytes;
+  final String? etag;
 
-  const WebDavObject(this.bytes);
+  const WebDavObject(this.bytes, {this.etag});
 }
 
 class WebDavException implements Exception {
@@ -178,7 +179,10 @@ class WebDavClient {
       if (cached?['body'] is! String) {
         throw const WebDavException('Server returned 304 without cached data.');
       }
-      return WebDavObject(base64Decode(cached!['body'] as String));
+      return WebDavObject(
+        base64Decode(cached!['body'] as String),
+        etag: etag as String?,
+      );
     }
     if (response.statusCode == 404) {
       await cacheStore?.cacheRemove(accountKey, 'object:$path');
@@ -199,7 +203,110 @@ class WebDavClient {
     } else {
       await cacheStore?.cacheRemove(accountKey, 'object:$path');
     }
-    return WebDavObject(response.bodyBytes);
+    return WebDavObject(response.bodyBytes, etag: freshTag);
+  }
+
+  /// Derived archives are mutable, unlike source books. Guard both writes
+  /// against the generation observed at the start of publication.
+  Future<void> publishDerivedArchive(
+    String path,
+    File file,
+    String manifestPath,
+    Map<String, dynamic> manifest,
+    WebDavObject? predecessor,
+  ) async {
+    await _ensureDirectory(_uri(path).resolve('./'), repair: true);
+    final collection = path.substring(0, path.lastIndexOf('/') + 1);
+    final locked = await _send(
+      'LOCK',
+      collection,
+      headers: {
+        'Depth': 'infinity',
+        'Timeout': 'Second-3600',
+        HttpHeaders.contentTypeHeader: 'application/xml',
+      },
+      body: utf8.encode(
+        '<?xml version="1.0"?><d:lockinfo xmlns:d="DAV:"><d:lockscope><d:exclusive/></d:lockscope><d:locktype><d:write/></d:locktype></d:lockinfo>',
+      ),
+    );
+    final token = locked.headers['lock-token'];
+    if (locked.statusCode < 200 ||
+        locked.statusCode >= 300 ||
+        token == null ||
+        !RegExp(r'^<[^\s<>]+>$').hasMatch(token)) {
+      throw WebDavException(
+        'Could not lock the derived generation; the local result was preserved.',
+        locked.statusCode,
+      );
+    }
+    try {
+      final fresh = await getOptional(manifestPath);
+      if ((fresh?.etag != predecessor?.etag) ||
+          (fresh != null &&
+              predecessor != null &&
+              sha256.convert(fresh.bytes) !=
+                  sha256.convert(predecessor.bytes))) {
+        throw const WebDavException(
+          'Derived generation changed before publication.',
+        );
+      }
+      final existing = await _send('HEAD', path);
+      final exists = existing.statusCode >= 200 && existing.statusCode < 300;
+      if (!exists && existing.statusCode != 404) {
+        throw WebDavException(
+          'Could not inspect derived archive.',
+          existing.statusCode,
+        );
+      }
+      final archiveTag = existing.headers[HttpHeaders.etagHeader];
+      final request = http.StreamedRequest('PUT', _uri(path))
+        ..followRedirects = false;
+      request.headers.addAll({
+        ..._baseHeaders,
+        'If': '($token)',
+        HttpHeaders.contentTypeHeader: 'application/zip',
+        if (exists && archiveTag != null)
+          HttpHeaders.ifMatchHeader: archiveTag
+        else if (!exists)
+          HttpHeaders.ifNoneMatchHeader: '*',
+      });
+      request.contentLength = await file.length();
+      final sending = _client
+          .send(request)
+          .timeout(const Duration(minutes: 30));
+      await request.sink.addStream(file.openRead());
+      await request.sink.close();
+      final response = await sending;
+      await response.stream.drain<void>();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw WebDavException(
+          'Derived generation changed during upload.',
+          response.statusCode,
+        );
+      }
+      final published = await _send(
+        'PUT',
+        manifestPath,
+        headers: {
+          'If': '($token)',
+          HttpHeaders.contentTypeHeader: 'application/json',
+          if (predecessor?.etag != null)
+            HttpHeaders.ifMatchHeader: predecessor!.etag!
+          else if (predecessor == null)
+            HttpHeaders.ifNoneMatchHeader: '*',
+        },
+        body: utf8.encode(jsonEncode(manifest)),
+      );
+      if (published.statusCode < 200 || published.statusCode >= 300) {
+        throw WebDavException(
+          'Derived manifest changed during publication.',
+          published.statusCode,
+        );
+      }
+      await cacheStore?.cacheRemove(accountKey, 'object:$manifestPath');
+    } finally {
+      await _send('UNLOCK', collection, headers: {'Lock-Token': token});
+    }
   }
 
   Future<Map<String, dynamic>?> getJsonOptional(String path) async {

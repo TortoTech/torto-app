@@ -67,7 +67,10 @@ class SentenceStructure {
           !display && RegExp(r'^\^\{?\d+\}?$').hasMatch(latex.trim()),
         _ => false,
       };
-      if (note || inline is MathInline || inline is InlineImageRun) {
+      if (note ||
+          inline is MathInline ||
+          inline is InlineImageRun ||
+          inline is RubyRun) {
         protected.add((start, end));
       }
       if (note) footnotes.add((start, end));
@@ -133,6 +136,7 @@ class SentenceStructure {
     }
     final iterator = _segmenter.segment(String.fromCharCodes(masked));
     final candidates = <int>{};
+    final colonCuts = <int>{};
     for (var end = iterator.next(); end >= 0; end = iterator.next()) {
       if (end > 0 && end < text.length) {
         final prefix = text.substring(0, end).trimRight();
@@ -185,6 +189,44 @@ class SentenceStructure {
           end++;
         }
         candidates.add(end);
+        if (':：'.contains(c)) colonCuts.add(end);
+      }
+    }
+    if (colonCuts.isNotEmpty) {
+      final diagnostic = String.fromCharCodes([
+        for (var i = 0; i < text.length; i++)
+          if (inside(i))
+            0xFFFC
+          else if (_pairs.containsKey(text[i]) ||
+              _pairs.containsValue(text[i]) ||
+              '"\''.contains(text[i]))
+            32
+          else
+            text.codeUnitAt(i),
+      ]);
+      final periods = <int>{};
+      final ends = _segmenter.segment(diagnostic);
+      for (var end = ends.next(); end >= 0; end = ends.next()) {
+        var cursor = mathMin(end, text.length);
+        while (cursor > 0 &&
+            (inside(cursor - 1) || diagnostic[cursor - 1].trim().isEmpty)) {
+          cursor--;
+        }
+        final prefix = diagnostic.substring(0, cursor);
+        if (prefix.endsWith('.') &&
+            !prefix.endsWith('..') &&
+            !_abbreviation.hasMatch(prefix)) {
+          periods.add(cursor - 1);
+        }
+      }
+      for (final end in colonCuts) {
+        if (!text.substring(0, end).trimRight().endsWith(':') &&
+            !text.substring(0, end).trimRight().endsWith('：')) {
+          continue;
+        }
+        if (_continuesSingleSentence(text, end, inside, periods)) {
+          candidates.remove(end);
+        }
       }
     }
     // An unmatched quote/bracket protects its remaining contents as well.
@@ -327,5 +369,66 @@ class SentenceStructure {
         after == '\\' ||
         prefix.contains('://') ||
         const {'mailto', 'tel', 'urn', 'data'}.contains(prefix);
+  }
+
+  static int mathMin(int a, int b) => a < b ? a : b;
+
+  static bool _continuesSingleSentence(
+    String text,
+    int start,
+    bool Function(int) protected,
+    Set<int> periods,
+  ) {
+    final closers = <String>[];
+    var content = false, ended = false;
+    final letter = RegExp(r'[\p{L}\p{N}]', unicode: true);
+    bool quote(int i) {
+      if (!'"\''.contains(text[i])) return false;
+      var slashes = 0;
+      for (var j = i - 1; j >= 0 && text[j] == '\\'; j--) {
+        slashes++;
+      }
+      return slashes.isEven &&
+          !(text[i] == "'" &&
+              i > 0 &&
+              i + 1 < text.length &&
+              letter.hasMatch(text[i - 1]) &&
+              letter.hasMatch(text[i + 1]));
+    }
+
+    for (var i = start; i < text.length; i++) {
+      if (protected(i)) continue;
+      final c = text[i];
+      if ('\n\r\u2028\u2029'.contains(c)) return false;
+      if (c.trim().isEmpty) continue;
+      if (closers.isNotEmpty && closers.last == c) {
+        closers.removeLast();
+        if (ended && closers.isEmpty) return true;
+        continue;
+      }
+      if (ended) {
+        if ('。！？.!?'.contains(c)) continue;
+        return false;
+      }
+      final closer = _pairs[c] ?? (quote(i) ? c : null);
+      if (closer != null) {
+        closers.add(closer);
+        continue;
+      }
+      if ('，,、；;：:…'.contains(c)) return false;
+      if (c == '.' &&
+          ((i + 1 < text.length && text[i + 1] == '.') ||
+              i > 0 && text[i - 1] == '.')) {
+        return false;
+      }
+      if ('。！？!?'.contains(c) || c == '.' && periods.contains(i)) {
+        if (!content) return false;
+        if (closers.isEmpty) return true;
+        ended = true;
+      } else {
+        content |= letter.hasMatch(c);
+      }
+    }
+    return false;
   }
 }

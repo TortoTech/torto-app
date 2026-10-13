@@ -11,6 +11,7 @@ library;
 import 'dart:typed_data';
 
 import '../html_ir/html_ir_parser.dart';
+import '../html_ir/note_references.dart';
 import '../html_ir/package_path.dart';
 import '../html_ir/tolerant_xml.dart';
 import '../ir/ir.dart';
@@ -129,7 +130,12 @@ class DirectBookSource implements BookSource {
       final section = source.sections[index];
       final href = 'Text/section-${index + 1}.xhtml';
       spine.add(
-        SpineItem(id: SpineItemId.generated(index), index: index, href: href),
+        SpineItem(
+          id: SpineItemId.generated(index),
+          index: index,
+          href: href,
+          linear: section.linear,
+        ),
       );
       contents.add(section.content);
       if (section.linear) {
@@ -179,7 +185,7 @@ class DirectBookSource implements BookSource {
       throw FormatException('section $index out of range');
     }
     final item = book.spine[index];
-    return switch (_sections[index]) {
+    final section = switch (_sections[index]) {
       HtmlSectionContent(:final html) => promoteTocHeadings(
         _parser.parse(
           spineIndex: index,
@@ -193,6 +199,15 @@ class DirectBookSource implements BookSource {
             final resource = _resources[href];
             return resource == null ? null : decodeXmlBytes(resource.bytes);
           },
+          isSmallListMarkerImage: (href) {
+            final bytes = _resources[href]?.bytes;
+            final size = bytes == null ? null : readImageDimensions(bytes);
+            return size != null &&
+                size.$1 <= 32 &&
+                size.$2 <= 32 &&
+                size.$1 > 0 &&
+                size.$2 > 0;
+          },
           isDecorativeSeparatorImage: (href) {
             final bytes = _resources[href]?.bytes;
             return bytes != null && isDecorativeSeparatorImage(bytes);
@@ -205,10 +220,19 @@ class DirectBookSource implements BookSource {
         spineIndex: index,
         href: item.href,
         blocks: [
-          ImageBlock(href: resourcePath, alt: alt, style: ImageStyle.normal),
+          ImageBlock(
+            href: resourcePath,
+            alt: alt,
+            style: ImageStyle.normal,
+            source: SourceRange(
+              start: SourceAnchor(spine: item.id, node: 'image', textOffset: 0),
+              end: SourceAnchor(spine: item.id, node: 'image', textOffset: 0),
+            ),
+          ),
         ],
       ),
     };
+    return markNoteReferences(section, book);
   }
 
   @override

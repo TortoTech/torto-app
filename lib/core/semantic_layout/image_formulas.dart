@@ -2,6 +2,13 @@ import '../ir/ir.dart';
 import '../ir/inline_content.dart';
 import 'formula_validation.dart';
 
+bool validImageText(Object? value, {bool literal = false}) =>
+    value is String &&
+    value.trim().isNotEmpty &&
+    value.length <= 4096 &&
+    !value.contains(RegExp(r'[\uFFFD\x00-\x08\x0B\x0C\x0E-\x1F]')) &&
+    (literal || !value.contains(RegExp(r'[<>]')));
+
 List<(int, ImageBlock)> formulaImageCandidates(
   Section section,
   int start,
@@ -30,7 +37,10 @@ List<(int, ImageBlock)> formulaImageCandidates(
     for (final text in blockTexts(block)) {
       if (text.kind == TextBlockKind.caption) continue;
       for (final inline in text.inlines.whereType<InlineImageRun>()) {
-        if (!inline.image.fixedPage) out.add((b, inline.image));
+        if (!inline.image.fixedPage &&
+            inline.image.href != text.authoredListMarkerImage) {
+          out.add((b, inline.image));
+        }
       }
     }
   }
@@ -44,6 +54,19 @@ bool validImageAnnotation(
   int end,
 ) {
   final block = g['block'];
+  if (g['kind'] == 'image_text') {
+    return block is int &&
+        block >= start &&
+        block < end &&
+        g['href'] is String &&
+        validImageText(g['text'], literal: g['literal'] == true) &&
+        g['literal'] is bool &&
+        formulaImageCandidates(
+          section,
+          block,
+          block + 1,
+        ).any((c) => c.$2.href == g['href']);
+  }
   return block is int &&
       block >= start &&
       block < end &&
@@ -64,7 +87,9 @@ Section composeImageAnnotations(
 ) {
   final formulas = {
     for (final g in groups.where(
-      (g) => g['kind'] == 'image_formula' && g['latex'] != '',
+      (g) =>
+          g['kind'] == 'image_formula' && g['latex'] != '' ||
+          g['kind'] == 'image_text',
     ))
       g['href'] as String: g,
   };
@@ -78,16 +103,29 @@ Section composeImageAnnotations(
           final g = formulas[image.href];
           if (g == null) return image;
           return ImageBlock(
+            ocrText: g['kind'] == 'image_text'
+                ? ImageText(
+                    g['text'] as String,
+                    literal: g['literal'] as bool,
+                    translated:
+                        image.ocrText?.text == g['text'] &&
+                            image.ocrText?.literal == g['literal']
+                        ? image.ocrText?.translated
+                        : null,
+                  )
+                : null,
             href: image.href,
             alt: image.alt,
             style: image.style,
             source: image.source,
             fixedPage: image.fixedPage,
-            formula: MathInline(
-              g['latex'] as String,
-              originalImage: image.href,
-              equationNumber: g['equation_number'] as String?,
-            ),
+            formula: g['kind'] == 'image_text'
+                ? null
+                : MathInline(
+                    g['latex'] as String,
+                    originalImage: image.href,
+                    equationNumber: g['equation_number'] as String?,
+                  ),
           );
         },
       ),
@@ -101,6 +139,7 @@ Section composeImageAnnotations(
     if (formula?.equationNumber == null || external == null) return image;
     final agrees = number(formula!.equationNumber!) == external;
     return ImageBlock(
+      ocrText: image.ocrText,
       href: image.href,
       alt: image.alt,
       style: image.style,

@@ -155,7 +155,7 @@ class _AssistantSettingsPageState extends State<AssistantSettingsPage> {
                   key: ValueKey('assistant-effort-$chosen'),
                   initialValue: settings.reasoningEffort,
                   decoration: InputDecoration(
-                    labelText: l.text('思考等级', 'Reasoning effort'),
+                    labelText: l.text('对话思考等级', 'Chat reasoning effort'),
                   ),
                   items: [
                     for (final effort in SearchCapabilities.reasoningLevels(
@@ -172,6 +172,41 @@ class _AssistantSettingsPageState extends State<AssistantSettingsPage> {
                       setState(
                         () => _settings = _settings!.copyWith(
                           reasoningEffort: effort,
+                        ),
+                      );
+                    }
+                  },
+                ),
+                DropdownButtonFormField<ReasoningEffort>(
+                  key: ValueKey('pdf-effort-$chosen'),
+                  initialValue:
+                      SearchCapabilities.reasoningLevels(
+                        settings.provider(ai),
+                        settings.resolvedModel(ai),
+                      ).contains(settings.pdfReasoningEffort)
+                      ? settings.pdfReasoningEffort
+                      : ReasoningEffort.defaultLevel,
+                  decoration: InputDecoration(
+                    labelText: l.text(
+                      'PDF 识别思考等级',
+                      'PDF discovery reasoning effort',
+                    ),
+                  ),
+                  items: [
+                    for (final effort in SearchCapabilities.reasoningLevels(
+                      settings.provider(ai),
+                      settings.resolvedModel(ai),
+                    ))
+                      DropdownMenuItem(
+                        value: effort,
+                        child: Text(effort.label),
+                      ),
+                  ],
+                  onChanged: (effort) {
+                    if (effort != null) {
+                      setState(
+                        () => _settings = _settings!.copyWith(
+                          pdfReasoningEffort: effort,
                         ),
                       );
                     }

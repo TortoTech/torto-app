@@ -1,7 +1,14 @@
 import 'ir.dart';
+import 'inline_content.dart';
 
 /// A normalized source node shared by search, selection and annotation anchors.
 class BookTextNode {
+  final List<int>? sourceOffsets;
+  int sourceOffset(int display) =>
+      source.start.textOffset +
+      (sourceOffsets == null
+          ? display
+          : sourceOffsets![display.clamp(0, sourceOffsets!.length - 1)]);
   final String? _displayId;
   String get displayId => _displayId ?? source.start.node;
   final SourceRange source;
@@ -11,6 +18,7 @@ class BookTextNode {
     this.source,
     this.text, {
     this.selectable = true,
+    this.sourceOffsets,
     String? displayId,
   }) : _displayId = displayId;
 }
@@ -18,14 +26,19 @@ class BookTextNode {
 Iterable<BookTextNode> sectionTextNodes(
   Section section, {
   bool includeNotes = false,
+  bool includeImageText = false,
 }) sync* {
   Iterable<BookTextNode> visit(Block block) sync* {
     switch (block) {
       case TextBlock():
         if (block.source != null) {
+          final projection = includeImageText
+              ? imageTextProjection(block.inlines)
+              : null;
           yield BookTextNode(
             block.source!,
-            block.plainText,
+            projection?.$1 ?? block.plainText,
+            sourceOffsets: projection?.$2,
             displayId: block.nodeId,
             selectable:
                 !block.nodeId.endsWith('@rewrite') &&
@@ -49,9 +62,13 @@ Iterable<BookTextNode> sectionTextNodes(
         for (final row in block.rows) {
           for (final cell in row.cells) {
             if (cell.source != null) {
+              final projection = includeImageText
+                  ? imageTextProjection(cell.inlines)
+                  : null;
               yield BookTextNode(
                 cell.source!,
-                cell.plainText,
+                projection?.$1 ?? cell.plainText,
+                sourceOffsets: projection?.$2,
                 displayId: cell.nodeId,
                 selectable: !cell.inlines.any(
                   (run) =>
@@ -67,6 +84,9 @@ Iterable<BookTextNode> sectionTextNodes(
           yield* visit(text);
         }
       case FigureBlock():
+        for (final image in block.images) {
+          yield* visit(image);
+        }
         for (final caption in block.captions) {
           yield* visit(caption);
         }
@@ -78,6 +98,17 @@ Iterable<BookTextNode> sectionTextNodes(
         }
       case SeparatorBlock():
         if (block.text != null) yield* visit(block.text!);
+      case ImageBlock():
+        if (includeImageText && block.ocrText != null && block.source != null) {
+          final text = block.ocrText!.displayText;
+          yield BookTextNode(
+            block.source!,
+            text,
+            displayId:
+                '${block.source!.start.spine.value}/${block.source!.start.node}@image-text',
+            sourceOffsets: List.filled(text.runes.length + 1, 0),
+          );
+        }
       default:
         break;
     }
@@ -97,6 +128,9 @@ String sourceSlice(String text, int start, int end) {
 }
 
 class TextMatch {
+  final String? displayNodeId;
+  final int? displayStart, displayEnd;
+
   /// Transient ordering hint; [range] carries the persistent section identity.
   final int sectionIndex;
   final String title, excerpt, text;
@@ -106,26 +140,57 @@ class TextMatch {
     this.title,
     this.excerpt,
     this.text,
-    this.range,
-  );
+    this.range, {
+    this.displayNodeId,
+    this.displayStart,
+    this.displayEnd,
+  });
 }
 
 /// Paragraph-level translation annotations resolve through original identity,
 /// never by treating translated character offsets as original offsets.
 Future<(List<SourceRange>, String)> resolveOriginalParagraphSelection(
   BookSource source,
-  List<SourceRange> displayed,
-) async {
+  List<SourceRange> displayed, {
+  String fallbackQuote = '',
+}) async {
   final ranges = <SourceRange>[], quotes = <String>[];
   final seen = <String>{};
   for (final range in displayed) {
     if (!seen.add('${range.start.spine.value}/${range.start.node}')) continue;
     final index = source.book.indexOfSpine(range.start.spine);
     if (index < 0) throw StateError('Unknown original paragraph');
-    final node = sectionTextNodes(
-      await source.parseSection(index),
-      includeNotes: true,
-    ).firstWhere((n) => n.source.start.node == range.start.node);
+    final section = await source.parseSection(index);
+    final node = sectionTextNodes(section, includeNotes: true)
+        .where(
+          (n) =>
+              n.source.start.node == range.start.node &&
+              n.source.start.spine == range.start.spine,
+        )
+        .firstOrNull;
+    if (node == null) {
+      SourceRange? owner;
+      for (final block in section.blocks) {
+        mapBlockContent(
+          block,
+          (text) => text,
+          image: (image) {
+            final candidate = image.source;
+            if (candidate?.start.spine == range.start.spine &&
+                candidate?.start.node == range.start.node) {
+              owner = candidate;
+            }
+            return image;
+          },
+        );
+      }
+      if (owner == null || fallbackQuote.trim().isEmpty) {
+        throw StateError('Unknown original paragraph');
+      }
+      ranges.add(owner!);
+      quotes.add(fallbackQuote);
+      continue;
+    }
     if (!node.selectable) {
       throw StateError('Original paragraph is not selectable');
     }

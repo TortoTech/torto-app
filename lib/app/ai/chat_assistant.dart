@@ -193,6 +193,8 @@ class ChatAssistant {
     required String context,
     String? bookFile,
     void Function(String)? onPartial,
+    List<Map<String, dynamic>> images = const [],
+    void Function(String)? onToolProgress,
     Future<Map<String, dynamic>> Function(
       String action,
       Map<String, dynamic> arguments,
@@ -202,7 +204,7 @@ class ChatAssistant {
   }) async {
     final tools = <Map<String, dynamic>>[];
     final sources = <Map<String, String>>[];
-    final visualImages = <Map<String, dynamic>>[];
+    final visualImages = <Map<String, dynamic>>[...images];
     final wantsOfficial =
         settings.resolvedMode(provider, model) == SearchMode.native;
     final restOfficial = const {
@@ -302,6 +304,7 @@ class ChatAssistant {
       );
       _check();
       final action = object['action'], query = object['query'];
+      if (action != 'answer') onToolProgress?.call('→ $action');
       if (action == 'answer') {
         if (nativeSearch || onPartial != null) {
           String answer;
@@ -426,6 +429,7 @@ class ChatAssistant {
         }
         _check();
         tools.add({'action': action, 'arguments': arguments, 'result': result});
+        onToolProgress?.call('✓ $action');
         continue;
       }
       if (!canSearch ||
@@ -480,6 +484,7 @@ class ChatAssistant {
           searchCache[cacheKey] = result;
         }
         sources.addAll(result);
+        onToolProgress?.call('✓ $action');
         tools.add({'action': action, 'query': query, 'results': result});
       } else {
         throw const FormatException('Unavailable assistant tool');

@@ -47,6 +47,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
 
   /// Null while the first load is in flight.
   List<LibraryBook>? _books;
+  String? _recentBookId;
 
   @override
   void initState() {
@@ -141,7 +142,17 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
     final books = [...await _store.list()];
     final activityTimes = await _progressStore.activityTimes();
     sortShelfBooks(books, activityTimes);
-    if (mounted) setState(() => _books = books);
+    final read = books.where((b) => (activityTimes[b.id] ?? 0) > 0).toList()
+      ..sort(
+        (a, b) =>
+            (activityTimes[b.id] ?? 0).compareTo(activityTimes[a.id] ?? 0),
+      );
+    if (mounted) {
+      setState(() {
+        _books = books;
+        _recentBookId = read.firstOrNull?.id;
+      });
+    }
   }
 
   Future<void> _import() async {
@@ -393,6 +404,7 @@ class _LibraryPageState extends State<LibraryPage> with WidgetsBindingObserver {
             final book = books[index];
             return _BookTile(
               book: book,
+              recent: book.id == _recentBookId,
               onTap: () => _open(book),
               onLongPress: () => _bookActions(book),
             );
@@ -420,11 +432,13 @@ void sortShelfBooks(List<LibraryBook> books, Map<String, int> readActivity) {
 
 class _BookTile extends StatelessWidget {
   final LibraryBook book;
+  final bool recent;
   final VoidCallback onTap;
   final VoidCallback onLongPress;
 
   const _BookTile({
     required this.book,
+    this.recent = false,
     required this.onTap,
     required this.onLongPress,
   });
@@ -437,7 +451,46 @@ class _BookTile extends StatelessWidget {
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        AspectRatio(aspectRatio: 0.7, child: _BookCover(book: book)),
+        AspectRatio(
+          aspectRatio: 0.7,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              _BookCover(book: book),
+              if (recent)
+                Positioned.fill(
+                  child: IgnorePointer(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        border: Border.all(
+                          color: Theme.of(context).colorScheme.primary,
+                          width: 3,
+                        ),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                    ),
+                  ),
+                ),
+              if (recent)
+                Align(
+                  alignment: Alignment.bottomCenter,
+                  child: Container(
+                    width: double.infinity,
+                    color: Theme.of(context).colorScheme.primary,
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Text(
+                      context.l10n.text('继续阅读', 'Continue reading'),
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.onPrimary,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
         const SizedBox(height: 8),
         Text(
           book.title,

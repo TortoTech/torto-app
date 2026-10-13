@@ -65,8 +65,10 @@ int semanticTextLength(Block block) => switch (block) {
 Iterable<String> semanticNodes(Block block) sync* {
   switch (block) {
     case TextBlock(:final source, :final nodeId):
+      if (source != null) yield '${source.start.spine.value}/${source.start.node}';
       yield source?.start.node ?? nodeId;
     case ImageBlock(:final source):
+      if (source != null) yield '${source.start.spine.value}/${source.start.node}';
       if (source != null) yield source.start.node;
     case FigureBlock(:final images, :final captions):
       for (final child in <Block>[...images, ...captions]) {
@@ -81,6 +83,7 @@ Iterable<String> semanticNodes(Block block) sync* {
         yield* semanticNodes(text);
       }
       for (final cell in rows.expand((row) => row.cells)) {
+        if (cell.source != null) yield '${cell.source!.start.spine.value}/${cell.source!.start.node}';
         yield cell.source?.start.node ?? cell.nodeId;
       }
     case NoteBlock(:final blocks):

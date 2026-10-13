@@ -3,6 +3,7 @@ import 'dart:isolate';
 import '../diagnostics.dart';
 
 import '../ir/ir.dart';
+import '../html_ir/paragraph_lists.dart';
 import 'translation_markup.dart';
 import 'translation_models.dart';
 
@@ -275,10 +276,9 @@ class TranslationBookSource implements BookSource {
           blocks.add(_translatedFigure(block, translation));
         case NoteBlock():
           blocks.add(_translatedNote(block, translation));
-        case ImageBlock() ||
-            SeparatorBlock() ||
-            PageBreakBlock() ||
-            LineBreakBlock():
+        case ImageBlock():
+          blocks.add(_translatedImage(block, translation.whole));
+        case SeparatorBlock() || PageBreakBlock() || LineBreakBlock():
           blocks.add(block);
       }
     }
@@ -326,6 +326,17 @@ class TranslationBookSource implements BookSource {
           for (var index = 0; index < block.captions.length; index++) {
             _appendInput(inputs, blockIndex, index, block.captions[index]);
           }
+          for (final (index, image) in block.images.indexed) {
+            final text = _imageTextBlock(image);
+            if (text != null) {
+              _appendInput(
+                inputs,
+                blockIndex,
+                block.captions.length + index,
+                text,
+              );
+            }
+          }
         case NoteBlock():
           final segments = _noteTranslationSegments(block);
           for (var index = 0; index < segments.length; index++) {
@@ -341,10 +352,10 @@ class TranslationBookSource implements BookSource {
               ),
             );
           }
-        case ImageBlock() ||
-            SeparatorBlock() ||
-            PageBreakBlock() ||
-            LineBreakBlock():
+        case ImageBlock():
+          final text = _imageTextBlock(block);
+          if (text != null) _appendInput(inputs, blockIndex, null, text);
+        case SeparatorBlock() || PageBreakBlock() || LineBreakBlock():
           break;
       }
     }
@@ -379,6 +390,48 @@ class TranslationBookSource implements BookSource {
           language: targetLanguageCode,
         ),
       );
+
+  static TextBlock? _imageTextBlock(ImageBlock image) {
+    if (image.ocrText == null || image.ocrText!.literal || image.source == null) {
+      return null;
+    }
+    return TextBlock(
+      nodeId:
+          '${image.source!.start.spine.value}/${image.source!.start.node}@image-text',
+      source: image.source,
+      inlines: [InlineImageRun(image: image, sizeScale: 1)],
+    );
+  }
+
+  ImageBlock _translatedImage(ImageBlock image, String? value) {
+    final original = _imageTextBlock(image);
+    if (value == null || original == null) return image;
+    final decoded = TranslationMarkupCodec.decode(
+      value,
+      original.inlines,
+      language: targetLanguageCode,
+    );
+    final translated = decoded
+        .whereType<InlineImageRun>()
+        .single
+        .image
+        .ocrText!;
+    return ImageBlock(
+      href: image.href,
+      alt: image.alt,
+      style: image.style,
+      source: image.source,
+      fixedPage: image.fixedPage,
+      formula: image.formula,
+      ocrText: ImageText(
+        image.ocrText!.text,
+        literal: false,
+        translated: mode == TranslationMode.replace
+            ? translated.displayText
+            : '${image.ocrText!.text}\n${translated.displayText}',
+      ),
+    );
+  }
 
   QuoteBlock _translatedQuote(
     QuoteBlock quote,
@@ -506,7 +559,13 @@ class TranslationBookSource implements BookSource {
       );
     }
     return FigureBlock(
-      images: figure.images,
+      images: [
+        for (final (index, image) in figure.images.indexed)
+          _translatedImage(
+            image,
+            translation.segments[figure.captions.length + index],
+          ),
+      ],
       captions: captions.take(figure.primaryCaptions.length).toList(),
       afterCaptions: captions.skip(figure.primaryCaptions.length).toList(),
       captionPosition: figure.captionPosition,
@@ -538,6 +597,25 @@ class TranslationBookSource implements BookSource {
         _copyText(block, inlines: translateInlines(block.inlines));
 
     late Block Function(Block block) translateBlock;
+    FigureBlock translateFigure(FigureBlock figure) {
+      final before = figure.primaryCaptions.map(translateText).toList(),
+          after = figure.afterCaptions.map(translateText).toList();
+      final images = [
+        for (final image in figure.images)
+          _imageTextBlock(image) == null
+              ? image
+              : _translatedImage(image, translation.segments[segmentIndex++]),
+      ];
+      return FigureBlock(
+        images: images,
+        captions: before,
+        afterCaptions: after,
+        captionPosition: figure.captionPosition,
+        style: figure.style,
+        source: figure.source,
+      );
+    }
+
     translateBlock = (block) => switch (block) {
       TextBlock() => translateText(block),
       QuoteBlock(:final body, :final attribution, :final source) => QuoteBlock(
@@ -574,33 +652,17 @@ class TranslationBookSource implements BookSource {
           before: before.map(translateText).toList(),
           after: after.map(translateText).toList(),
         ),
-      FigureBlock(
-        :final images,
-        :final primaryCaptions,
-        :final afterCaptions,
-        :final captionPosition,
-        :final style,
-        :final source,
-      ) =>
-        FigureBlock(
-          images: images,
-          captions: primaryCaptions.map(translateText).toList(growable: false),
-          afterCaptions: afterCaptions
-              .map(translateText)
-              .toList(growable: false),
-          captionPosition: captionPosition,
-          style: style,
-          source: source,
-        ),
+      FigureBlock() => translateFigure(block),
       NoteBlock(:final kind, :final blocks, :final source) => NoteBlock(
         kind: kind,
         blocks: blocks.map(translateBlock).toList(growable: false),
         source: source,
       ),
-      ImageBlock() ||
-      SeparatorBlock() ||
-      PageBreakBlock() ||
-      LineBreakBlock() => block,
+      ImageBlock() =>
+        _imageTextBlock(block) == null
+            ? block
+            : _translatedImage(block, translation.segments[segmentIndex++]),
+      SeparatorBlock() || PageBreakBlock() || LineBreakBlock() => block,
     };
 
     return NoteBlock(
@@ -626,13 +688,23 @@ class TranslationBookSource implements BookSource {
       TableBlock() when segmentIndex != null =>
         block.translationSegments.elementAtOrNull(segmentIndex)?.inlines,
       FigureBlock() when segmentIndex != null =>
-        block.captions.elementAtOrNull(segmentIndex)?.inlines,
+        segmentIndex < block.captions.length
+            ? block.captions.elementAtOrNull(segmentIndex)?.inlines
+            : _imageTextBlockOrNull(
+                block.images.elementAtOrNull(
+                  segmentIndex - block.captions.length,
+                ),
+              )?.inlines,
+      ImageBlock() when segmentIndex == null => _imageTextBlock(block)?.inlines,
       NoteBlock() when segmentIndex != null => _noteTranslationSegments(
         block,
       ).elementAtOrNull(segmentIndex)?.inlines,
       _ => null,
     };
   }
+
+  static TextBlock? _imageTextBlockOrNull(ImageBlock? image) =>
+      image == null ? null : _imageTextBlock(image);
 
   static List<({List<Inline> inlines, String nodeId})> _noteTranslationSegments(
     NoteBlock note,
@@ -656,12 +728,16 @@ class TranslationBookSource implements BookSource {
           }
         case FigureBlock(:final captions):
           captions.forEach(addText);
+          for (final image in block.images) {
+            final text = _imageTextBlock(image);
+            if (text != null) addText(text);
+          }
         case NoteBlock(:final blocks):
           blocks.forEach(visit);
-        case ImageBlock() ||
-            SeparatorBlock() ||
-            PageBreakBlock() ||
-            LineBreakBlock():
+        case ImageBlock():
+          final text = _imageTextBlock(block);
+          if (text != null) addText(text);
+        case SeparatorBlock() || PageBreakBlock() || LineBreakBlock():
           break;
       }
     }
@@ -686,6 +762,7 @@ class TranslationBookSource implements BookSource {
     String? nodeId,
     bool? listMarkerVisible,
   }) => TextBlock(
+    authoredListMarkerImage: block.authoredListMarkerImage,
     kind: block.kind,
     headingLevel: block.headingLevel,
     headingOrdinal: block.headingOrdinal,
@@ -694,6 +771,10 @@ class TranslationBookSource implements BookSource {
     listDepth: block.listDepth,
     listGroupId: block.listGroupId,
     listMarkerVisible: listMarkerVisible ?? block.listMarkerVisible,
+    authoredListMarkerChars:
+        block.authoredListMarkerChars == 0 || inlines == null
+        ? block.authoredListMarkerChars
+        : authoredListPrefixLength(inlines),
     inlines: inlines ?? block.inlines,
     style: style ?? block.style,
     source: clearSource ? null : (source ?? block.source),

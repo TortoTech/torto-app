@@ -327,6 +327,15 @@ class ImageFraction extends ImageLength {
 }
 
 class ImageStyle {
+  final double containerFraction;
+  final double? containerPixels;
+  double containingWidth(double width) {
+    final fraction = width * containerFraction;
+    return containerPixels == null || containerPixels! > fraction
+        ? fraction
+        : containerPixels!;
+  }
+
   final ImageLength? width;
   final ImageLength? height;
   final ImageLength? maxWidth;
@@ -338,6 +347,8 @@ class ImageStyle {
   final double marginAfter;
 
   const ImageStyle({
+    this.containerFraction = 1,
+    this.containerPixels,
     this.width,
     this.height,
     this.maxWidth,

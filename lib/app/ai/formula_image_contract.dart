@@ -12,7 +12,14 @@ const formulaImageSchema = {
       'items': {
         'type': 'object',
         'additionalProperties': false,
-        'required': ['image_id', 'status', 'latex', 'equation_number'],
+        'required': [
+          'image_id',
+          'status',
+          'latex',
+          'equation_number',
+          'text',
+          'literal',
+        ],
         'properties': {
           'image_id': {
             'type': 'integer',
@@ -21,9 +28,15 @@ const formulaImageSchema = {
           },
           'status': {
             'type': 'string',
-            'enum': ['recognized', 'not_formula', 'unreadable'],
+            'enum': [
+              'recognized',
+              'not_formula',
+              'unreadable',
+              'recognized_text',
+              'unreadable_text',
+            ],
             'description':
-                'recognized: the entire meaningful image is faithfully representable as math, a symbol or a formal production rule. not_formula: a diagram, plot, table, photo, decorative art or prose, even if it contains equations. unreadable: a formula with ambiguous essential details or unsupported notation. Both latex and equation_number must be null for either negative status.',
+                'recognized: the entire meaningful image is faithfully representable as math, a symbol or a formal production rule. recognized_text: the entire meaningful image is plain Unicode text, including character and script examples. unreadable_text: a text image with ambiguous essential glyphs. not_formula: a diagram, plot, table, photo or decorative art, even if it contains equations. unreadable: a formula with ambiguous essential details or unsupported notation. Both latex and equation_number must be null unless status is recognized.',
           },
           'latex': {
             'type': ['string', 'null'],
@@ -34,6 +47,16 @@ const formulaImageSchema = {
             'type': ['string', 'null'],
             'description':
                 'Separate equation number visibly printed inside this image; exclude it from latex. Never copy or infer a number from adjacent HTML or context. Null when absent or for a negative status.',
+          },
+          'text': {
+            'type': ['string', 'null'],
+            'description':
+                'Exact faithful Unicode for recognized_text, preserving glyphs, accents, meaningful spaces and line breaks. Null for every other status.',
+          },
+          'literal': {
+            'type': 'boolean',
+            'description':
+                'True only for character or script examples that must remain untranslated; false for ordinary words/prose and non-text results.',
           },
         },
       },
@@ -46,7 +69,6 @@ Future<({String transcribe, String verify})> formulaImagePrompts() async {
   return (
     transcribe:
         '$base\n${await rootBundle.loadString('assets/ai/formula_transcribe.md')}',
-    verify:
-        '$base\n${await rootBundle.loadString('assets/ai/formula_verify.md')}',
+    verify: '',
   );
 }

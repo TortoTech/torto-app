@@ -1148,7 +1148,7 @@ void main() {
   );
 
   test(
-    'unified tables preserve authored alignment and center unspecified cells',
+    'unified tables preserve authored alignment and start-align unspecified cells',
     () {
       final table = TableBlock(
         rows: const [
@@ -1166,7 +1166,7 @@ void main() {
       final centered = cells[0].paragraph.getBoxesForRange(0, 1).single;
       final authoredStart = cells[1].paragraph.getBoxesForRange(0, 1).single;
 
-      expect(centered.left, greaterThan(0));
+      expect(centered.left, closeTo(0, _eps));
       expect(authoredStart.left, closeTo(0, _eps));
       _disposeAll(pages);
     },

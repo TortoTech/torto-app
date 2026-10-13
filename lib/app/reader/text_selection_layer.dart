@@ -32,10 +32,21 @@ class ReaderSelection {
 }
 
 class ReaderPaintMark {
+  final String? displayNodeId;
+  final int? displayStart, displayEnd;
   final SourceRange range;
   final Color color;
   final String? annotationId;
-  const ReaderPaintMark(this.range, this.color, [this.annotationId]);
+  const ReaderPaintMark(this.range, this.color, [this.annotationId])
+    : displayNodeId = null,
+      displayStart = null,
+      displayEnd = null;
+  ReaderPaintMark.search(TextMatch match, this.color)
+    : range = match.range,
+      annotationId = null,
+      displayNodeId = match.displayNodeId,
+      displayStart = match.displayStart,
+      displayEnd = match.displayEnd;
 }
 
 /// Use each line's maximum font box for every run on that line. Tight glyph
@@ -49,6 +60,7 @@ List<Rect> selectionLineBoxes(ui.Paragraph paragraph, int start, int end) =>
 /// The retained paragraphs are the single source of glyph geometry. No second
 /// hidden Text widget is laid out for hit-testing or highlight painting.
 class _Surface {
+  final List<int> sourceMapping;
   final ui.Paragraph paragraph;
   final Offset origin;
   final Rect clip;
@@ -68,10 +80,11 @@ class _Surface {
     this.prefix,
     this.images,
     this.sourceNode,
+    this.sourceMapping,
   );
   int toSource(int display) => mapping[display.clamp(0, mapping.length - 1)];
-  int toDisplay(int source, {bool end = false}) {
-    final map = mapping;
+  int toDisplay(int source, {bool end = false, bool canonical = false}) {
+    final map = canonical ? sourceMapping : mapping;
     if (end) {
       final i = map.indexWhere((v) => v >= source);
       return i < 0 ? map.length - 1 : i;
@@ -84,11 +97,28 @@ class _Surface {
     return last;
   }
 
-  List<Rect> boxes(int start, int end) =>
-      selectionLineBoxes(paragraph, toDisplay(start), toDisplay(end, end: true))
-          .map((b) => b.shift(origin).intersect(clip))
-          .where((r) => !r.isEmpty)
-          .toList();
+  List<Rect> boxes(int start, int end, {bool canonical = false}) {
+    if (canonical && start == end) {
+      final matching = [
+        for (var i = 0; i < sourceMapping.length; i++)
+          if (sourceMapping[i] == start) i,
+      ];
+      if (matching.length > 1) {
+        return selectionLineBoxes(paragraph, matching.first, matching.last)
+            .map((b) => b.shift(origin).intersect(clip))
+            .where((r) => !r.isEmpty)
+            .toList();
+      }
+    }
+    return selectionLineBoxes(
+          paragraph,
+          toDisplay(start, canonical: canonical),
+          toDisplay(end, end: true, canonical: canonical),
+        )
+        .map((b) => b.shift(origin).intersect(clip))
+        .where((r) => !r.isEmpty)
+        .toList();
+  }
 }
 
 List<_Surface> _surfaces(PageLayout page) => [
@@ -100,10 +130,11 @@ List<_Surface> _surfaces(PageLayout page) => [
         Rect.fromLTWH(item.x, item.y, item.width, item.sliceHeight),
         item.nodeId,
         item.source?.start.spine,
-        item.displayToSource,
+        item.displayToSelection ?? item.displayToSource,
         item.syntheticPrefixLength,
-        item.inlineImages,
+        item.inlineImages.where((i) => i.ruby == null).toList(),
         item.source?.start.node ?? item.nodeId,
+        item.displayToSource,
       )
     else if (item is TableCellPlacement)
       _Surface(
@@ -112,10 +143,11 @@ List<_Surface> _surfaces(PageLayout page) => [
         item.rect.deflate(item.padding),
         item.nodeId,
         item.source?.start.spine,
-        item.displayToSource,
+        item.displayToSelection ?? item.displayToSource,
         0,
-        item.inlineImages,
+        item.inlineImages.where((i) => i.ruby == null).toList(),
         item.source?.start.node ?? item.nodeId,
+        item.displayToSource,
       ),
 ];
 
@@ -272,12 +304,12 @@ class ReaderSelectionLayerState extends State<ReaderSelectionLayer> {
           start: SourceAnchor(
             spine: node.source.start.spine,
             node: node.source.start.node,
-            textOffset: start,
+            textOffset: node.sourceOffset(start),
           ),
           end: SourceAnchor(
             spine: node.source.start.spine,
             node: node.source.start.node,
-            textOffset: end,
+            textOffset: node.sourceOffset(end),
           ),
         ),
       );
@@ -295,6 +327,7 @@ class ReaderSelectionLayerState extends State<ReaderSelectionLayer> {
           widget.wholeParagraphMarks
               ? surface.mapping.last
               : range.end.textOffset,
+          canonical: true,
         ),
   ];
   @override
@@ -303,7 +336,38 @@ class ReaderSelectionLayerState extends State<ReaderSelectionLayer> {
     final boxes = selection == null
         ? <Rect>[]
         : <Rect>{
-            for (final range in selection.ranges) ..._boxes(range),
+            for (
+              var index = math.min(_start!.$1, _end!.$1);
+              index <= math.max(_start!.$1, _end!.$1);
+              index++
+            )
+              for (final surface in _text.where(
+                (s) => s.node == widget.nodes[index].displayId,
+              ))
+                ...surface.boxes(
+                  index == math.min(_start!.$1, _end!.$1)
+                      ? selectionUnit(
+                          widget.nodes[index].text,
+                          _start!.$1 < _end!.$1 ||
+                                  _start!.$1 == _end!.$1 &&
+                                      _start!.$2 < _end!.$2
+                              ? _start!.$2
+                              : _end!.$2,
+                          widget.mode,
+                        ).$1
+                      : 0,
+                  index == math.max(_start!.$1, _end!.$1)
+                      ? selectionUnit(
+                          widget.nodes[index].text,
+                          _start!.$1 > _end!.$1 ||
+                                  _start!.$1 == _end!.$1 &&
+                                      _start!.$2 > _end!.$2
+                              ? _start!.$2
+                              : _end!.$2,
+                          widget.mode,
+                        ).$2
+                      : widget.nodes[index].text.runes.length,
+                ),
           }.toList();
     final toolbarWidth = (widget.canAnnotate ? 4 : 2) * 48.0 + 8;
     void move(Offset position, bool start) {
@@ -339,7 +403,19 @@ class ReaderSelectionLayerState extends State<ReaderSelectionLayer> {
               child: CustomPaint(
                 painter: _SelectionPainter([
                   for (final mark in widget.marks)
-                    for (final rect in _boxes(mark.range)) (rect, mark.color),
+                    if (mark.displayNodeId != null &&
+                        mark.displayStart != null &&
+                        mark.displayEnd != null)
+                      for (final surface in _text.where(
+                        (s) => s.node == mark.displayNodeId,
+                      ))
+                        for (final rect in surface.boxes(
+                          mark.displayStart!,
+                          mark.displayEnd!,
+                        ))
+                          (rect, mark.color)
+                    else
+                      for (final rect in _boxes(mark.range)) (rect, mark.color),
                   for (final rect in boxes) (rect, const Color(0x555299F5)),
                 ]),
               ),

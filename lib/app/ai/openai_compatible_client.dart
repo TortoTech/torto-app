@@ -34,6 +34,8 @@ String translationSystemPrompt(
 - <strong>、<em>、<i>、<cite>、<t-italic>、<u>、<s>、<sup>、<sub>、<noteback> 及其闭合标签是行内结构标记。必须把完整标签移动到译文中语义对应的词语或句子周围，不得翻译、删除、拆分或把样式扩展到标签范围之外。
 - Preserve each <t-note-N/> footnote reference and <t-web-N/> website exactly once, attached to its corresponding claim. Never translate, expand or renumber these source identities. Keep literal websites unchanged.
 - Translate contents of <inlinefootnote id="N">...</inlinefootnote> and <citation id="N">...</citation>, preserving each group and its ID exactly once. Keep bibliographic names and years accurate; never invent or merge IDs. Untagged paragraphs must not acquire citation tags. Numeric paragraph JSON keys are not citation IDs.
+- Preserve each <t-img-N/> inline image exactly once at its corresponding semantic position. Never remove, duplicate, expand or renumber image identities.
+- Paired <t-img-N>...</t-img-N> tags contain recognized image text: translate ordinary words while preserving the matching ID and tag form. For <t-img-N keep="1">...</t-img-N>, preserve the content byte-for-byte as a literal character/script example. Never convert images between paired and self-closing forms.
 - <t-math-0/>、<t-math-1/> 等自闭合标签是不可修改的公式占位符。可以随语序移动到对应位置，但每个占位符必须原样保留且恰好出现一次，绝不能翻译、展开、删除、重复、重编号或改写其中的公式。
 $fixedPageSection
 # 输出格式
@@ -117,7 +119,7 @@ class OpenAiCompatibleClient {
     final content = await LlmTransport(_client).generate(
       provider: provider,
       model: model,
-      system: compact ? SemanticWire.instructions(prompt) : prompt,
+      system: compact ? SemanticWire.instructions(prompt, [input]) : prompt,
       input: compact ? SemanticWire.convert(input) : input,
       images: images,
       schema: compact ? SemanticWire.schema(schema) : schema,

@@ -5,13 +5,13 @@ import '../semantic_layout/web_links.dart';
 
 class TranslationMarkupCodec {
   static final _tokenPattern = RegExp(
-    r'</?(?:strong|em|i|cite|citation|torto-italic|u|s|sup|sub|noteref|noteback|inlinefootnote|torto-size|torto-size-[0-9]+)>|<torto-math-(\d+)/>|<torto-size scale="([^"<>]*)">|<torto-protected-(\d+)/>|<citation id="([1-9][0-9]*)">',
+    r'</?(?:strong|em|i|cite|citation|torto-italic|u|s|sup|sub|noteref|noteback|inlinefootnote|torto-size|torto-size-[0-9]+)>|<torto-math-(\d+)/>|<torto-size scale="([^"<>]*)">|<torto-protected-(\d+)/>|<citation id="([1-9][0-9]*)">|<t-img-(\d+)(?:/>|( keep="1")?>([^<>]*)</t-img-\5>)',
   );
 
   static String encode(List<Inline> inlines) {
     inlines = translationInlines(inlines);
     final output = StringBuffer();
-    var mathIndex = 0;
+    var mathIndex = 0, imageIndex = 0;
     var websiteIndex = 0, noteIndex = 0, inlineNoteIndex = 0, citation = 0;
     for (final inline in inlines) {
       final nextCitation = inline is TextRun ? inline.style.inlineCitation : 0;
@@ -83,7 +83,12 @@ class TranslationMarkupCodec {
         case MathInline():
           output.write('<torto-math-${mathIndex++}/>');
         case InlineImageRun():
-          break;
+          final index = imageIndex++, text = inline.image.ocrText;
+          output.write(
+            text == null
+                ? '<t-img-$index/>'
+                : '<t-img-$index${text.literal ? ' keep="1"' : ''}>${text.text}</t-img-$index>',
+          );
       }
     }
     if (citation != 0) output.write('</citation>');
@@ -100,6 +105,43 @@ class TranslationMarkupCodec {
     bool requireSizeMarkup = false,
   }) {
     original = translationInlines(original);
+    translated = translated
+        .replaceAll('<t-image-', '<t-img-')
+        .replaceAll('</t-image-', '</t-img-')
+        .replaceAll('<torto-image-', '<t-img-')
+        .replaceAll('</torto-image-', '</t-img-');
+    final images = original.whereType<InlineImageRun>().toList(growable: false);
+    final imageTokens = _tokenPattern
+        .allMatches(translated)
+        .where((m) => m[5] != null)
+        .toList();
+    final imageIds = imageTokens.map((m) => int.parse(m[5]!)).toList()..sort();
+    final hasImageMarkup = translated.contains('<t-img-');
+    if (hasImageMarkup || requireSizeMarkup && images.isNotEmpty) {
+      if (imageIds.length != images.length ||
+          List.generate(
+            imageIds.length,
+            (i) => i,
+          ).any((i) => imageIds[i] != i) ||
+          translated.replaceAll(_tokenPattern, '').contains('t-img-')) {
+        throw const FormatException('Translation changed image identities.');
+      }
+      for (final token in imageTokens) {
+        final original = images[int.parse(token[5]!)].image.ocrText;
+        final text = token[7], literal = token[6] != null;
+        if ((original == null) != (text == null) ||
+            original != null &&
+                (literal != original.literal ||
+                    literal && text != original.text ||
+                    text!.trim().isEmpty ||
+                    text.length > 4096 ||
+                    text.contains(RegExp(r'[\x00-\x09\x0B-\x1F\uFFFD]')))) {
+          throw const FormatException(
+            'Translation changed image text identities.',
+          );
+        }
+      }
+    }
     final identity =
         (requireSizeMarkup && !translated.contains('<torto-')) ||
         translated.contains(
@@ -251,7 +293,33 @@ class TranslationMarkupCodec {
       );
       final token = match.group(0)!;
       final mathIndex = match.group(1);
-      if (match.group(3) != null) {
+      if (match.group(5) != null) {
+        final run = images[int.parse(match.group(5)!)], image = run.image;
+        final text = image.ocrText;
+        output.add(
+          text == null
+              ? run
+              : InlineImageRun(
+                  sizeScale: run.sizeScale,
+                  intrinsicSizing: run.intrinsicSizing,
+                  verticalAlign: run.verticalAlign,
+                  presentation: run.presentation,
+                  image: ImageBlock(
+                    href: image.href,
+                    alt: image.alt,
+                    style: image.style,
+                    source: image.source,
+                    fixedPage: image.fixedPage,
+                    formula: image.formula,
+                    ocrText: ImageText(
+                      text.text,
+                      literal: text.literal,
+                      translated: match[7],
+                    ),
+                  ),
+                ),
+        );
+      } else if (match.group(3) != null) {
         output.add(protected[int.parse(match.group(3)!)]);
       } else if (match.group(4) != null) {
         stack.add(
@@ -322,7 +390,11 @@ class TranslationMarkupCodec {
     if (stack.length != 1) {
       throw const FormatException('Translation left inline markup unclosed.');
     }
-    _restoreInlineImages(output, original);
+    // Older cached translations did not encode images. Keep their readable
+    // fallback, while new requests must preserve explicit source identities.
+    if (!hasImageMarkup && !requireSizeMarkup) {
+      _restoreInlineImages(output, original);
+    }
     return output;
   }
 

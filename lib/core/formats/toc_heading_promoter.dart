@@ -185,6 +185,7 @@ Section promoteTocHeadings(Section section, List<TocHeadingHint> hints) {
     return section;
   }
   return Section(
+    continuationQuote: section.continuationQuote,
     id: section.id,
     spineIndex: section.spineIndex,
     href: section.href,

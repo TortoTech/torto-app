@@ -1,31 +1,73 @@
 import 'ir.dart';
 
-TextBlock withInlines(TextBlock b, List<Inline> inlines) => TextBlock(
-  inlines: inlines,
-  nodeId: b.nodeId,
-  source: b.source,
-  style: b.style,
-  kind: b.kind,
-  headingLevel: b.headingLevel,
-  headingOrdinal: b.headingOrdinal,
-  listOrdered: b.listOrdered,
-  listOrdinal: b.listOrdinal,
-  listDepth: b.listDepth,
-  listGroupId: b.listGroupId,
-  listMarkerVisible: b.listMarkerVisible,
-);
+TextBlock withInlines(TextBlock b, List<Inline> inlines, {String? nodeId}) =>
+    TextBlock(
+      authoredListMarkerImage: b.authoredListMarkerImage,
+      authoredListMarkerChars: b.authoredListMarkerChars,
+      inlines: inlines,
+      nodeId: nodeId ?? b.nodeId,
+      source: b.source,
+      style: b.style,
+      kind: b.kind,
+      headingLevel: b.headingLevel,
+      headingOrdinal: b.headingOrdinal,
+      listOrdered: b.listOrdered,
+      listOrdinal: b.listOrdinal,
+      listDepth: b.listDepth,
+      listGroupId: b.listGroupId,
+      listMarkerVisible: b.listMarkerVisible,
+    );
 
 TextRun withRun(TextRun run, String text, {TextStyle? style, String? link}) =>
-    TextRun(
-      text,
-      style: style ?? run.style,
-      link: link ?? run.link,
-      language: run.language,
-      displayWritingSystem: run.displayWritingSystem,
-    );
+    run is ImageTextRun
+    ? ImageTextRun(
+        text,
+        run.originalImage,
+        literal: run.literal,
+        style: style ?? run.style,
+        link: link ?? run.link,
+      )
+    : run is RubyRun && text == run.text
+    ? RubyRun(
+        base: [
+          for (final b in run.base)
+            TextRun(
+              b.text,
+              style: style ?? b.style,
+              link: link ?? b.link,
+              language: b.language,
+            ),
+        ],
+        annotation: run.annotation,
+        below: run.below,
+      )
+    : TextRun(
+        text,
+        style: style ?? run.style,
+        link: link ?? run.link,
+        language: run.language,
+        displayWritingSystem: run.displayWritingSystem,
+      );
 
 /// Caption numbering is emphasized without changing authored source offsets.
 List<Inline> emphasizeCaptionLabel(List<Inline> inlines) {
+  inlines = [
+    for (final inline in inlines)
+      if (inline is TextRun)
+        withRun(
+          inline,
+          inline.text,
+          style: inline.style.copyWith(
+            bold: false,
+            italic: false,
+            emphasis: false,
+            alternateVoice: false,
+            citation: false,
+          ),
+        )
+      else
+        inline,
+  ];
   final prefix = inlines
       .takeWhile((inline) => inline is TextRun)
       .cast<TextRun>()
@@ -165,9 +207,50 @@ Block mapBlockContent(
 }
 
 Section withBlocks(Section section, List<Block> blocks) => Section(
+  continuationQuote: section.continuationQuote,
   id: section.id,
   spineIndex: section.spineIndex,
   href: section.href,
   anchors: section.anchors,
   blocks: blocks,
 );
+
+List<Inline> presentImageText(List<Inline> inlines) => [
+  for (final inline in inlines)
+    if (inline is InlineImageRun && inline.image.ocrText != null)
+      ImageTextRun(
+        inline.image.ocrText!.displayText,
+        inline.image.href,
+        literal: inline.image.ocrText!.literal,
+      )
+    else
+      inline,
+];
+
+(String, List<int>) imageTextProjection(List<Inline> inlines) {
+  final text = StringBuffer(), offsets = <int>[0];
+  var source = 0;
+  void append(String value, {bool derived = false}) {
+    text.write(value);
+    for (final _ in value.runes) {
+      if (!derived) source++;
+      offsets.add(source);
+    }
+  }
+
+  for (final inline in presentImageText(inlines)) {
+    switch (inline) {
+      case ImageTextRun():
+        append(inline.text, derived: true);
+      case TextRun():
+        append(inline.text);
+      case BreakInline():
+        if (!inline.synthetic) append('\n');
+      case MathInline():
+        append(inline.sourceText);
+      case InlineImageRun():
+        break;
+    }
+  }
+  return (text.toString(), offsets);
+}

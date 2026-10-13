@@ -2,8 +2,22 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/layout/layout_types.dart';
 
+enum FocusStyle { highlight, dimSurroundings }
+
 /// Persists reader-wide presentation choices shared by every book.
 class ReaderPreferencesStore {
+  Future<FocusStyle> loadFocusStyle() async {
+    try {
+      final name = (await _preferences).getString('reader_focus_style_v1');
+      return FocusStyle.values.where((v) => v.name == name).firstOrNull ??
+          FocusStyle.dimSurroundings;
+    } catch (_) {
+      return FocusStyle.dimSurroundings;
+    }
+  }
+
+  Future<void> saveFocusStyle(FocusStyle value) async =>
+      (await _preferences).setString('reader_focus_style_v1', value.name);
   static const _typesettingModeKey = 'reader_typesetting_mode_v1';
   static const _darkModeKey = 'reader_dark_mode_v1';
   // Legacy global font keys retained only as a migration fallback.

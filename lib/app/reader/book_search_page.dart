@@ -107,8 +107,9 @@ class BookSearchChoice {
 }
 
 class BookSearchPage extends StatefulWidget {
+  final Stream<(List<TextMatch>, double)> Function(String)? search;
   final File file;
-  const BookSearchPage({super.key, required this.file});
+  const BookSearchPage({super.key, required this.file, this.search});
   @override
   State<BookSearchPage> createState() => _BookSearchPageState();
 }
@@ -146,6 +147,26 @@ class _BookSearchPageState extends State<BookSearchPage> {
 
   Future<void> _search(String value) async {
     final generation = _generation;
+    if (widget.search != null) {
+      try {
+        await for (final (batch, progress) in widget.search!(value)) {
+          if (!mounted || generation != _generation) return;
+          setState(() {
+            _results.addAll(batch);
+            _progress = progress;
+          });
+        }
+        if (mounted && generation == _generation) setState(() => _busy = false);
+      } catch (_) {
+        if (mounted && generation == _generation) {
+          setState(() {
+            _busy = false;
+            _error = context.l10n.text('搜索失败，请重试', 'Search failed. Try again.');
+          });
+        }
+      }
+      return;
+    }
     final port = ReceivePort();
     _port = port;
     port.listen((message) {

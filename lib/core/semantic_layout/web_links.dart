@@ -41,6 +41,7 @@ List<Inline> detectWebLinks(List<Inline> inlines) {
   final output = <Inline>[];
   for (final inline in inlines) {
     if (inline is! TextRun ||
+        inline is ImageTextRun && inline.literal ||
         inline.style.inlineCitation > 0 ||
         inline.style.inlineRole != InlineRole.normal ||
         inline.style.linkRole != LinkRole.normal) {
@@ -100,7 +101,11 @@ List<Inline> detectWebLinks(List<Inline> inlines) {
 List<Inline> coalesceReferences(List<Inline> inlines) {
   final out = <Inline>[];
   for (final inline in inlines) {
-    if (inline is TextRun && out.lastOrNull is TextRun) {
+    if (inline is TextRun &&
+        out.lastOrNull is TextRun &&
+        (inline is ImageTextRun) == (out.last is ImageTextRun) &&
+        (inline is! ImageTextRun ||
+            (out.last as ImageTextRun).originalImage == inline.originalImage)) {
       final previous = out.last as TextRun;
       if ((inline.style.inlineCitation > 0 &&
               inline.style.inlineCitation == previous.style.inlineCitation) ||

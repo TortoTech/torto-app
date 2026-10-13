@@ -38,7 +38,9 @@ import '../ai/translation_glossary.dart';
 import '../ai/pdf_discovery_service.dart';
 import '../progress_store.dart';
 import '../sync/derived_data_store.dart';
+import '../../core/formats/reading_continuations.dart';
 import '../../core/formats/pdf/pdf_ocr_book_source.dart';
+import '../../core/formats/pdf/pdf_native_book_source.dart';
 
 // Keep the isolate closure outside controller methods: their closure contexts
 // can retain native UI resources and cannot cross an isolate boundary.
@@ -119,12 +121,70 @@ class ReaderController extends ChangeNotifier {
       _textNodeCache[key] = cached;
       return cached.$2;
     }
-    final nodes = sectionTextNodes(section, includeNotes: true).toList();
+    final nodes = sectionTextNodes(
+      section,
+      includeNotes: true,
+      includeImageText:
+          displayed && _style.typesettingMode == TypesettingMode.unified,
+    ).toList();
     _textNodeCache[key] = (section, nodes);
     while (_textNodeCache.length > 6) {
       _textNodeCache.remove(_textNodeCache.keys.first);
     }
     return nodes;
+  }
+
+  Stream<(List<TextMatch>, double)> searchReadingText(String query) async* {
+    final source = _translationSource?.inner ?? _resourceSource;
+    if (source == null || query.trim().isEmpty) return;
+    var found = 0;
+    for (
+      var i = 0;
+      i < source.book.sectionCount && !_disposed && found < 200;
+      i++
+    ) {
+      final section = await source.parseSection(i), batch = <TextMatch>[];
+      for (final node in sectionTextNodes(section, includeImageText: true)) {
+        for (final (start, end) in sourceMatches(
+          node.text,
+          query.trim(),
+          caseSensitive: false,
+        )) {
+          final length = node.text.runes.length;
+          batch.add(
+            TextMatch(
+              i,
+              '${i + 1}',
+              sourceSlice(
+                node.text,
+                (start - 60).clamp(0, length),
+                (end + 60).clamp(0, length),
+              ),
+              sourceSlice(node.text, start, end),
+              SourceRange(
+                start: SourceAnchor(
+                  spine: node.source.start.spine,
+                  node: node.source.start.node,
+                  textOffset: node.sourceOffset(start),
+                ),
+                end: SourceAnchor(
+                  spine: node.source.start.spine,
+                  node: node.source.start.node,
+                  textOffset: node.sourceOffset(end),
+                ),
+              ),
+              displayNodeId: node.sourceOffsets == null ? null : node.displayId,
+              displayStart: node.sourceOffsets == null ? null : start,
+              displayEnd: node.sourceOffsets == null ? null : end,
+            ),
+          );
+          if (++found >= 200) break;
+        }
+        if (found >= 200) break;
+      }
+      yield (batch, (i + 1) / source.book.sectionCount);
+      await Future<void>.delayed(Duration.zero);
+    }
   }
 
   Future<void> saveAnnotation(
@@ -143,7 +203,9 @@ class ReaderController extends ChangeNotifier {
         if (index < 0) throw StateError('Unknown source section');
         final nodes = await textNodes(index);
         final node = nodes.firstWhere(
-          (n) => n.source.start.node == range.start.node,
+          (n) =>
+              n.source.start.node == range.start.node &&
+              n.source.start.spine == range.start.spine,
         );
         if (!node.selectable ||
             range.end.spine != range.start.spine ||
@@ -172,8 +234,13 @@ class ReaderController extends ChangeNotifier {
   }
 
   Future<(List<SourceRange>, String)> originalParagraphSelection(
-    List<SourceRange> displayed,
-  ) => resolveOriginalParagraphSelection(_resourceSource!, displayed);
+    List<SourceRange> displayed, {
+    String fallbackQuote = '',
+  }) => resolveOriginalParagraphSelection(
+    _resourceSource!,
+    displayed,
+    fallbackQuote: fallbackQuote,
+  );
 
   Future<List<SourceRange>?> resolveAnnotation(
     AnnotationState annotation,
@@ -188,9 +255,11 @@ class ReaderController extends ChangeNotifier {
             range.start.node != range.end.node) {
           return null;
         }
-        final node = (await textNodes(
-          index,
-        )).firstWhere((n) => n.source.start.node == range.start.node);
+        final node = (await textNodes(index)).firstWhere(
+          (n) =>
+              n.source.start.node == range.start.node &&
+              n.source.start.spine == range.start.spine,
+        );
         quotes.add(
           sourceSlice(node.text, range.start.textOffset, range.end.textOffset),
         );
@@ -244,6 +313,40 @@ class ReaderController extends ChangeNotifier {
     return true;
   }
 
+  Future<bool> goToSearchMatch(TextMatch match) async {
+    if (!await goToTextRange(match.range)) return false;
+    if (match.displayNodeId == null || match.displayStart == null) return true;
+    TextPlacement? target;
+    for (final (index, page) in currentPages.indexed) {
+      for (final text in page.items.whereType<TextPlacement>()) {
+        final map = text.displayToSelection;
+        if (text.nodeId != match.displayNodeId || map == null) continue;
+        final position = text.paragraph
+            .getPositionForOffset(ui.Offset(0, text.sliceTop + .1))
+            .offset;
+        if (map[position.clamp(0, map.length - 1)] <= match.displayStart!) {
+          pageIndex = index;
+          target = text;
+        }
+      }
+    }
+    notifyListeners();
+    if (_style.focusMode && target != null) {
+      final map = target.displayToSelection!;
+      final offset = map.indexWhere((value) => value >= match.displayStart!);
+      final boxes = target.paragraph.getBoxesForRange(
+        offset.clamp(0, map.length - 1),
+        (offset + 1).clamp(0, map.length - 1),
+      );
+      if (boxes.isNotEmpty) {
+        scrollFocus(
+          target.y - target.sliceTop + boxes.first.top - _style.marginTop,
+        );
+      }
+    }
+    return true;
+  }
+
   final ProgressStore progressStore;
   final String? titleHint;
   final String? publicationIdHint;
@@ -273,6 +376,7 @@ class ReaderController extends ChangeNotifier {
   RewriteBookSource? _rewriteSource;
   bool _assistantLayoutActive = false;
   BookSource? get assistantSource => _resourceSource;
+  BookSource? get previewSource => _source;
   bool get hasTemporaryRewrites =>
       _rewriteSource?.replacements.isNotEmpty ?? false;
   Future<void> clearTemporaryRewrites() async {
@@ -418,6 +522,7 @@ class ReaderController extends ChangeNotifier {
                   'citation',
                   'text_formula',
                   'image_formula',
+                  'image_text',
                 }.contains(g['kind']),
               )
               .map((g) => g['block'] as int)
@@ -439,16 +544,26 @@ class ReaderController extends ChangeNotifier {
     for (final item in displayPage?.items ?? []) {
       switch (item) {
         case TextPlacement(:final nodeId, :final source):
-          nodes.add(source?.start.node ?? nodeId);
+          nodes.add(
+            source == null
+                ? nodeId
+                : '${source.start.spine.value}/${source.start.node}',
+          );
         case TableCellPlacement(:final nodeId, :final source):
-          nodes.add(source?.start.node ?? nodeId);
+          nodes.add(
+            source == null
+                ? nodeId
+                : '${source.start.spine.value}/${source.start.node}',
+          );
         case ImagePlacement(:final href):
           images.add(href);
         default:
           break;
       }
     }
-    if (readingAnchor case final anchor?) nodes.add(anchor.node);
+    if (readingAnchor case final anchor?) {
+      nodes.add('${anchor.spine.value}/${anchor.node}');
+    }
     return plan.visibleBlocks(nodes, images);
   }
 
@@ -573,7 +688,7 @@ class ReaderController extends ChangeNotifier {
         job.resource = _resourceSource!.resource;
       }
       job.validateFormulaRender = (formula) async =>
-          await _formulaRasterizer.render(formula, _style.foreground) == null
+          await _formulaRasterizer.measure(formula, _style.foreground) == null
           ? 'Formula rendering exceeds supported geometry'
           : null;
       _semanticJob = job;
@@ -601,6 +716,7 @@ class ReaderController extends ChangeNotifier {
                       'citation',
                       'text_formula',
                       'image_formula',
+                      'image_text',
                     }.contains(g['kind']),
                   )
                   .map((g) => g['block'] as int)
@@ -643,7 +759,53 @@ class ReaderController extends ChangeNotifier {
   }
 
   BookFormat? _format;
-  PdfOcrBookSource? _pdfOcr;
+  PdfReflowSource? _pdfOcr;
+  Directory? _pdfDerivedDirectory;
+  String? _preferredPdfTextSource;
+  String? get preferredPdfTextSource =>
+      _preferredPdfTextSource ?? pdfTextSource;
+  bool get canChoosePdfTextSource => _pdfDerivedDirectory != null;
+  String? get pdfTextSource => _pdfOcr is PdfNativeBookSource
+      ? 'native'
+      : _pdfOcr != null
+      ? 'ocr'
+      : null;
+  Future<List<String>> availablePdfTextSources() async {
+    final directory = _pdfDerivedDirectory;
+    if (directory == null) return const [];
+    return [
+      if (await File('${directory.path}/ocr.zip').exists()) 'ocr',
+      if (await File('${directory.path}/native-pdf.zip').exists()) 'native',
+    ];
+  }
+
+  Directory? get pdfDerivedDirectory => _pdfDerivedDirectory;
+
+  Future<bool> preferPdfTextSource(String choice) async {
+    if (busy || !opened || _disposed) return false;
+    if (!(await availablePdfTextSources()).contains(choice)) {
+      throw StateError('PDF text source is unavailable');
+    }
+    if (_disposed || busy || !opened) return false;
+    if (choice == preferredPdfTextSource) return false;
+    // Persist a physical-page locator that both derived sources can restore.
+    // Retained layouts/resources keep their ownership until the book is reopened.
+    if (pdfReflowEnabled) await togglePdfReflow();
+    await flushProgress();
+    final directory = _pdfDerivedDirectory!;
+    if (choice == 'ocr') {
+      await File(
+        '${directory.path}/view-mode.json',
+      ).writeAsString('"reflow"', flush: true);
+    }
+    await File(
+      '${directory.path}/pdf-source.json',
+    ).writeAsString(jsonEncode(choice), flush: true);
+    _preferredPdfTextSource = choice;
+    return true;
+  }
+
+  String get pdfReflowLabel => _pdfOcr?.label ?? 'OCR';
   bool get pdfOcrAvailable => _pdfOcr != null;
   bool get pdfReflowEnabled => _pdfOcr?.mode == PdfOcrViewMode.reflow;
   bool get _fixedPdf => _format == BookFormat.pdf && !pdfReflowEnabled;
@@ -901,15 +1063,23 @@ class ReaderController extends ChangeNotifier {
 
   final focusReading = FocusReadingState();
   final Map<int, Map<String, SourceAnchor>> _tocAnchors = {};
-  final Map<int, List<String>> _sourceNodeOrder = {};
+  final Map<int, List<SourceAnchor>> _sourceNodeOrder = {};
 
   Set<String> get reachedTocTargets {
     final current = readingAnchor;
-    final nodes = _sourceNodeOrder[sectionIndex] ?? const <String>[];
-    final at = current == null ? -1 : nodes.indexOf(current.node);
+    final nodes = _sourceNodeOrder[sectionIndex] ?? const <SourceAnchor>[];
+    int position(SourceAnchor anchor) => nodes.indexWhere(
+      (n) => n.spine == anchor.spine && n.node == anchor.node,
+    );
+    final at = current == null ? -1 : position(current);
     return {
       for (final entry in (_tocAnchors[sectionIndex] ?? {}).entries)
-        if (at >= 0 && nodes.indexOf(entry.value.node) <= at) entry.key,
+        if (at >= 0 &&
+            position(entry.value) >= 0 &&
+            (position(entry.value) < at ||
+                position(entry.value) == at &&
+                    entry.value.textOffset <= current!.textOffset))
+          entry.key,
     };
   }
 
@@ -1028,6 +1198,24 @@ class ReaderController extends ChangeNotifier {
       _formulaRasterizer.image(href) ?? _images[href];
 
   /// A preview owns its texture; it never replaces the reading cache or layout.
+  Future<String?> recognizedImageText(String href) async {
+    final source = _source;
+    if (source == null || _disposed) return null;
+    final section = await source.parseSection(sectionIndex);
+    String? text;
+    for (final block in section.blocks) {
+      mapBlockContent(
+        block,
+        (t) => t,
+        image: (image) {
+          if (image.href == href) text = image.ocrText?.displayText;
+          return image;
+        },
+      );
+    }
+    return text;
+  }
+
   Future<ui.Image?> imagePreview(String href) async {
     final source = _resourceSource, size = _imageSizes[href];
     if (source == null || size == null || size.width <= 0 || size.height <= 0) {
@@ -1104,11 +1292,28 @@ class ReaderController extends ChangeNotifier {
     if (source is PdfBookSource) {
       final store = DerivedDataStore.fromBooksDirectory(file.parent);
       try {
-        _pdfOcr = await loadPdfOcrBookSource(
-          source,
-          Directory('${store.root.path}/${source.book.id}'),
-          toc: await store.generatedToc(source.book.id, source.book),
-        );
+        final derived = Directory('${store.root.path}/${source.book.id}');
+        _pdfDerivedDirectory = derived;
+        var preferNative = false;
+        try {
+          preferNative =
+              jsonDecode(
+                await File('${derived.path}/pdf-source.json').readAsString(),
+              ) ==
+              'native';
+        } catch (_) {}
+        try {
+          _pdfOcr = await loadPdfNativeBookSource(source, derived);
+        } catch (error) {
+          debugPrint('Native PDF text unavailable: $error');
+        }
+        if (_pdfOcr == null && !preferNative) {
+          _pdfOcr = await loadPdfOcrBookSource(
+            source,
+            derived,
+            toc: await store.generatedToc(source.book.id, source.book),
+          );
+        }
         final ocr = _pdfOcr;
         if (ocr != null) source = ocr;
       } catch (error) {
@@ -1120,6 +1325,9 @@ class ReaderController extends ChangeNotifier {
         (source as DisposableBookSource).dispose();
       }
       throw StateError('Reader was closed while opening');
+    }
+    if (source is! PdfBookSource && source is! PdfReflowSource) {
+      source = await ReadingContinuationSource.open(source);
     }
     _resourceSource = source;
     final sourceMilliseconds = openingWatch.elapsedMilliseconds;
@@ -1224,7 +1432,7 @@ class ReaderController extends ChangeNotifier {
     final store = DerivedDataStore.fromBooksDirectory(booksDirectory);
     final toc = await store.generatedToc(
       source.book.id,
-      source is PdfOcrBookSource ? source.original.book : source.book,
+      source is PdfReflowSource ? source.original.book : source.book,
     );
     final metadata = await store.metadata(source.book.id);
     if (_disposed ||
@@ -1472,10 +1680,11 @@ class ReaderController extends ChangeNotifier {
     final visibleNodes = <String>{};
     for (final item in page.items) {
       final nodeId = switch (item) {
-        TextPlacement(:final nodeId, :final source) =>
-          source?.start.node ?? nodeId,
-        TableCellPlacement(:final nodeId, :final source) =>
-          source?.start.node ?? nodeId,
+        TextPlacement(:final nodeId) => nodeId.replaceFirst(
+          RegExp(r'@translation$'),
+          '',
+        ),
+        TableCellPlacement(:final nodeId) => nodeId,
         _ => '',
       };
       if (nodeId.isNotEmpty) visibleNodes.add(nodeId);
@@ -1711,10 +1920,11 @@ class ReaderController extends ChangeNotifier {
     double fallbackProgression,
   ) {
     focusReading.target = anchor;
-    var match = -1;
+    final matches = <int>{}, focusMatches = <int>{};
+    var bestOffset = -1;
     for (var index = 0; index < pages.length; index++) {
       if (pages[index].focusUnits.any((unit) => unit.contains(anchor))) {
-        match = index;
+        focusMatches.add(index);
       }
       for (final item in pages[index].items) {
         if (item is TextPlacement &&
@@ -1722,14 +1932,30 @@ class ReaderController extends ChangeNotifier {
             (item.source?.start.node ?? item.nodeId) == anchor.node &&
             item.textOffsetAtStart + (item.source?.start.textOffset ?? 0) <=
                 anchor.textOffset) {
-          match = index;
+          final offset =
+              item.textOffsetAtStart + (item.source?.start.textOffset ?? 0);
+          if (offset > bestOffset) {
+            bestOffset = offset;
+            matches.clear();
+          }
+          if (offset == bestOffset) matches.add(index);
         } else if (item is TableCellPlacement &&
             item.source?.start.spine == anchor.spine &&
-            item.nodeId == anchor.node) {
-          match = index;
+            (item.source?.start.node ?? item.nodeId) == anchor.node) {
+          matches.add(index);
         }
       }
     }
+    final candidates = matches.isNotEmpty ? matches : focusMatches;
+    final match = candidates.isEmpty
+        ? -1
+        : candidates.reduce(
+            (a, b) =>
+                (pages[a].progression - fallbackProgression).abs() <=
+                    (pages[b].progression - fallbackProgression).abs()
+                ? a
+                : b,
+          );
     return match >= 0
         ? match
         : (fallbackProgression * (pages.length - 1)).round().clamp(
@@ -1771,7 +1997,7 @@ class ReaderController extends ChangeNotifier {
     final pages = _sections[section] ?? const [];
     if (pages.isEmpty) return 0;
     final anchor = locator.source?.start;
-    if (anchor != null && anchor.spine == _book.spine[section].id) {
+    if (anchor != null && _book.indexOfSpine(anchor.spine) == section) {
       return _pageForAnchor(pages, anchor, locator.progression);
     }
     return (locator.progression * (pages.length - 1)).round().clamp(
@@ -1953,6 +2179,7 @@ class ReaderController extends ChangeNotifier {
   /// Resolves and jumps to an internal publication link, including fragments.
   Future<bool> goToHref(String href) async {
     if (busy || !opened || isExternalHref(href)) return false;
+    href = _book.hrefTargets[href] ?? href;
     final (path, fragment) = splitPackageFragment(href);
     final target = _book.spine.indexWhere((item) => item.href == path);
     if (target < 0) return false;
@@ -1975,15 +2202,17 @@ class ReaderController extends ChangeNotifier {
                 FigureBlock() => block.images,
                 _ => <ImageBlock>[],
               })
-                if (image.source?.start.node == anchor.source.node) image.href,
+                if (image.source?.start.node == anchor.source.node &&
+                    image.source?.start.spine == anchor.source.spine)
+                  image.href,
           };
           final index = pages.indexWhere(
             (page) => page.items.any(
               (item) => switch (item) {
-                TextPlacement(:final nodeId) ||
-                TableCellPlacement(
-                  :final nodeId,
-                ) => nodeId == anchor.source.node,
+                TextPlacement(:final source, :final nodeId) ||
+                TableCellPlacement(:final source, :final nodeId) =>
+                  (source?.start.node ?? nodeId) == anchor.source.node &&
+                      source?.start.spine == anchor.source.spine,
                 ImagePlacement(:final href) => imageHrefs.contains(href),
                 _ => false,
               },
@@ -2018,7 +2247,7 @@ class ReaderController extends ChangeNotifier {
     final section = await _source!.parseSection(target);
     final anchor = _anchorByFragment(section, fragment);
     if (anchor == null) return null;
-    final text = _textForSourceNode(section, anchor.source.node);
+    final text = _textForSourceNodeInBlocks(section.blocks, anchor.source);
     if (text == null || text.trim().isEmpty) return null;
     return ReaderFootnote(
       marker: link.marker,
@@ -2027,7 +2256,9 @@ class ReaderController extends ChangeNotifier {
       inlines: section.blocks
           .expand(blockTexts)
           .where(
-            (b) => (b.source?.start.node ?? b.nodeId) == anchor.source.node,
+            (b) =>
+                (b.source?.start.node ?? b.nodeId) == anchor.source.node &&
+                b.source?.start.spine == anchor.source.spine,
           )
           .firstOrNull
           ?.inlines,
@@ -2075,17 +2306,8 @@ class ReaderController extends ChangeNotifier {
               (link.footnoteIcon || link.role == LinkRole.footnoteReference),
         )
         .toList();
-    links.sort(
-      (a, b) => a.citationOrdinal > 0 && b.citationOrdinal == 0
-          ? 1
-          : a.citationOrdinal == 0 && b.citationOrdinal > 0
-          ? -1
-          : a.citationOrdinal > 0
-          ? a.citationOrdinal.compareTo(b.citationOrdinal)
-          : a.footnoteNumber > 0 && b.footnoteNumber > 0
-          ? a.footnoteNumber.compareTo(b.footnoteNumber)
-          : a.start.compareTo(b.start),
-    );
+    // Page items and their link runs are already in source order. Sorting by
+    // printed numbers mixes independent notes/citations and reorders prose.
     final out = <ReaderFootnote>[];
     for (final link in links) {
       final note = link.inlineNote != null
@@ -2194,7 +2416,7 @@ class ReaderController extends ChangeNotifier {
     if (cancelled()) return const [];
     _sourceNodeOrder[index] = [
       for (final block in section.blocks)
-        for (final range in FocusUnitBuilder.sources(block)) range.start.node,
+        for (final range in FocusUnitBuilder.sources(block)) range.start,
     ];
     final targets = <String, SourceAnchor>{};
     void collectTargets(List<TocEntry> entries) {
@@ -2206,11 +2428,7 @@ class ReaderController extends ChangeNotifier {
               : _anchorByFragment(section, fragment)?.source;
           if (anchor != null) targets[entry.href] = anchor;
           if (fragment == null && _sourceNodeOrder[index]!.isNotEmpty) {
-            targets[entry.href] = SourceAnchor(
-              spine: section.id,
-              node: _sourceNodeOrder[index]!.first,
-              textOffset: 0,
-            );
+            targets[entry.href] = _sourceNodeOrder[index]!.first;
           }
         }
         collectTargets(entry.children);
@@ -2221,7 +2439,12 @@ class ReaderController extends ChangeNotifier {
     _tocAnchors[index] = targets;
     await Future.wait([
       _decodeSectionImages(section),
-      _formulaRasterizer.prepare(section, style.foreground),
+      _formulaRasterizer.prepare(
+        section,
+        style.foreground,
+        deferPixels: true,
+        shouldCancel: cancelled,
+      ),
       FootnoteSpacing.prepare(section, style),
       EnglishHyphenator.instance.ensureLoadedForSection(
         section,
@@ -2378,6 +2601,13 @@ class ReaderController extends ChangeNotifier {
     _imagePixelRatio = pixelRatio;
     final wanted = <String, int>{};
     void request(String href, double width, double height) {
+      if (_formulaRasterizer.owns(href)) {
+        wanted[href] = math.max(
+          wanted[href] ?? 0,
+          (math.max(width, height) * pixelRatio).ceil().clamp(1, 8192),
+        );
+        return;
+      }
       final size = _imageSizes[href];
       if (size == null || size.width <= 0 || size.height <= 0) return;
       final scale = math.max(
@@ -2409,12 +2639,49 @@ class ReaderController extends ChangeNotifier {
               ? item.inlineImages
               : (item as TableCellPlacement).inlineImages;
           for (final image in images) {
+            if (image.ruby != null) continue;
+            final paragraph = item is TextPlacement
+                ? item.paragraph
+                : (item as TableCellPlacement).paragraph;
+            final origin = item is TextPlacement
+                ? ui.Offset(item.x, item.y - item.sliceTop)
+                : ui.Offset(
+                    (item as TableCellPlacement).rect.left + item.padding,
+                    item.rect.top + item.padding,
+                  );
+            final clip = item is TextPlacement
+                ? ui.Rect.fromLTWH(item.x, item.y, item.width, item.sliceHeight)
+                : (item as TableCellPlacement).rect;
+            final boxes = paragraph.getBoxesForRange(image.start, image.end);
+            if (!boxes.any(
+              (box) =>
+                  box.toRect().shift(origin).overlaps(clip) &&
+                  box
+                      .toRect()
+                      .shift(origin)
+                      .overlaps(
+                        ui.Rect.fromLTWH(
+                          0,
+                          0,
+                          page.viewport.width,
+                          page.viewport.height,
+                        ),
+                      ),
+            )) {
+              continue;
+            }
             request(image.href, image.width, image.height);
           }
         }
       }
     }
     _visibleImages = wanted.keys.toSet();
+    _formulaRasterizer.retainVisible(_visibleImages);
+    _imageDimensions.removeWhere(
+      (href, _) =>
+          _formulaRasterizer.owns(href) &&
+          _formulaRasterizer.image(href) == null,
+    );
     _imageRequests.removeWhere((href, _) => !wanted.containsKey(href));
     for (final entry in wanted.entries) {
       if ((_imageDimensions[entry.key] ?? 0) < entry.value &&
@@ -2442,6 +2709,18 @@ class ReaderController extends ChangeNotifier {
         if (source == null) break;
         ui.Image? image;
         try {
+          if (_formulaRasterizer.owns(entry.key)) {
+            await _formulaRasterizer.renderHref(
+              entry.key,
+              maxDimension: entry.value,
+            );
+            if (!_disposed && _visibleImages.contains(entry.key)) {
+              _imageDimensions[entry.key] = entry.value;
+              notifyListeners();
+            }
+            await Future<void>.delayed(Duration.zero);
+            continue;
+          }
           if (source is RasterResourceSource) {
             image = await (source as RasterResourceSource).rasterResource(
               entry.key,
@@ -2830,31 +3109,32 @@ void _visitBlockText(
   }
 }
 
-String? _textForSourceNode(Section section, String nodeId) {
-  return _textForSourceNodeInBlocks(section.blocks, nodeId);
-}
-
-String? _textForSourceNodeInBlocks(List<Block> blocks, String nodeId) {
+String? _textForSourceNodeInBlocks(List<Block> blocks, SourceAnchor anchor) {
+  bool matches(SourceRange? source, String nodeId) =>
+      (source?.start.node ?? nodeId) == anchor.node &&
+      source?.start.spine == anchor.spine;
   for (final block in blocks) {
     switch (block) {
       case TextBlock():
-        if ((block.source?.start.node ?? block.nodeId) == nodeId) {
+        if (matches(block.source, block.nodeId)) {
           return _readableInlineText(block.inlines);
         }
       case TableBlock():
         final attached = _textForSourceNodeInBlocks([
           ...block.before,
           ...block.after,
-        ], nodeId);
+        ], anchor);
         if (attached != null) return attached;
         for (final row in block.rows) {
           for (final cell in row.cells) {
-            if (cell.nodeId == nodeId) return _readableInlineText(cell.inlines);
+            if (matches(cell.source, cell.nodeId)) {
+              return _readableInlineText(cell.inlines);
+            }
           }
         }
       case FigureBlock():
         for (final caption in block.captions) {
-          if ((caption.source?.start.node ?? caption.nodeId) == nodeId) {
+          if (matches(caption.source, caption.nodeId)) {
             return _readableInlineText(caption.inlines);
           }
         }
@@ -2862,10 +3142,10 @@ String? _textForSourceNodeInBlocks(List<Block> blocks, String nodeId) {
         final text = _textForSourceNodeInBlocks([
           ...body,
           ?attribution,
-        ], nodeId);
+        ], anchor);
         if (text != null) return text;
       case NoteBlock(:final blocks):
-        final text = _textForSourceNodeInBlocks(blocks, nodeId);
+        final text = _textForSourceNodeInBlocks(blocks, anchor);
         if (text != null) return text;
       default:
         continue;

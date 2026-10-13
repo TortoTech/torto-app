@@ -207,8 +207,9 @@ void _paintInlineImages(
         continue;
     }
     for (final inlineImage in images) {
-      final image = imageResolver(inlineImage.href);
-      if (image == null) continue;
+      final ruby = inlineImage.ruby;
+      final image = ruby == null ? imageResolver(inlineImage.href) : null;
+      if (image == null && ruby == null) continue;
       final boxes = paragraph.getBoxesForRange(
         inlineImage.start,
         inlineImage.end,
@@ -218,19 +219,56 @@ void _paintInlineImages(
       final boxWidth = box.right - box.left;
       final destination = ui.Rect.fromLTWH(
         paragraphOffset.dx + box.left + (boxWidth - inlineImage.width) / 2,
-        paragraphOffset.dy + box.top + inlineImage.paintOffsetY,
+        ruby == null
+            ? paragraphOffset.dy + box.top + inlineImage.paintOffsetY
+            : (paragraphOffset.dy +
+                      box.top +
+                      (box.bottom - box.top - inlineImage.height) / 2)
+                  .clamp(
+                    clip.top,
+                    math.max(clip.top, clip.bottom - inlineImage.height),
+                  ),
         inlineImage.width,
         inlineImage.height,
       );
       if (!destination.overlaps(clip)) continue;
       canvas.save();
       canvas.clipRect(clip);
-      canvas.drawImageRect(
-        image,
-        ui.Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
-        destination,
-        Paint()..filterQuality = FilterQuality.medium,
-      );
+      if (ruby != null) {
+        final baseY = ruby.below
+            ? destination.top
+            : destination.top + ruby.annotation.height + 1;
+        final noteY = ruby.below
+            ? destination.top + ruby.base.height + 1
+            : destination.top;
+        canvas.drawParagraph(
+          ruby.base,
+          ui.Offset(
+            destination.left + (ruby.width - ruby.base.maxIntrinsicWidth) / 2,
+            baseY,
+          ),
+        );
+        canvas.drawParagraph(
+          ruby.annotation,
+          ui.Offset(
+            destination.left +
+                (ruby.width - ruby.annotation.maxIntrinsicWidth) / 2,
+            noteY,
+          ),
+        );
+      } else {
+        canvas.drawImageRect(
+          image!,
+          ui.Rect.fromLTWH(
+            0,
+            0,
+            image.width.toDouble(),
+            image.height.toDouble(),
+          ),
+          destination,
+          Paint()..filterQuality = FilterQuality.medium,
+        );
+      }
       canvas.restore();
     }
   }

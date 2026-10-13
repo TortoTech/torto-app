@@ -5,8 +5,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_math_fork/flutter_math.dart' as fm;
 import 'package:url_launcher/url_launcher.dart';
+import '../../l10n/app_localizations.dart';
 import '../../core/ir/ir.dart' as ir;
 import '../../core/semantic_layout/web_links.dart';
+import '../../core/semantic_layout/media_references.dart';
+import 'media_reference_scope.dart';
 import 'reader_controller.dart' show ReaderFootnote;
 
 import '../../core/ir/book.dart';
@@ -31,6 +34,8 @@ Future<void> showReaderFootnoteSheet(
   int initialCitation = 0,
   int initialFootnoteNumber = 0,
   Color? markerColor,
+  bool blockNavigation = false,
+  Future<void> Function(String)? onMediaReference,
 }) async {
   await EnglishHyphenator.instance.ensureLoadedForLanguage(publicationLanguage);
   if (!context.mounted) return;
@@ -66,22 +71,119 @@ Future<void> showReaderFootnoteSheet(
       maxWidth: viewport.width,
       maxHeight: viewport.height * 0.75,
     ),
-    builder: (context) => Theme(
-      data: sheetTheme,
-      child: ReaderFootnoteSheet(
-        text: text,
-        foreground: foreground,
-        publicationLanguage: publicationLanguage,
-        writingSystem: writingSystem,
-        typography: typography,
-        typesettingMode: typesettingMode,
-        entries: entries,
-        initialCitation: initialCitation,
-        initialFootnoteNumber: initialFootnoteNumber,
-        markerColor: markerColor ?? footnoteIconColor(background),
+    builder: (context) => MediaReferenceScope(
+      open: onMediaReference,
+      child: Theme(
+        data: sheetTheme,
+        child: _FootnoteNavigator(
+          blockNavigation: blockNavigation,
+          sheet: ReaderFootnoteSheet(
+            text: text,
+            foreground: foreground,
+            publicationLanguage: publicationLanguage,
+            writingSystem: writingSystem,
+            typography: typography,
+            typesettingMode: typesettingMode,
+            entries: entries,
+            initialCitation: initialCitation,
+            initialFootnoteNumber: initialFootnoteNumber,
+            markerColor: markerColor ?? footnoteIconColor(background),
+          ),
+        ),
       ),
     ),
   );
+}
+
+class _FootnoteNavigator extends StatefulWidget {
+  final ReaderFootnoteSheet sheet;
+  final bool blockNavigation;
+  const _FootnoteNavigator({
+    required this.sheet,
+    required this.blockNavigation,
+  });
+  @override
+  State<_FootnoteNavigator> createState() => _FootnoteNavigatorState();
+}
+
+class _FootnoteNavigatorState extends State<_FootnoteNavigator> {
+  late int index;
+  @override
+  void initState() {
+    super.initState();
+    final sheet = widget.sheet;
+    final initial = sheet.entries.indexWhere(
+      (e) => sheet.initialCitation > 0
+          ? e.citationOrdinal == sheet.initialCitation
+          : sheet.initialFootnoteNumber > 0
+          ? e.footnoteNumber == sheet.initialFootnoteNumber
+          : false,
+    );
+    index = initial < 0 ? 0 : initial;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final sheet = widget.sheet, entries = sheet.entries;
+    final active = entries.isEmpty ? null : entries[index];
+    final navigation = widget.blockNavigation && entries.length > 1;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          children: [
+            if (navigation)
+              IconButton(
+                key: const Key('footnote-previous'),
+                tooltip: context.l10n.text('上一条', 'Previous note'),
+                onPressed: () =>
+                    setState(() => index = (index - 1) % entries.length),
+                icon: const Icon(Icons.chevron_left),
+              ),
+            Expanded(
+              child: Text(
+                navigation ? '${index + 1} / ${entries.length}' : '',
+                textAlign: TextAlign.center,
+              ),
+            ),
+            IconButton(
+              key: const Key('footnote-copy'),
+              tooltip: context.l10n.text('复制脚注', 'Copy footnote'),
+              onPressed: () => Clipboard.setData(
+                ClipboardData(text: active?.text ?? sheet.text),
+              ),
+              icon: const Icon(Icons.copy_outlined),
+            ),
+            if (navigation)
+              IconButton(
+                key: const Key('footnote-next'),
+                tooltip: context.l10n.text('下一条', 'Next note'),
+                onPressed: () =>
+                    setState(() => index = (index + 1) % entries.length),
+                icon: const Icon(Icons.chevron_right),
+              ),
+          ],
+        ),
+        Flexible(
+          child: navigation
+              ? ReaderFootnoteSheet(
+                  key: ValueKey(index),
+                  text: active!.text,
+                  foreground: sheet.foreground,
+                  publicationLanguage: sheet.publicationLanguage,
+                  writingSystem: sheet.writingSystem,
+                  typography: sheet.typography,
+                  typesettingMode: sheet.typesettingMode,
+                  entries: [active],
+                  initialCitation: active.citationOrdinal,
+                  initialFootnoteNumber: active.footnoteNumber,
+                  markerColor: sheet.markerColor,
+                )
+              : sheet,
+        ),
+      ],
+    );
+  }
 }
 
 class ReaderFootnoteSheet extends StatelessWidget {
@@ -367,30 +469,47 @@ class _PopupText extends StatelessWidget {
   Widget build(BuildContext context) {
     // Popup content is a new paragraph: a citation's outer semantic role must
     // not suppress detection of a URL inside its expanded text.
-    final inlines = translationInlines([
-      for (final inline in this.inlines)
-        if (inline is ir.TextRun)
-          ir.TextRun(
-            inline.text,
-            style: inline.style.copyWith(
-              inlineCitation: 0,
-              inlineRole: ir.InlineRole.normal,
-              linkRole: ir.LinkRole.normal,
-            ),
-            link: inline.style.linkRole == ir.LinkRole.footnoteBacklink
-                ? null
-                : inline.link,
-          )
-        else
-          inline,
-    ]);
+    final inlines = MediaReferences.link(
+      translationInlines([
+        for (final inline in this.inlines)
+          if (inline is ir.TextRun)
+            ir.TextRun(
+              inline.text,
+              style: inline.style.copyWith(
+                inlineCitation: 0,
+                inlineRole: ir.InlineRole.normal,
+                linkRole: ir.LinkRole.normal,
+              ),
+              link: inline.style.linkRole == ir.LinkRole.footnoteBacklink
+                  ? null
+                  : inline.link,
+            )
+          else
+            inline,
+      ]),
+    );
     if (!inlines.any((inline) => inline is ir.MathInline)) {
       final text = StringBuffer();
       final widgets = <int, PopupInlineWidget>{};
       final em = MediaQuery.textScalerOf(context).scale(style.fontSize ?? 17);
       for (final inline in inlines) {
         if (inline is ir.TextRun) {
-          if (websiteIcons && inline.style.website && inline.link != null) {
+          if (inline.link?.startsWith('torto-media:') == true) {
+            final painter = TextPainter(
+              text: TextSpan(text: inline.text, style: style),
+              textDirection: TextDirection.ltr,
+              textScaler: MediaQuery.textScalerOf(context),
+            )..layout();
+            widgets[text.length] = (
+              span: _mediaSpan(context, inline, style),
+              width: painter.width,
+              height: painter.height,
+            );
+            painter.dispose();
+            text.write('\ufffc');
+          } else if (websiteIcons &&
+              inline.style.website &&
+              inline.link != null) {
             widgets[text.length] = (
               span: _websiteSpan(inline.link!, em, linkColor),
               width: em * 1.25,
@@ -421,7 +540,11 @@ class _PopupText extends StatelessWidget {
             ?leading,
             for (final inline in inlines)
               if (inline is ir.TextRun)
-                if (websiteIcons && inline.style.website && inline.link != null)
+                if (inline.link?.startsWith('torto-media:') == true)
+                  _mediaSpan(context, inline, style)
+                else if (websiteIcons &&
+                    inline.style.website &&
+                    inline.link != null)
                   _websiteSpan(
                     inline.link!,
                     MediaQuery.textScalerOf(
@@ -465,6 +588,23 @@ class _PopupText extends StatelessWidget {
     );
   }
 }
+
+WidgetSpan _mediaSpan(BuildContext context, ir.TextRun run, TextStyle style) =>
+    WidgetSpan(
+      alignment: PlaceholderAlignment.baseline,
+      baseline: TextBaseline.alphabetic,
+      child: GestureDetector(
+        onTap: () => MediaReferenceScope.of(context)?.open?.call(run.link!),
+        onLongPress: () => Clipboard.setData(ClipboardData(text: run.text)),
+        child: Text(
+          run.text,
+          style: style.copyWith(
+            color: Colors.blue,
+            decoration: TextDecoration.underline,
+          ),
+        ),
+      ),
+    );
 
 WidgetSpan _websiteSpan(String url, double em, Color color) => WidgetSpan(
   alignment: PlaceholderAlignment.middle,
@@ -760,6 +900,7 @@ TextSpan? _optimizedTextSpan(
         children.add(
           WidgetSpan(
             alignment: inlineWidget.span.alignment,
+            baseline: inlineWidget.span.baseline,
             child: SizedBox(
               width: math.max(.1, inlineWidget.width + adjustment),
               height: inlineWidget.height,

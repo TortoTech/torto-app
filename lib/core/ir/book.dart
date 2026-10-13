@@ -166,16 +166,26 @@ class TocEntry {
 }
 
 class SpineItem {
+  final bool linear;
   final SpineItemId id;
   final int index;
 
   /// Root-relative path of the section document within the package.
   final String href;
 
-  const SpineItem({required this.id, required this.index, required this.href});
+  const SpineItem({
+    required this.id,
+    required this.index,
+    required this.href,
+    this.linear = true,
+  });
 }
 
 class Book {
+  /// Storage chunks can share a logical reading section without rewriting
+  /// their original source-spine identities.
+  final Map<SpineItemId, int> spineAliases;
+  final Map<String, String> hrefTargets;
   final PublicationId id;
   final BookMetadata metadata;
   final List<SpineItem> spine;
@@ -185,6 +195,8 @@ class Book {
   final String? coverHref;
 
   const Book({
+    this.spineAliases = const {},
+    this.hrefTargets = const {},
     required this.id,
     required this.metadata,
     required this.spine,
@@ -193,11 +205,15 @@ class Book {
   });
 
   int get sectionCount => spine.length;
-  int indexOfSpine(SpineItemId id) => spine.indexWhere((item) => item.id == id);
+  int indexOfSpine(SpineItemId id) {
+    final index = spine.indexWhere((item) => item.id == id);
+    return index < 0 ? spineAliases[id] ?? -1 : index;
+  }
 }
 
 /// One spine section's parsed content.
 class Section {
+  final String? continuationQuote;
   final SpineItemId id;
   final int spineIndex;
   final String href;
@@ -205,6 +221,7 @@ class Section {
   final List<SectionAnchor> anchors;
 
   const Section({
+    this.continuationQuote,
     required this.id,
     required this.spineIndex,
     required this.href,

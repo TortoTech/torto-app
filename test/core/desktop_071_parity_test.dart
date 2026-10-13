@@ -144,9 +144,9 @@ void main() {
     },
   );
   test(
-    'colons split prose but preserve URLs, times and paired punctuation',
+    'colons preserve complete sentence continuations, URLs, times and paired punctuation',
     () {
-      expect(SentenceStructure.boundaries('Note: Next step.'), hasLength(1));
+      expect(SentenceStructure.boundaries('Note: Next step.'), isEmpty);
       expect(
         SentenceStructure.boundaries(
           '时间12:30，比例1：2，网址https://example.com:8080/a，继续。',
